@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +12,9 @@ from urllib.parse import parse_qs, urlsplit
 SERVICE_NAME = "real-world-event-decision-sim"
 
 EVENT_FIELDS = ("eventId", "organizationId", "type", "occurredAt", "payload")
+
+_POSITIVE_INTEGER_TEXT = re.compile(r"[1-9][0-9]*")
+_NON_NEGATIVE_INTEGER_TEXT = re.compile(r"(?:0|[1-9][0-9]*)")
 
 
 class EventValidationError(ValueError):
@@ -57,6 +61,59 @@ class EventLedger:
             ]
         events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
         return events
+
+    def aggregate(
+        self,
+        organization_id: str,
+        event_type: str,
+        window_size: int,
+        start: int | None,
+        end: int | None,
+    ) -> list[dict[str, int]]:
+        """Count matching events per fixed-width window.
+
+        Windows start at 0 and are ``window_size`` wide; each window covers
+        ``window_start <= occurredAt < window_end``. When ``start`` and ``end``
+        are given, every window intersecting the closed range ``[start, end]``
+        is returned (empty windows included); otherwise only windows that
+        contain a matching event are returned.
+        """
+        counts: dict[int, int] = {}
+        with self._lock:
+            timestamps = sorted(
+                event["occurredAt"]
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
+                and event["type"] == event_type
+                and (start is None or start <= event["occurredAt"] <= end)
+            )
+
+        for occurred_at in timestamps:
+            window_start = (occurred_at // window_size) * window_size
+            counts[window_start] = counts.get(window_start, 0) + 1
+
+        if start is None:
+            return [
+                {
+                    "start": window_start,
+                    "end": window_start + window_size,
+                    "count": counts[window_start],
+                }
+                for window_start in sorted(counts)
+            ]
+
+        first_window = (start // window_size) * window_size
+        last_window = (end // window_size) * window_size
+        return [
+            {
+                "start": window_start,
+                "end": window_start + window_size,
+                "count": counts.get(window_start, 0),
+            }
+            for window_start in range(
+                first_window, last_window + window_size, window_size
+            )
+        ]
 
 
 def validate_event(data: Any) -> dict[str, Any]:
@@ -110,6 +167,48 @@ def _organization_id_from_query(query: str) -> str:
     return value
 
 
+def _single_non_empty(values: list[str] | None, name: str) -> str:
+    if not values or len(values) != 1:
+        raise EventValidationError(f"{name} query parameter is required exactly once")
+    value = values[0]
+    if not value.strip():
+        raise EventValidationError(f"{name} must be non-empty")
+    return value
+
+
+def _integer_text(values: list[str] | None, name: str, pattern: re.Pattern[str]) -> int:
+    value = _single_non_empty(values, name)
+    if not pattern.fullmatch(value):
+        kind = "positive" if pattern is _POSITIVE_INTEGER_TEXT else "non-negative"
+        raise EventValidationError(f"{name} must be a {kind} integer")
+    return int(value)
+
+
+def _aggregate_params_from_query(
+    query: str,
+) -> tuple[str, str, int, int | None, int | None]:
+    """Validate the aggregate query string into typed parameter values."""
+    params = parse_qs(query, keep_blank_values=True)
+    organization_id = _single_non_empty(params.get("organizationId"), "organizationId")
+    event_type = _single_non_empty(params.get("type"), "type")
+    window_size = _integer_text(
+        params.get("windowSize"), "windowSize", _POSITIVE_INTEGER_TEXT
+    )
+
+    has_from = "from" in params
+    has_to = "to" in params
+    if has_from != has_to:
+        raise EventValidationError("from and to query parameters must be provided together")
+    start = end = None
+    if has_from:
+        start = _integer_text(params.get("from"), "from", _NON_NEGATIVE_INTEGER_TEXT)
+        end = _integer_text(params.get("to"), "to", _NON_NEGATIVE_INTEGER_TEXT)
+        if start > end:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return organization_id, event_type, window_size, start, end
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -123,6 +222,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/events":
             self._list_events(parsed.query)
+            return
+        if parsed.path == "/events/aggregate":
+            self._aggregate_events(parsed.query)
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -196,6 +298,36 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(
             HTTPStatus.OK,
             {"organizationId": organization_id, "events": events},
+        )
+
+    def _aggregate_events(self, query: str) -> None:
+        try:
+            (
+                organization_id,
+                event_type,
+                window_size,
+                start,
+                end,
+            ) = _aggregate_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+        windows = self.server.ledger.aggregate(  # type: ignore[attr-defined]
+            organization_id, event_type, window_size, start, end
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "type": event_type,
+                "windowSize": window_size,
+                "from": start,
+                "to": end,
+                "windows": windows,
+            },
         )
 
     def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:

@@ -263,6 +263,295 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["organizationId"], "org-1")
 
+    # --- GET /events/aggregate -------------------------------------------------
+
+    def test_aggregate_without_range_returns_only_covered_windows(self) -> None:
+        events = [
+            make_event(eventId="evt-1", occurredAt=0),
+            make_event(eventId="evt-2", occurredAt=99),
+            make_event(eventId="evt-3", occurredAt=100),
+            make_event(eventId="evt-4", occurredAt=350),
+            make_event(eventId="evt-5", type="incident.updated", occurredAt=50),
+            make_event(eventId="evt-6", organizationId="org-2", occurredAt=50),
+        ]
+        for event in events:
+            self.assertEqual(self.post_event(event)[0], 201)
+
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 100,
+                "from": None,
+                "to": None,
+                "windows": [
+                    {"start": 0, "end": 100, "count": 2},
+                    {"start": 100, "end": 200, "count": 1},
+                    {"start": 300, "end": 400, "count": 1},
+                ],
+            },
+        )
+
+    def test_aggregate_window_boundaries_are_start_inclusive_end_exclusive(self) -> None:
+        for occurred_at in (0, 99, 100, 199, 200):
+            self.assertEqual(
+                self.post_event(make_event(eventId=f"evt-{occurred_at}", occurredAt=occurred_at))[0],
+                201,
+            )
+
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["windows"],
+            [
+                {"start": 0, "end": 100, "count": 2},
+                {"start": 100, "end": 200, "count": 2},
+                {"start": 200, "end": 300, "count": 1},
+            ],
+        )
+
+    def test_aggregate_with_range_returns_all_intersecting_windows(self) -> None:
+        for occurred_at in (0, 50, 250):
+            self.assertEqual(
+                self.post_event(make_event(eventId=f"evt-{occurred_at}", occurredAt=occurred_at))[0],
+                201,
+            )
+
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=150&to=450"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["from"], 150)
+        self.assertEqual(body["to"], 450)
+        self.assertEqual(
+            body["windows"],
+            [
+                {"start": 100, "end": 200, "count": 0},
+                {"start": 200, "end": 300, "count": 1},
+                {"start": 300, "end": 400, "count": 0},
+                {"start": 400, "end": 500, "count": 0},
+            ],
+        )
+
+    def test_aggregate_range_endpoints_are_inclusive(self) -> None:
+        for occurred_at in (49, 50, 150, 151):
+            self.assertEqual(
+                self.post_event(make_event(eventId=f"evt-{occurred_at}", occurredAt=occurred_at))[0],
+                201,
+            )
+
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=50&to=150"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["windows"],
+            [
+                {"start": 0, "end": 100, "count": 1},
+                {"start": 100, "end": 200, "count": 1},
+            ],
+        )
+
+    def test_aggregate_range_within_single_window(self) -> None:
+        self.assertEqual(self.post_event(make_event(occurredAt=10))[0], 201)
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=20&to=30"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [{"start": 0, "end": 100, "count": 0}])
+
+    def test_aggregate_no_matches_without_range_is_empty(self) -> None:
+        self.assertEqual(self.post_event(make_event())[0], 201)
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=other&windowSize=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [])
+
+        status, body = self.request(
+            "/events/aggregate?organizationId=other&type=incident.created&windowSize=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [])
+
+    def test_aggregate_no_matches_with_range_returns_empty_windows(self) -> None:
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=0&to=50"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["windows"],
+            [{"start": 0, "end": 100, "count": 0}],
+        )
+
+    def test_aggregate_does_not_leak_other_organizations_or_types(self) -> None:
+        self.assertEqual(
+            self.post_event(make_event(eventId="evt-1", organizationId="org-a", type="t1", occurredAt=10))[0],
+            201,
+        )
+        self.assertEqual(
+            self.post_event(make_event(eventId="evt-2", organizationId="org-b", type="t1", occurredAt=10))[0],
+            201,
+        )
+        self.assertEqual(
+            self.post_event(make_event(eventId="evt-3", organizationId="org-a", type="t2", occurredAt=10))[0],
+            201,
+        )
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-a&type=t1&windowSize=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [{"start": 0, "end": 100, "count": 1}])
+
+    def test_aggregate_is_deterministic_for_replays_and_same_timestamps(self) -> None:
+        event = make_event(occurredAt=10)
+        self.assertEqual(self.post_event(event)[0], 201)
+        self.assertEqual(self.post_event(event)[0], 200)
+
+        for _ in range(3):
+            status, body = self.request(
+                "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["windows"], [{"start": 0, "end": 100, "count": 1}])
+
+        # Events posted out of timestamp order still come back window-sorted.
+        for occurred_at, event_id in ((300, "late"), (5, "early"), (150, "middle")):
+            self.assertEqual(
+                self.post_event(make_event(eventId=event_id, occurredAt=occurred_at))[0],
+                201,
+            )
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        )
+        self.assertEqual(
+            [window["start"] for window in body["windows"]],
+            [0, 100, 300],
+        )
+        self.assertEqual(body["windows"][0]["count"], 2)
+
+    def test_aggregate_requires_all_three_core_parameters(self) -> None:
+        valid = "organizationId=org-1&type=incident.created&windowSize=100"
+        for query in (
+            "/events/aggregate",
+            "/events/aggregate?type=incident.created&windowSize=100",
+            "/events/aggregate?organizationId=org-1&windowSize=100",
+            "/events/aggregate?organizationId=org-1&type=incident.created",
+        ):
+            with self.subTest(query=query):
+                status, body = self.request(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        # sanity: the fully valid query succeeds
+        status, _ = self.request(f"/events/aggregate?{valid}")
+        self.assertEqual(status, 200)
+
+    def test_aggregate_rejects_blank_core_parameters(self) -> None:
+        for query in (
+            "/events/aggregate?organizationId=&type=t&windowSize=100",
+            "/events/aggregate?organizationId=%20&type=t&windowSize=100",
+            "/events/aggregate?organizationId=o&type=&windowSize=100",
+            "/events/aggregate?organizationId=o&type=%20&windowSize=100",
+        ):
+            with self.subTest(query=query):
+                status, body = self.request(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_rejects_duplicate_parameters(self) -> None:
+        base = "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        for suffix in (
+            "&organizationId=org-2",
+            "&type=other",
+            "&windowSize=200",
+            "&from=0&from=1&to=5",
+            "&from=0&to=5&to=6",
+        ):
+            with self.subTest(suffix=suffix):
+                status, body = self.request(base + suffix)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_rejects_invalid_window_size(self) -> None:
+        for raw in ("0", "-1", "1.5", "01", "1e2", "abc", "", "%205"):
+            query = (
+                "/events/aggregate?organizationId=org-1&type=incident.created"
+                f"&windowSize={raw}"
+            )
+            with self.subTest(windowSize=raw):
+                status, body = self.request(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_requires_from_and_to_together(self) -> None:
+        base = "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        for suffix in ("&from=0", "&to=10", "&from=", "&to="):
+            with self.subTest(suffix=suffix):
+                status, body = self.request(base + suffix)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_validates_range_values(self) -> None:
+        base = "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        for suffix in (
+            "&from=-1&to=10",
+            "&from=0&to=-1",
+            "&from=5&to=4",
+            "&from=1.5&to=10",
+            "&from=0&to=1.5",
+            "&from=01&to=10",
+            "&from=abc&to=10",
+        ):
+            with self.subTest(suffix=suffix):
+                status, body = self.request(base + suffix)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_from_equal_to_to_is_valid(self) -> None:
+        self.assertEqual(self.post_event(make_event(occurredAt=100))[0], 201)
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=100&to=100"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [{"start": 100, "end": 200, "count": 1}])
+
+    def test_aggregate_ignores_unrelated_query_parameters(self) -> None:
+        # Matches GET /events: unrelated params are ignored as long as the
+        # documented parameters are present and valid.
+        status, body = self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&extra=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [])
+
+    def test_aggregate_is_read_only(self) -> None:
+        self.assertEqual(
+            self.post_event(make_event(eventId="evt-1", occurredAt=10))[0], 201
+        )
+        self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created&windowSize=100"
+        )
+        self.request(
+            "/events/aggregate?organizationId=org-1&type=incident.created"
+            "&windowSize=100&from=0&to=1000"
+        )
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["events"]), 1)
+
     # --- concurrency and isolation ---------------------------------------------
 
     def test_concurrent_identical_posts_create_once(self) -> None:

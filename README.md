@@ -25,6 +25,8 @@ python -m unittest discover -s tests -v
 ## Public interface
 
 - `GET /health` returns JSON with the service name and `ok` status.
+- `GET /events?organizationId=...` lists an organization's events.
+- `GET /events/aggregate?...` returns event counts grouped into fixed time windows.
 - Unknown paths return a JSON `not_found` error with HTTP 404.
 - `python -m event_sim --help` documents the command-line entry point.
 
@@ -69,4 +71,51 @@ Returns `200` with `{"organizationId": "...", "events": [...]}`, where events
 belong only to that organization and are sorted by `occurredAt`, then
 `eventId`. An unknown organization returns `"events": []`. A missing, blank, or
 duplicated parameter yields `422`.
+
+### `GET /events/aggregate`
+
+Counts stored events for one organization and event type, grouped into
+fixed-width time windows. Windows start at `0` and are `windowSize` wide; an
+event belongs to window `start` when `start <= occurredAt < end` (so `end` is
+exclusive). The ledger is never modified and only matching events of the
+requested organization are counted.
+
+Query parameters:
+
+| Parameter      | Rule                                                                   |
+| -------------- | ---------------------------------------------------------------------- |
+| `organizationId` | required exactly once; non-empty string                              |
+| `type`         | required exactly once; non-empty string                                |
+| `windowSize`   | required exactly once; positive integer text (e.g. `100`, not `0`)    |
+| `from`         | optional; must be paired with `to`; non-negative integer text          |
+| `to`           | optional; must be paired with `from`; non-negative integer text, `from <= to` |
+
+`from` and `to` must either both be omitted or both appear exactly once. Only
+events with `from <= occurredAt <= to` are counted when the range is given.
+
+Returns `200` with:
+
+```json
+{
+  "organizationId": "org-1",
+  "type": "incident.created",
+  "windowSize": 100,
+  "from": 0,
+  "to": 250,
+  "windows": [
+    {"start": 0, "end": 100, "count": 1},
+    {"start": 100, "end": 200, "count": 0},
+    {"start": 200, "end": 300, "count": 2}
+  ]
+}
+```
+
+- Without `from`/`to`, only windows actually covered by matching events are
+  returned; if no event matches, `"windows": []` (and `from`/`to` are `null`).
+- With `from`/`to`, every window that intersects the closed interval
+  `[from, to]` is returned in ascending `start` order, including empty windows
+  with `"count": 0`.
+- A missing, duplicated, blank, or malformed parameter (including a lone
+  `from`/`to`, `from > to`, a zero `windowSize`, or a negative or non-integer
+  value) yields `422` with an `error` field.
 
