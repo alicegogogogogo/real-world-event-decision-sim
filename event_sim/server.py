@@ -58,6 +58,20 @@ class EventLedger:
         events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
         return events
 
+    def occurred_at_values(
+        self, organization_id: str, event_type: str
+    ) -> list[int]:
+        """Sorted occurredAt values of events matching organization and type."""
+        with self._lock:
+            values = [
+                event["occurredAt"]
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
+                and event["type"] == event_type
+            ]
+        values.sort()
+        return values
+
 
 def validate_event(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body against the five-field event contract."""
@@ -110,6 +124,70 @@ def _organization_id_from_query(query: str) -> str:
     return value
 
 
+def _integer_text(value: str) -> int | None:
+    """Parse ASCII decimal integer text; return None for anything else."""
+    if not value or not value.isascii() or not value.isdigit():
+        return None
+    return int(value)
+
+
+def _aggregate_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/aggregate query string.
+
+    organizationId, type and windowSize are each required exactly once;
+    from and to must be both absent or both present exactly once.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    def single_text(name: str) -> str:
+        values = params.get(name)
+        if not values or len(values) != 1:
+            raise EventValidationError(
+                f"{name} query parameter is required exactly once"
+            )
+        value = values[0]
+        if not value.strip():
+            raise EventValidationError(f"{name} must be non-empty")
+        return value
+
+    organization_id = single_text("organizationId")
+    event_type = single_text("type")
+
+    window_size_text = single_text("windowSize")
+    window_size = _integer_text(window_size_text)
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "type": event_type,
+        "windowSize": window_size,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -123,6 +201,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/events":
             self._list_events(parsed.query)
+            return
+        if parsed.path == "/events/aggregate":
+            self._aggregate_events(parsed.query)
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -196,6 +277,55 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(
             HTTPStatus.OK,
             {"organizationId": organization_id, "events": events},
+        )
+
+    def _aggregate_events(self, query: str) -> None:
+        try:
+            params = _aggregate_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        window_size = params["windowSize"]
+        from_value = params["from"]
+        to_value = params["to"]
+        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+            params["organizationId"], params["type"]
+        )
+
+        counts: dict[int, int] = {}
+        for timestamp in occurred:
+            if from_value is not None and not (from_value <= timestamp <= to_value):
+                continue
+            start = (timestamp // window_size) * window_size
+            counts[start] = counts.get(start, 0) + 1
+
+        if from_value is None:
+            # Only windows actually covered by matching events.
+            starts = sorted(counts)
+        else:
+            # Every window intersecting the closed interval [from, to].
+            first = (from_value // window_size) * window_size
+            last = (to_value // window_size) * window_size
+            starts = list(range(first, last + 1, window_size))
+
+        windows = [
+            {"start": start, "end": start + window_size, "count": counts.get(start, 0)}
+            for start in starts
+        ]
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": window_size,
+                "from": from_value,
+                "to": to_value,
+                "windows": windows,
+            },
         )
 
     def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:

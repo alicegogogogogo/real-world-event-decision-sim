@@ -263,6 +263,178 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["organizationId"], "org-1")
 
+    # --- GET /events/aggregate -------------------------------------------------
+
+    def aggregate(self, query: str) -> tuple[int, Any]:
+        return self.request(f"/events/aggregate?{query}")
+
+    def seed_aggregate_events(self) -> None:
+        events = [
+            make_event(eventId="evt-1", occurredAt=0),
+            make_event(eventId="evt-2", occurredAt=59),
+            make_event(eventId="evt-3", occurredAt=60),
+            make_event(eventId="evt-4", occurredAt=60),
+            make_event(eventId="evt-5", occurredAt=180),
+            make_event(eventId="evt-6", type="incident.updated", occurredAt=10),
+            make_event(eventId="evt-7", organizationId="org-2", occurredAt=10),
+        ]
+        for event in events:
+            self.assertEqual(self.post_event(event)[0], 201)
+
+    def test_aggregate_without_range_returns_only_covered_windows(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.aggregate(
+            "organizationId=org-1&type=incident.created&windowSize=60"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "from": None,
+                "to": None,
+                "windows": [
+                    {"start": 0, "end": 60, "count": 2},
+                    {"start": 60, "end": 120, "count": 2},
+                    {"start": 180, "end": 240, "count": 1},
+                ],
+            },
+        )
+
+    def test_aggregate_with_range_returns_empty_windows_and_filters(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.aggregate(
+            "organizationId=org-1&type=incident.created&windowSize=60&from=59&to=180"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["from"], 59)
+        self.assertEqual(body["to"], 180)
+        self.assertEqual(
+            body["windows"],
+            [
+                {"start": 0, "end": 60, "count": 1},
+                {"start": 60, "end": 120, "count": 2},
+                {"start": 120, "end": 180, "count": 0},
+                {"start": 180, "end": 240, "count": 1},
+            ],
+        )
+
+    def test_aggregate_boundary_event_belongs_to_upper_window(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.aggregate(
+            "organizationId=org-1&type=incident.created&windowSize=60&from=60&to=60"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["windows"], [{"start": 60, "end": 120, "count": 2}]
+        )
+
+    def test_aggregate_no_matching_events_without_range_is_empty(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.aggregate(
+            "organizationId=org-1&type=no.such.type&windowSize=10"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [])
+
+    def test_aggregate_no_matching_events_with_range_returns_zero_windows(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.aggregate(
+            "organizationId=org-1&type=no.such.type&windowSize=10&from=5&to=25"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["windows"],
+            [
+                {"start": 0, "end": 10, "count": 0},
+                {"start": 10, "end": 20, "count": 0},
+                {"start": 20, "end": 30, "count": 0},
+            ],
+        )
+
+    def test_aggregate_does_not_modify_ledger(self) -> None:
+        self.seed_aggregate_events()
+        self.aggregate("organizationId=org-1&type=incident.created&windowSize=60")
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["events"]), 6)
+
+    def test_aggregate_is_deterministic_across_insertion_order(self) -> None:
+        for event_id, occurred_at in (("evt-b", 60), ("evt-a", 60), ("evt-c", 0)):
+            self.assertEqual(
+                self.post_event(make_event(eventId=event_id, occurredAt=occurred_at))[0],
+                201,
+            )
+        first = self.aggregate("organizationId=org-1&type=incident.created&windowSize=60")
+        second = self.aggregate("organizationId=org-1&type=incident.created&windowSize=60")
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first[1]["windows"],
+            [
+                {"start": 0, "end": 60, "count": 1},
+                {"start": 60, "end": 120, "count": 2},
+            ],
+        )
+
+    def test_aggregate_requires_each_parameter_exactly_once(self) -> None:
+        base = "organizationId=org-1&type=incident.created&windowSize=60"
+        for query in (
+            "",
+            "organizationId=org-1&type=incident.created",
+            "organizationId=org-1&windowSize=60",
+            "type=incident.created&windowSize=60",
+            f"{base}&windowSize=60",
+            f"{base}&type=incident.created",
+            f"{base}&organizationId=org-1",
+        ):
+            with self.subTest(query=query):
+                status, body = self.aggregate(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_rejects_blank_and_invalid_values(self) -> None:
+        for query in (
+            "organizationId=&type=t&windowSize=1",
+            "organizationId=%20&type=t&windowSize=1",
+            "organizationId=o&type=&windowSize=1",
+            "organizationId=o&type=t&windowSize=",
+            "organizationId=o&type=t&windowSize=0",
+            "organizationId=o&type=t&windowSize=-5",
+            "organizationId=o&type=t&windowSize=1.5",
+            "organizationId=o&type=t&windowSize=abc",
+            "organizationId=o&type=t&windowSize=+5",
+        ):
+            with self.subTest(query=query):
+                status, body = self.aggregate(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_from_to_must_be_paired_valid_and_ordered(self) -> None:
+        base = "organizationId=o&type=t&windowSize=10"
+        for query in (
+            f"{base}&from=0",
+            f"{base}&to=0",
+            f"{base}&from=0&from=1&to=2",
+            f"{base}&from=0&to=1&to=2",
+            f"{base}&from=-1&to=2",
+            f"{base}&from=0&to=x",
+            f"{base}&from=&to=2",
+            f"{base}&from=10&to=5",
+        ):
+            with self.subTest(query=query):
+                status, body = self.aggregate(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_aggregate_accepts_equal_from_and_to(self) -> None:
+        status, body = self.aggregate(
+            "organizationId=o&type=t&windowSize=10&from=0&to=0"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [{"start": 0, "end": 10, "count": 0}])
+
     # --- concurrency and isolation ---------------------------------------------
 
     def test_concurrent_identical_posts_create_once(self) -> None:

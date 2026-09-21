@@ -70,3 +70,51 @@ belong only to that organization and are sorted by `occurredAt`, then
 `eventId`. An unknown organization returns `"events": []`. A missing, blank, or
 duplicated parameter yields `422`.
 
+### `GET /events/aggregate?organizationId=...&type=...&windowSize=...`
+
+Counts stored events per time window, without modifying the ledger. Only
+events matching both `organizationId` and `type` are counted; other
+organizations' data is never included.
+
+Query parameters:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. A missing, duplicated, or invalid parameter yields
+`422` with a JSON body containing a stable `error` field.
+
+Windows start at `0` and each covers `[start, end)` with
+`end = start + windowSize`; an event belongs to a window when
+`start <= occurredAt < end`. The `200` response is:
+
+```json
+{
+  "organizationId": "org-1",
+  "type": "incident.created",
+  "windowSize": 60,
+  "from": null,
+  "to": null,
+  "windows": [{"start": 0, "end": 60, "count": 2}]
+}
+```
+
+- Without `from`/`to` (`from` and `to` echo back as `null`), only windows
+  actually covered by matching events are returned; with no matching events
+  `windows` is `[]`.
+- With `from`/`to`, only events with `from <= occurredAt <= to` are counted,
+  and every window intersecting the closed interval `[from, to]` is returned,
+  including empty windows with `count: 0`.
+- `windows` is sorted by `start` ascending; results are deterministic
+  regardless of event insertion order, replays, or identical timestamps.
+
+```bash
+curl 'http://127.0.0.1:8000/events/aggregate?organizationId=org-1&type=incident.created&windowSize=60&from=0&to=180'
+```
+
