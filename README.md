@@ -118,3 +118,63 @@ Windows start at `0` and each covers `[start, end)` with
 curl 'http://127.0.0.1:8000/events/aggregate?organizationId=org-1&type=incident.created&windowSize=60&from=0&to=180'
 ```
 
+### `POST /decisions/evaluate`
+
+A read-only, deterministic emergency decision over the same windows as the
+aggregate endpoint. The ledger is never written to or changed by a decision
+request. Requires `Content-Type: application/json`. The body must be a JSON
+object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string                                   |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+Only events matching both `organizationId` and `type` are counted. Windows
+start at `0` and cover `[start, start + windowSize)`. Without `from`/`to`,
+only windows actually covered by matching events are considered; with a
+range, events are filtered by the closed interval `from <= occurredAt <= to`
+and every window intersecting that interval is considered, including empty
+ones for audit reconciliation.
+
+The `200` response has a fixed shape:
+
+```json
+{
+  "organizationId": "org-1",
+  "type": "incident.created",
+  "windowSize": 60,
+  "from": null,
+  "to": null,
+  "peakStart": 60,
+  "peakCount": 2,
+  "action": "observe"
+}
+```
+
+- `peakCount` is the largest window count and `peakStart` is that window's
+  start; ties resolve to the earliest start, so results are reproducible
+  regardless of event submission order.
+- With no matching events (or no non-empty windows in range), `peakCount` is
+  `0`, `peakStart` is `null`, and `action` is `"observe"`.
+- `action` is `"escalate"` when `peakCount >= threshold`, otherwise
+  `"observe"`.
+- Unknown organizations or types compute as zero events and return normally;
+  other organizations' data is never included.
+
+```bash
+curl -X POST http://127.0.0.1:8000/decisions/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON; no decision is
+  produced.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  invalid types, unpaired `from`/`to`, or out-of-range values.
+

@@ -69,6 +69,27 @@ class ServerTest(unittest.TestCase):
             "/events", method="POST", body=body, content_type=content_type
         )
 
+    def post_decision(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/decisions/evaluate", method="POST", body=body, content_type=content_type
+        )
+
+    def seed_aggregate_events(self) -> None:
+        events = [
+            make_event(eventId="evt-1", occurredAt=0),
+            make_event(eventId="evt-2", occurredAt=59),
+            make_event(eventId="evt-3", occurredAt=60),
+            make_event(eventId="evt-4", occurredAt=60),
+            make_event(eventId="evt-5", occurredAt=180),
+            make_event(eventId="evt-6", type="incident.updated", occurredAt=10),
+            make_event(eventId="evt-7", organizationId="org-2", occurredAt=10),
+        ]
+        for event in events:
+            self.assertEqual(self.post_event(event)[0], 201)
+
     # --- pre-existing contract ------------------------------------------------
 
     def test_health(self) -> None:
@@ -268,19 +289,6 @@ class ServerTest(unittest.TestCase):
     def aggregate(self, query: str) -> tuple[int, Any]:
         return self.request(f"/events/aggregate?{query}")
 
-    def seed_aggregate_events(self) -> None:
-        events = [
-            make_event(eventId="evt-1", occurredAt=0),
-            make_event(eventId="evt-2", occurredAt=59),
-            make_event(eventId="evt-3", occurredAt=60),
-            make_event(eventId="evt-4", occurredAt=60),
-            make_event(eventId="evt-5", occurredAt=180),
-            make_event(eventId="evt-6", type="incident.updated", occurredAt=10),
-            make_event(eventId="evt-7", organizationId="org-2", occurredAt=10),
-        ]
-        for event in events:
-            self.assertEqual(self.post_event(event)[0], 201)
-
     def test_aggregate_without_range_returns_only_covered_windows(self) -> None:
         self.seed_aggregate_events()
         status, body = self.aggregate(
@@ -435,7 +443,288 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["windows"], [{"start": 0, "end": 10, "count": 0}])
 
+    # --- POST /decisions/evaluate ---------------------------------------------
+
+    def decision_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "organizationId": "org-1",
+            "type": "incident.created",
+            "windowSize": 60,
+            "threshold": 3,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_decision_observe_when_peak_below_threshold(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.post_decision(self.decision_payload(threshold=3))
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "from": None,
+                "to": None,
+                "peakStart": 0,
+                "peakCount": 2,
+                "action": "observe",
+            },
+        )
+
+    def test_decision_escalate_when_peak_reaches_threshold(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.post_decision(self.decision_payload(threshold=2))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["peakStart"], 0)
+        self.assertEqual(body["peakCount"], 2)
+        self.assertEqual(body["action"], "escalate")
+
+    def test_decision_tie_chooses_earliest_window_start(self) -> None:
+        # Two events at 10 and two at 130: windows 0 and 120 tie at count 2.
+        for event_id, occurred_at in (
+            ("evt-a", 10),
+            ("evt-b", 11),
+            ("evt-c", 130),
+            ("evt-d", 131),
+        ):
+            self.assertEqual(
+                self.post_event(
+                    make_event(eventId=event_id, occurredAt=occurred_at)
+                )[0],
+                201,
+            )
+        status, body = self.post_decision(self.decision_payload(threshold=5))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["peakStart"], 0)
+        self.assertEqual(body["peakCount"], 2)
+        self.assertEqual(body["action"], "observe")
+
+    def test_decision_no_matching_events_is_zero_observe(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.post_decision(self.decision_payload(type="no.such.type"))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["peakCount"], 0)
+        self.assertIsNone(body["peakStart"])
+        self.assertEqual(body["action"], "observe")
+
+    def test_decision_unknown_organization_is_isolated_zero_result(self) -> None:
+        self.seed_aggregate_events()
+        status, body = self.post_decision(self.decision_payload(organizationId="org-x"))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["organizationId"], "org-x")
+        self.assertEqual(body["peakCount"], 0)
+        self.assertIsNone(body["peakStart"])
+        self.assertEqual(body["action"], "observe")
+
+    def test_decision_with_range_filters_and_keeps_empty_windows(self) -> None:
+        self.seed_aggregate_events()
+        payload = self.decision_payload(
+            windowSize=60, threshold=3, **{"from": 59, "to": 180}
+        )
+        status, body = self.post_decision(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["from"], 59)
+        self.assertEqual(body["to"], 180)
+        # Counts over [59,180]: window 0 -> 1 (59), 60 -> 2, 120 -> 0, 180 -> 1.
+        self.assertEqual(body["peakStart"], 60)
+        self.assertEqual(body["peakCount"], 2)
+        self.assertEqual(body["action"], "observe")
+
+    def test_decision_range_with_only_empty_windows_is_zero_observe(self) -> None:
+        self.seed_aggregate_events()
+        payload = self.decision_payload(
+            type="no.such.type", windowSize=10, threshold=1, **{"from": 5, "to": 25}
+        )
+        status, body = self.post_decision(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["peakCount"], 0)
+        self.assertIsNone(body["peakStart"])
+        self.assertEqual(body["action"], "observe")
+
+    def test_decision_boundary_event_belongs_to_upper_window(self) -> None:
+        self.seed_aggregate_events()
+        payload = self.decision_payload(
+            windowSize=60, threshold=2, **{"from": 60, "to": 60}
+        )
+        status, body = self.post_decision(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["peakStart"], 60)
+        self.assertEqual(body["peakCount"], 2)
+        self.assertEqual(body["action"], "escalate")
+
+    def test_decision_equal_from_and_to_accepted(self) -> None:
+        status, body = self.post_decision(
+            self.decision_payload(
+                windowSize=10, threshold=1, **{"from": 0, "to": 0}
+            )
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["from"], 0)
+        self.assertEqual(body["to"], 0)
+        self.assertEqual(body["peakCount"], 0)
+        self.assertIsNone(body["peakStart"])
+
+    def test_decision_deterministic_across_insertion_order(self) -> None:
+        for event_id, occurred_at in (("evt-b", 60), ("evt-a", 60), ("evt-c", 0)):
+            self.assertEqual(
+                self.post_event(make_event(eventId=event_id, occurredAt=occurred_at))[0],
+                201,
+            )
+        payload = self.decision_payload(threshold=5)
+        first = self.post_decision(payload)
+        second = self.post_decision(payload)
+        self.assertEqual(first, second)
+        self.assertEqual(first[1]["peakStart"], 60)
+        self.assertEqual(first[1]["peakCount"], 2)
+
+    def test_decision_does_not_modify_ledger(self) -> None:
+        self.seed_aggregate_events()
+        self.post_decision(self.decision_payload())
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["events"]), 6)
+
+    def test_decision_missing_content_type_is_415(self) -> None:
+        status, body = self.post_decision(self.decision_payload(), content_type=None)
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_decision_unsupported_content_type_is_415(self) -> None:
+        status, body = self.post_decision(
+            self.decision_payload(), content_type="text/plain"
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_decision_malformed_json_is_400(self) -> None:
+        status, body = self.post_decision(b'{"organizationId": ', raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+
+    def test_decision_array_body_is_422(self) -> None:
+        status, body = self.post_decision([self.decision_payload()])
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_missing_required_field_is_422(self) -> None:
+        for field in ("organizationId", "type", "windowSize", "threshold"):
+            payload = self.decision_payload()
+            del payload[field]
+            with self.subTest(field=field):
+                status, body = self.post_decision(payload)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_extra_field_is_422(self) -> None:
+        status, body = self.post_decision(self.decision_payload(extra="nope"))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_blank_or_non_string_identifiers_are_422(self) -> None:
+        for field in ("organizationId", "type"):
+            for bad_value in ("", "   ", 123, None, ["x"], True):
+                with self.subTest(field=field, bad_value=bad_value):
+                    status, body = self.post_decision(
+                        self.decision_payload(**{field: bad_value})
+                    )
+                    self.assertEqual(status, 422)
+                    self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_bad_positive_integer_fields_are_422(self) -> None:
+        for field in ("windowSize", "threshold"):
+            for bad_value in (0, -1, 1.5, "60", True, None, [3]):
+                with self.subTest(field=field, bad_value=bad_value):
+                    status, body = self.post_decision(
+                        self.decision_payload(**{field: bad_value})
+                    )
+                    self.assertEqual(status, 422)
+                    self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_from_to_must_be_paired(self) -> None:
+        for overrides in ({"from": 0}, {"to": 0}):
+            with self.subTest(overrides=overrides):
+                status, body = self.post_decision(
+                    self.decision_payload(**overrides)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_bad_from_to_values_are_422(self) -> None:
+        for overrides in (
+            {"from": -1, "to": 2},
+            {"from": 0, "to": -2},
+            {"from": 1.5, "to": 2},
+            {"from": 0, "to": 2.5},
+            {"from": True, "to": 2},
+            {"from": 0, "to": False},
+            {"from": "0", "to": 2},
+            {"from": 10, "to": 5},
+            {"from": None, "to": 2},
+        ):
+            with self.subTest(overrides=overrides):
+                status, body = self.post_decision(
+                    self.decision_payload(**overrides)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_decision_repeated_requests_return_same_result(self) -> None:
+        self.seed_aggregate_events()
+        payload = self.decision_payload(threshold=2)
+        results = [self.post_decision(payload) for _ in range(5)]
+        self.assertTrue(all(status == 200 for status, _ in results))
+        self.assertEqual(len({json.dumps(body, sort_keys=True) for _, body in results}), 1)
+
     # --- concurrency and isolation ---------------------------------------------
+
+    def test_decision_reads_are_consistent_under_concurrent_writes(self) -> None:
+        # Seed some initial events so reads are taken against a populated
+        # ledger while many writes land concurrently.
+        for index in range(20):
+            self.assertEqual(
+                self.post_event(
+                    make_event(eventId=f"seed-{index}", occurredAt=index * 3)
+                )[0],
+                201,
+            )
+
+        def write_event(index: int) -> None:
+            self.post_event(
+                make_event(eventId=f"live-{index}", occurredAt=index * 7)
+            )
+
+        payload = self.decision_payload(windowSize=10, threshold=50)
+
+        def read_decision(_: int) -> tuple[int, Any]:
+            return self.post_decision(payload)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            writes = [pool.submit(write_event, i) for i in range(24)]
+            reads = list(pool.map(read_decision, range(16)))
+            for future in writes:
+                future.result()
+
+        for status, body in reads:
+            self.assertEqual(status, 200)
+            # Every response must be internally coherent: peakCount is the
+            # declared maximum and observe/escalate agrees with the threshold.
+            self.assertGreaterEqual(body["peakCount"], 0)
+            if body["peakCount"] == 0:
+                self.assertIsNone(body["peakStart"])
+            else:
+                self.assertIsNotNone(body["peakStart"])
+            expected_action = (
+                "escalate" if body["peakCount"] >= payload["threshold"] else "observe"
+            )
+            self.assertEqual(body["action"], expected_action)
+
+        # The ledger still contains exactly the seeded plus live events;
+        # decision reads never wrote anything.
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["events"]), 44)
 
     def test_concurrent_identical_posts_create_once(self) -> None:
         event = make_event()

@@ -12,6 +12,10 @@ SERVICE_NAME = "real-world-event-decision-sim"
 
 EVENT_FIELDS = ("eventId", "organizationId", "type", "occurredAt", "payload")
 
+DECISION_REQUIRED_FIELDS = ("organizationId", "type", "windowSize", "threshold")
+DECISION_OPTIONAL_FIELDS = ("from", "to")
+DECISION_FIELDS = DECISION_REQUIRED_FIELDS + DECISION_OPTIONAL_FIELDS
+
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
@@ -61,7 +65,11 @@ class EventLedger:
     def occurred_at_values(
         self, organization_id: str, event_type: str
     ) -> list[int]:
-        """Sorted occurredAt values of events matching organization and type."""
+        """Sorted occurredAt values of events matching organization and type.
+
+        The matching values are copied while holding the lock, so the
+        returned list is a consistent snapshot safe against concurrent writes.
+        """
         with self._lock:
             values = [
                 event["occurredAt"]
@@ -188,6 +196,136 @@ def _aggregate_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _is_positive_integer(value: Any) -> bool:
+    """True only for plain positive ints (booleans and floats rejected)."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not isinstance(value, float)
+        and value > 0
+    )
+
+
+def _is_non_negative_integer(value: Any) -> bool:
+    """True only for plain non-negative ints (booleans and floats rejected)."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not isinstance(value, float)
+        and value >= 0
+    )
+
+
+def validate_decision_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /decisions/evaluate.
+
+    Required fields: organizationId, type, windowSize, threshold.
+    Optional fields: from and to, which must appear together. No other
+    fields are allowed.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("decision body must be a JSON object")
+
+    keys = set(data)
+    required = set(DECISION_REQUIRED_FIELDS)
+    allowed = set(DECISION_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
+def evaluate_decision(occurred: list[int], params: dict[str, Any]) -> dict[str, Any]:
+    """Compute the peak window and resulting action from matching timestamps.
+
+    ``occurred`` is a consistent snapshot (already filtered by organization
+    and type). Window boundaries are left-closed/right-open and start at
+    zero. Ties on the peak count resolve to the earliest window start.
+    """
+    window_size = params["windowSize"]
+    threshold = params["threshold"]
+    from_value = params["from"]
+    to_value = params["to"]
+
+    counts: dict[int, int] = {}
+    for timestamp in occurred:
+        if from_value is not None and not (from_value <= timestamp <= to_value):
+            continue
+        start = (timestamp // window_size) * window_size
+        counts[start] = counts.get(start, 0) + 1
+
+    if from_value is None:
+        # Only windows actually covered by matching events.
+        starts = sorted(counts)
+    else:
+        # Every window intersecting the closed interval [from, to], kept
+        # (including empty ones) so the audit can reconcile the result.
+        first = (from_value // window_size) * window_size
+        last = (to_value // window_size) * window_size
+        starts = list(range(first, last + 1, window_size))
+
+    peak_start = None
+    peak_count = 0
+    for start in starts:
+        count = counts.get(start, 0)
+        if count > peak_count:
+            peak_count = count
+            peak_start = start
+
+    action = "escalate" if peak_count >= threshold else "observe"
+    return {
+        "organizationId": params["organizationId"],
+        "type": params["type"],
+        "windowSize": window_size,
+        "from": from_value,
+        "to": to_value,
+        "peakStart": peak_start,
+        "peakCount": peak_count,
+        "action": action,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -212,6 +350,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlsplit(self.path)
+        if parsed.path == "/decisions/evaluate":
+            self._evaluate_decision()
+            return
         if parsed.path != "/events":
             self._write_json(
                 HTTPStatus.NOT_FOUND,
@@ -261,6 +402,47 @@ class Handler(BaseHTTPRequestHandler):
                 HTTPStatus.CONFLICT,
                 {"error": "event_id_conflict"},
             )
+
+    def _evaluate_decision(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._write_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "unsupported_media_type"},
+            )
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+            )
+            return
+
+        try:
+            params = validate_decision_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        # Read-only: the ledger is never mutated by a decision request, and
+        # the snapshot is taken in a single locked copy for consistency.
+        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+            params["organizationId"], params["type"]
+        )
+        result = evaluate_decision(occurred, params)
+        self._write_json(HTTPStatus.OK, result)
 
     def _list_events(self, query: str) -> None:
         try:
