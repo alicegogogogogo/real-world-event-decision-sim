@@ -24,7 +24,8 @@ python -m unittest discover -s tests -v
 
 ## Public interface
 
-- `GET /health` returns JSON with the service name and `ok` status.
+- `GET /health` returns JSON with the service name and `ok` status: the body
+  is `{"service": "...", "status": "ok"}` with keys `service` and `status`.
 - Unknown paths return a JSON `not_found` error with HTTP 404.
 - `python -m event_sim --help` documents the command-line entry point.
 
@@ -69,6 +70,58 @@ Returns `200` with `{"organizationId": "...", "events": [...]}`, where events
 belong only to that organization and are sorted by `occurredAt`, then
 `eventId`. An unknown organization returns `"events": []`. A missing, blank, or
 duplicated parameter yields `422`.
+
+### `GET /events/replay?organizationId=...&asOf=...`
+
+Replays the event ledger as of a point in time, read-only: the ledger is
+never written by a replay, and the replay sees only the current process
+ledger (a restart starts empty). Both `organizationId` and `asOf` must
+appear exactly once and be non-empty; `asOf` must be non-negative integer
+text (e.g. `100`). A missing, duplicated, blank, or non-integer parameter
+yields `422` with `{"error": "validation_error", ...}`.
+
+Returns `200` with `{"organizationId": "...", "asOf": 100, "events": [...]}`,
+echoing the organization and the parsed integer time point. `events` lists
+only that organization's events with `occurredAt <= asOf`, each as the
+original five-field record, sorted by `occurredAt` then `eventId` in Unicode
+code-point order. An unknown organization returns `"events": []`; other
+organizations' events are never included. The body is compact JSON with keys
+sorted by code point, integer values kept as integers, and a trailing
+newline.
+
+```bash
+curl 'http://127.0.0.1:8000/events/replay?organizationId=org-1&asOf=100'
+```
+
+### `GET /events/replay/compare?organizationId=...&fromAsOf=...&toAsOf=...`
+
+Compares two replays of the same organization's ledger, read-only.
+`organizationId`, `fromAsOf`, and `toAsOf` must each appear exactly once and
+be non-empty; both time points must be non-negative integer text and may
+appear in either order. Any parameter problem yields `422` with
+`{"error": "validation_error", ...}`.
+
+The endpoint replays the ledger at `fromAsOf` and at `toAsOf` and diffs the
+two event lists by `eventId`. The `200` response echoes the organization and
+both parsed integer time points, and adds:
+
+| Key              | Content                                                              |
+| ---------------- | -------------------------------------------------------------------- |
+| `added`          | eventIds only in the `toAsOf` replay                                 |
+| `removed`        | eventIds only in the `fromAsOf` replay                               |
+| `changed`        | eventIds in both replays whose non-identifier fields differ          |
+| `unchangedCount` | integer count of eventIds in both with every field identical         |
+
+`added`, `removed`, and `changed` are arrays of event identifiers, each
+sorted in Unicode code-point order; `unchangedCount` is given separately as
+an integer. An unknown organization computes as zero events at both time
+points and returns the normal structure without other organizations' data.
+Repeated identical requests return byte-for-byte identical compact JSON
+(keys sorted by code point, trailing newline).
+
+```bash
+curl 'http://127.0.0.1:8000/events/replay/compare?organizationId=org-1&fromAsOf=0&toAsOf=100'
+```
 
 ### `GET /events/aggregate?organizationId=...&type=...&windowSize=...`
 
@@ -555,5 +608,7 @@ validation, ordering, and window semantics:
   `branch_not_found`.
 - The region queries (`/events/region` and `/events/region/aggregate`) are
   main-only; no branch-prefixed region paths are added.
+- The replay queries (`/events/replay` and `/events/replay/compare`) are
+  main-only; no branch-prefixed replay paths are added.
 - `/decisions/allocate` remains a main-only, stateless endpoint.
 
