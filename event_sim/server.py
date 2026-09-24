@@ -47,6 +47,20 @@ class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
 
 
+def event_region(event: dict[str, Any]) -> str | None:
+    """Return an event's region attribution, or None when it has none.
+
+    The region is the payload's ``region`` value: only a non-empty string
+    attributes the event to a region. A missing key, an empty string, or any
+    non-string value means the event has no region. Matching uses the value
+    verbatim, with no normalization.
+    """
+    region = event["payload"].get("region")
+    if isinstance(region, str) and region != "":
+        return region
+    return None
+
+
 class EventLedger:
     """In-process store of events, keyed by eventId.
 
@@ -88,6 +102,25 @@ class EventLedger:
         events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
         return events
 
+    def list_for_organization_region(
+        self, organization_id: str, region: str
+    ) -> list[dict[str, Any]]:
+        """List one organization's events attributed to one region.
+
+        Only events whose payload ``region`` is a non-empty string equal to
+        ``region`` (compared verbatim) are included; ordering matches
+        :meth:`list_for_organization`.
+        """
+        with self._lock:
+            events = [
+                dict(event)
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
+                and event_region(event) == region
+            ]
+        events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
+        return events
+
     def occurred_at_values(
         self, organization_id: str, event_type: str
     ) -> list[int]:
@@ -102,6 +135,25 @@ class EventLedger:
                 for event in self._events.values()
                 if event["organizationId"] == organization_id
                 and event["type"] == event_type
+            ]
+        values.sort()
+        return values
+
+    def occurred_at_values_for_region(
+        self, organization_id: str, event_type: str, region: str
+    ) -> list[int]:
+        """Sorted occurredAt values of an org/type's events in one region.
+
+        Consistent locked snapshot, like :meth:`occurred_at_values`; events
+        without a non-empty string payload ``region`` never match.
+        """
+        with self._lock:
+            values = [
+                event["occurredAt"]
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
+                and event["type"] == event_type
+                and event_region(event) == region
             ]
         values.sort()
         return values
@@ -492,6 +544,81 @@ def _organization_id_from_query(query: str) -> str:
     if not value.strip():
         raise EventValidationError("organizationId must be non-empty")
     return value
+
+
+def _single_non_empty_text(params: dict[str, list[str]], name: str) -> str:
+    """Extract one exactly-once, non-blank text parameter from parsed query."""
+    values = params.get(name)
+    if not values or len(values) != 1:
+        raise EventValidationError(
+            f"{name} query parameter is required exactly once"
+        )
+    value = values[0]
+    if not value.strip():
+        raise EventValidationError(f"{name} must be non-empty")
+    return value
+
+
+def _region_list_params_from_query(query: str) -> dict[str, str]:
+    """Validate the /events/region query string.
+
+    organizationId and region are each required exactly once and non-empty;
+    matching keeps the raw region text verbatim.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+    return {
+        "organizationId": _single_non_empty_text(params, "organizationId"),
+        "region": _single_non_empty_text(params, "region"),
+    }
+
+
+def _region_aggregate_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/region/aggregate query string.
+
+    organizationId, region, type and windowSize are each required exactly
+    once; from and to must be both absent or both present exactly once. The
+    rules mirror /events/aggregate, with an added region parameter.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    region = _single_non_empty_text(params, "region")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size_text = _single_non_empty_text(params, "windowSize")
+    window_size = _integer_text(window_size_text)
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "region": region,
+        "type": event_type,
+        "windowSize": window_size,
+        "from": from_value,
+        "to": to_value,
+    }
 
 
 def _integer_text(value: str) -> int | None:
@@ -1005,6 +1132,41 @@ def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _windows_from_occurred(
+    occurred: list[int],
+    window_size: int,
+    from_value: int | None,
+    to_value: int | None,
+) -> list[dict[str, int]]:
+    """Build aggregate windows from a sorted timestamp snapshot.
+
+    Windows start at zero and cover ``[start, start + windowSize)``. Without
+    a range only windows actually hit by events are returned; with a range
+    every window intersecting the closed interval ``[from, to]`` is kept,
+    empty ones included. Windows are ordered by start ascending.
+    """
+    counts: dict[int, int] = {}
+    for timestamp in occurred:
+        if from_value is not None and not (from_value <= timestamp <= to_value):
+            continue
+        start = (timestamp // window_size) * window_size
+        counts[start] = counts.get(start, 0) + 1
+
+    if from_value is None:
+        # Only windows actually covered by matching events.
+        starts = sorted(counts)
+    else:
+        # Every window intersecting the closed interval [from, to].
+        first = (from_value // window_size) * window_size
+        last = (to_value // window_size) * window_size
+        starts = list(range(first, last + 1, window_size))
+
+    return [
+        {"start": start, "end": start + window_size, "count": counts.get(start, 0)}
+        for start in starts
+    ]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -1065,6 +1227,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/events":
             self._list_events(self.server.ledger, query)  # type: ignore[attr-defined]
+            return
+        if path == "/events/region":
+            self._list_events_by_region(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/region/aggregate":
+            self._aggregate_events_by_region(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
             return
         if path == "/events/aggregate":
             self._aggregate_events(
@@ -1314,27 +1488,9 @@ class Handler(BaseHTTPRequestHandler):
         occurred = ledger.occurred_at_values(
             params["organizationId"], params["type"]
         )
-
-        counts: dict[int, int] = {}
-        for timestamp in occurred:
-            if from_value is not None and not (from_value <= timestamp <= to_value):
-                continue
-            start = (timestamp // window_size) * window_size
-            counts[start] = counts.get(start, 0) + 1
-
-        if from_value is None:
-            # Only windows actually covered by matching events.
-            starts = sorted(counts)
-        else:
-            # Every window intersecting the closed interval [from, to].
-            first = (from_value // window_size) * window_size
-            last = (to_value // window_size) * window_size
-            starts = list(range(first, last + 1, window_size))
-
-        windows = [
-            {"start": start, "end": start + window_size, "count": counts.get(start, 0)}
-            for start in starts
-        ]
+        windows = _windows_from_occurred(
+            occurred, window_size, from_value, to_value
+        )
         self._write_json(
             HTTPStatus.OK,
             {
@@ -1346,6 +1502,68 @@ class Handler(BaseHTTPRequestHandler):
                 "windows": windows,
             },
             newline=newline,
+        )
+
+    def _list_events_by_region(
+        self, ledger: EventLedger, query: str
+    ) -> None:
+        try:
+            params = _region_list_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        events = ledger.list_for_organization_region(
+            params["organizationId"], params["region"]
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "region": params["region"],
+                "events": events,
+            },
+            newline=True,
+        )
+
+    def _aggregate_events_by_region(
+        self, ledger: EventLedger, query: str
+    ) -> None:
+        try:
+            params = _region_aggregate_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        window_size = params["windowSize"]
+        from_value = params["from"]
+        to_value = params["to"]
+        # Read-only: a single locked snapshot of the region's matching events.
+        occurred = ledger.occurred_at_values_for_region(
+            params["organizationId"], params["type"], params["region"]
+        )
+        windows = _windows_from_occurred(
+            occurred, window_size, from_value, to_value
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "region": params["region"],
+                "type": params["type"],
+                "windowSize": window_size,
+                "from": from_value,
+                "to": to_value,
+                "windows": windows,
+            },
+            newline=True,
         )
 
     # --------------------------------------------------------------- decisions

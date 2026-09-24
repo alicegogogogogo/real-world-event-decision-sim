@@ -510,9 +510,19 @@ class ServerTest(unittest.TestCase):
         self.seed_aggregate_events()
         status, body = self.post_decision(self.decision_payload(threshold=2))
         self.assertEqual(status, 200)
-        self.assertEqual(body["peakStart"], 0)
-        self.assertEqual(body["peakCount"], 2)
-        self.assertEqual(body["action"], "escalate")
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "from": None,
+                "to": None,
+                "peakStart": 0,
+                "peakCount": 2,
+                "action": "escalate",
+            },
+        )
 
     def test_decision_tie_chooses_earliest_window_start(self) -> None:
         # Two events at 10 and two at 130: windows 0 and 120 tie at count 2.
@@ -1228,9 +1238,19 @@ class ServerTest(unittest.TestCase):
         second_status, second_body = self.post_reservation(self.reservation_payload())
         self.assertEqual(first_status, 201)
         self.assertEqual(second_status, 200)
+        self.assertEqual(
+            second_body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "res-1",
+                "resourceId": "r-a",
+                "quantity": 2,
+                "capacity": 5,
+                "occupied": 2,
+                "remaining": 3,
+            },
+        )
         self.assertEqual(first_body, second_body)
-        self.assertEqual(second_body["occupied"], 2)
-        self.assertEqual(second_body["remaining"], 3)
 
         status, listing = self.request("/reservations?organizationId=org-1")
         self.assertEqual(status, 200)

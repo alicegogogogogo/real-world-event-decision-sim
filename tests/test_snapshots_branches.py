@@ -441,11 +441,15 @@ class SnapshotBranchTest(unittest.TestCase):
         self._fork_with_seeded_snapshot()
         self.create_branch("br-2")
 
-        status, _ = self.post_json(
+        status, body = self.post_json(
             "/branches/br-1/events",
             make_event(eventId="evt-branch", occurredAt=300),
         )
         self.assertEqual(status, 201)
+        # A successful branch commit returns the same full five-field body.
+        self.assertEqual(
+            body, make_event(eventId="evt-branch", occurredAt=300)
+        )
 
         # The new event is visible in br-1 only.
         status, body = self.request("/branches/br-1/events?organizationId=org-1")
@@ -478,8 +482,18 @@ class SnapshotBranchTest(unittest.TestCase):
             make_reservation(reservationId="res-branch", quantity=1),
         )
         self.assertEqual(status, 201)
-        self.assertEqual(body["occupied"], 3)
-        self.assertEqual(body["remaining"], 2)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "res-branch",
+                "resourceId": "r-a",
+                "quantity": 1,
+                "capacity": 5,
+                "occupied": 3,
+                "remaining": 2,
+            },
+        )
 
         # Balances moved only in br-1.
         status, listing = self.request(
@@ -503,8 +517,18 @@ class SnapshotBranchTest(unittest.TestCase):
             "/branches/br-1/reservations", make_reservation()
         )
         self.assertEqual(status, 200)
-        self.assertEqual(body["occupied"], 2)
-        self.assertEqual(body["remaining"], 3)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "res-1",
+                "resourceId": "r-a",
+                "quantity": 2,
+                "capacity": 5,
+                "occupied": 2,
+                "remaining": 3,
+            },
+        )
 
         # Same reservationId, different fields.
         status, body = self.post_json(
@@ -540,8 +564,18 @@ class SnapshotBranchTest(unittest.TestCase):
             make_reservation(reservationId="res-2", quantity=3),
         )
         self.assertEqual(status, 201)
-        self.assertEqual(body["occupied"], 5)
-        self.assertEqual(body["remaining"], 0)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "res-2",
+                "resourceId": "r-a",
+                "quantity": 3,
+                "capacity": 5,
+                "occupied": 5,
+                "remaining": 0,
+            },
+        )
 
     def test_branch_reservation_response_ends_with_newline(self) -> None:
         self._fork_with_seeded_snapshot()
@@ -557,8 +591,10 @@ class SnapshotBranchTest(unittest.TestCase):
         self._fork_with_seeded_snapshot()
 
         seeded = make_event(eventId="evt-1", occurredAt=10)
-        status, _ = self.post_json("/branches/br-1/events", seeded)
+        status, body = self.post_json("/branches/br-1/events", seeded)
         self.assertEqual(status, 200)
+        # An identical replay returns the same full body, nothing duplicated.
+        self.assertEqual(body, seeded)
         status, body = self.post_json(
             "/branches/br-1/events", {**seeded, "payload": {"severity": "high"}}
         )
@@ -697,9 +733,19 @@ class SnapshotBranchTest(unittest.TestCase):
         ]
         self.assertTrue(all(status == 200 for status, _ in responses))
         self.assertEqual(len({json.dumps(b, sort_keys=True) for _, b in responses}), 1)
-        self.assertEqual(responses[0][1]["peakStart"], 0)
-        self.assertEqual(responses[0][1]["peakCount"], 3)
-        self.assertEqual(responses[0][1]["action"], "escalate")
+        self.assertEqual(
+            responses[0][1],
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "from": None,
+                "to": None,
+                "peakStart": 0,
+                "peakCount": 3,
+                "action": "escalate",
+            },
+        )
 
         status, main_result = self.post_json("/decisions/evaluate", payload)
         self.assertEqual(status, 200)

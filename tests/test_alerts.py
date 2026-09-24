@@ -137,11 +137,23 @@ class AlertTest(unittest.TestCase):
         self.seed_events(10, 20)
         status, body = self.evaluate_alert(threshold=2)
         self.assertEqual(status, 200)
-        self.assertEqual(body["action"], "escalate")
-        self.assertEqual(body["alertId"], "alert-1")
-        self.assertEqual(body["suppressedCount"], 0)
-        self.assertEqual(body["peakStart"], 0)
-        self.assertEqual(body["peakCount"], 2)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "threshold": 2,
+                "suppressionWindow": 100,
+                "from": None,
+                "to": None,
+                "peakStart": 0,
+                "peakCount": 2,
+                "action": "escalate",
+                "alertId": "alert-1",
+                "suppressedCount": 0,
+            },
+        )
 
     def test_zero_events_unknown_organization_is_observe(self) -> None:
         self.seed_events(10, 20)
@@ -178,9 +190,23 @@ class AlertTest(unittest.TestCase):
 
         status, second = self.evaluate_alert(suppressionWindow=100)
         self.assertEqual(status, 200)
-        self.assertEqual(second["action"], "suppress")
-        self.assertEqual(second["alertId"], "alert-1")
-        self.assertEqual(second["suppressedCount"], 1)
+        self.assertEqual(
+            second,
+            {
+                "organizationId": "org-1",
+                "type": "incident.created",
+                "windowSize": 60,
+                "threshold": 2,
+                "suppressionWindow": 100,
+                "from": None,
+                "to": None,
+                "peakStart": 0,
+                "peakCount": 2,
+                "action": "suppress",
+                "alertId": "alert-1",
+                "suppressedCount": 1,
+            },
+        )
 
         status, third = self.evaluate_alert(suppressionWindow=100)
         self.assertEqual(third["action"], "suppress")
