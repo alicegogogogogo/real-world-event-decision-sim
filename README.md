@@ -24,7 +24,7 @@ python -m unittest discover -s tests -v
 
 ## Public interface
 
-- `GET /health` returns JSON with the service name and `ok` status.
+- `GET /health` returns JSON with the service name and `ok` status, under the keys `service` and `status`: `{"service": "real-world-event-decision-sim", "status": "ok"}`.
 - Unknown paths return a JSON `not_found` error with HTTP 404.
 - `python -m event_sim --help` documents the command-line entry point.
 

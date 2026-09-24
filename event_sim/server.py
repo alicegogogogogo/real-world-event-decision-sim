@@ -102,6 +102,25 @@ class EventLedger:
         events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
         return events
 
+    def list_for_organization_as_of(
+        self, organization_id: str, as_of: int
+    ) -> list[dict[str, Any]]:
+        """List one organization's events with occurredAt not after ``as_of``.
+
+        Ordering matches :meth:`list_for_organization`; the result is a
+        consistent locked snapshot, so a replay never observes a partial
+        concurrent write.
+        """
+        with self._lock:
+            events = [
+                dict(event)
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
+                and event["occurredAt"] <= as_of
+            ]
+        events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
+        return events
+
     def list_for_organization_region(
         self, organization_id: str, region: str
     ) -> list[dict[str, Any]]:
@@ -626,6 +645,79 @@ def _integer_text(value: str) -> int | None:
     if not value or not value.isascii() or not value.isdigit():
         return None
     return int(value)
+
+
+def _non_negative_integer_param(params: dict[str, list[str]], name: str) -> int:
+    """Extract one exactly-once, non-blank, non-negative integer parameter."""
+    text = _single_non_empty_text(params, name)
+    value = _integer_text(text)
+    if value is None:
+        raise EventValidationError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _replay_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/replay query string.
+
+    organizationId and asOf are each required exactly once and non-empty;
+    asOf must be non-negative integer text.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+    return {
+        "organizationId": _single_non_empty_text(params, "organizationId"),
+        "asOf": _non_negative_integer_param(params, "asOf"),
+    }
+
+
+def _replay_compare_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/replay/compare query string.
+
+    organizationId, fromAsOf and toAsOf are each required exactly once and
+    non-empty; both time points must be non-negative integer text. The two
+    time points may relate to each other in either direction.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+    return {
+        "organizationId": _single_non_empty_text(params, "organizationId"),
+        "fromAsOf": _non_negative_integer_param(params, "fromAsOf"),
+        "toAsOf": _non_negative_integer_param(params, "toAsOf"),
+    }
+
+
+def compare_replays(
+    from_events: list[dict[str, Any]], to_events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Diff two replayed event lists by eventId.
+
+    ``added`` holds identifiers only in the to-replay, ``removed`` those
+    only in the from-replay; identifiers present in both count toward
+    ``unchangedCount`` when every field except eventId matches, and land in
+    ``changed`` otherwise. Each identifier group is sorted in Unicode
+    code-point order.
+    """
+    from_by_id = {event["eventId"]: event for event in from_events}
+    to_by_id = {event["eventId"]: event for event in to_events}
+    added = sorted(set(to_by_id) - set(from_by_id))
+    removed = sorted(set(from_by_id) - set(to_by_id))
+    changed: list[str] = []
+    unchanged_count = 0
+    for event_id in sorted(set(from_by_id) & set(to_by_id)):
+        before = from_by_id[event_id]
+        after = to_by_id[event_id]
+        if all(
+            before[field] == after[field]
+            for field in EVENT_FIELDS
+            if field != "eventId"
+        ):
+            unchanged_count += 1
+        else:
+            changed.append(event_id)
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "unchangedCount": unchanged_count,
+    }
 
 
 def _aggregate_params_from_query(query: str) -> dict[str, Any]:
@@ -1228,6 +1320,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/events":
             self._list_events(self.server.ledger, query)  # type: ignore[attr-defined]
             return
+        if path == "/events/replay":
+            self._replay_events(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/replay/compare":
+            self._compare_replays(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
         if path == "/events/region":
             self._list_events_by_region(
                 self.server.ledger,  # type: ignore[attr-defined]
@@ -1467,6 +1571,59 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {"organizationId": organization_id, "events": events},
             newline=newline,
+        )
+
+    def _replay_events(self, ledger: EventLedger, query: str) -> None:
+        try:
+            params = _replay_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        # Read-only: the replay is a single locked snapshot of the ledger.
+        events = ledger.list_for_organization_as_of(
+            params["organizationId"], params["asOf"]
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {"organizationId": params["organizationId"], "events": events},
+            newline=True,
+        )
+
+    def _compare_replays(self, ledger: EventLedger, query: str) -> None:
+        try:
+            params = _replay_compare_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        # Read-only: both replays read the same current ledger and nothing
+        # is written back, so identical requests return identical bytes.
+        from_events = ledger.list_for_organization_as_of(
+            params["organizationId"], params["fromAsOf"]
+        )
+        to_events = ledger.list_for_organization_as_of(
+            params["organizationId"], params["toAsOf"]
+        )
+        result = compare_replays(from_events, to_events)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "fromAsOf": params["fromAsOf"],
+                "toAsOf": params["toAsOf"],
+                "added": result["added"],
+                "removed": result["removed"],
+                "changed": result["changed"],
+                "unchangedCount": result["unchangedCount"],
+            },
+            newline=True,
         )
 
     def _aggregate_events(
