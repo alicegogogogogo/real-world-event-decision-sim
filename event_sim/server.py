@@ -12,9 +12,16 @@ SERVICE_NAME = "real-world-event-decision-sim"
 
 EVENT_FIELDS = ("eventId", "organizationId", "type", "occurredAt", "payload")
 
+DECISION_REQUIRED_FIELDS = ("organizationId", "type", "windowSize", "threshold")
+DECISION_ALLOWED_FIELDS = DECISION_REQUIRED_FIELDS + ("from", "to")
+
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
+
+
+class DecisionValidationError(ValueError):
+    """The submitted decision request fails the evaluation field rules."""
 
 
 class EventLedger:
@@ -188,6 +195,134 @@ def _aggregate_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _positive_integer(value: Any) -> bool:
+    # bool is a subclass of int; floats are explicitly rejected.
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not isinstance(value, float)
+        and value > 0
+    )
+
+
+def _non_negative_integer(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not isinstance(value, float)
+        and value >= 0
+    )
+
+
+def validate_decision(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body against the decision-request contract."""
+    if not isinstance(data, dict):
+        raise DecisionValidationError("decision body must be a JSON object")
+
+    keys = set(data)
+    allowed = set(DECISION_ALLOWED_FIELDS)
+    required = set(DECISION_REQUIRED_FIELDS)
+    missing = required - keys
+    unknown = keys - allowed
+    if missing or unknown:
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(sorted(missing))}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(sorted(unknown))}")
+        raise DecisionValidationError("; ".join(detail))
+
+    if not _non_empty_string(data["organizationId"]):
+        raise DecisionValidationError("organizationId must be a non-empty string")
+    if not _non_empty_string(data["type"]):
+        raise DecisionValidationError("type must be a non-empty string")
+    if not _positive_integer(data["windowSize"]):
+        raise DecisionValidationError("windowSize must be a positive integer")
+    if not _positive_integer(data["threshold"]):
+        raise DecisionValidationError("threshold must be a positive integer")
+
+    has_from = "from" in data
+    has_to = "to" in data
+    if has_from != has_to:
+        raise DecisionValidationError(
+            "from and to must be omitted together or supplied together"
+        )
+    from_value = None
+    to_value = None
+    if has_from:
+        if not _non_negative_integer(data["from"]):
+            raise DecisionValidationError("from must be a non-negative integer")
+        if not _non_negative_integer(data["to"]):
+            raise DecisionValidationError("to must be a non-negative integer")
+        from_value = data["from"]
+        to_value = data["to"]
+        if from_value > to_value:
+            raise DecisionValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": data["organizationId"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
+def evaluate_decision(params: dict[str, Any], occurred: list[int]) -> dict[str, Any]:
+    """Compute the peak window and resulting action over matching timestamps.
+
+    ``occurred`` is a single consistent snapshot from the ledger; this
+    function never touches or mutates ledger state.
+    """
+    window_size = params["windowSize"]
+    from_value = params["from"]
+    to_value = params["to"]
+
+    counts: dict[int, int] = {}
+    for timestamp in occurred:
+        if from_value is not None and not (from_value <= timestamp <= to_value):
+            continue
+        start = (timestamp // window_size) * window_size
+        counts[start] = counts.get(start, 0) + 1
+
+    if from_value is None:
+        # Only windows actually covered by matching events.
+        starts = sorted(counts)
+    else:
+        # Every window intersecting the closed interval [from, to], kept so
+        # empty windows remain available for auditing.
+        first = (from_value // window_size) * window_size
+        last = (to_value // window_size) * window_size
+        starts = list(range(first, last + 1, window_size))
+
+    peak_start = None
+    peak_count = 0
+    # starts is ascending, so the earliest start wins ties by only taking
+    # strict improvements.
+    for start in starts:
+        count = counts.get(start, 0)
+        if count > peak_count:
+            peak_count = count
+            peak_start = start
+
+    action = "escalate" if peak_count >= params["threshold"] else "observe"
+    return {
+        "organizationId": params["organizationId"],
+        "type": params["type"],
+        "windowSize": window_size,
+        "from": from_value,
+        "to": to_value,
+        "peakStart": peak_start,
+        "peakCount": peak_count,
+        "action": action,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -212,6 +347,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlsplit(self.path)
+        if parsed.path == "/decisions/evaluate":
+            self._evaluate_decision()
+            return
         if parsed.path != "/events":
             self._write_json(
                 HTTPStatus.NOT_FOUND,
@@ -327,6 +465,47 @@ class Handler(BaseHTTPRequestHandler):
                 "windows": windows,
             },
         )
+
+    def _evaluate_decision(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._write_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "unsupported_media_type"},
+            )
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+            )
+            return
+
+        try:
+            params = validate_decision(data)
+        except DecisionValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        # One locked read produces a consistent snapshot for this request;
+        # the evaluation itself never writes back to the ledger.
+        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+            params["organizationId"], params["type"]
+        )
+        result = evaluate_decision(params, occurred)
+        self._write_json(HTTPStatus.OK, result)
 
     def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
