@@ -118,6 +118,68 @@ Windows start at `0` and each covers `[start, end)` with
 curl 'http://127.0.0.1:8000/events/aggregate?organizationId=org-1&type=incident.created&windowSize=60&from=0&to=180'
 ```
 
+### `GET /events/region?organizationId=...&region=...`
+
+A read-only listing of one organization's events attributed to one region.
+An event is attributed to a region only when its payload carries a
+`region` key with a non-empty string value; a missing key, an empty string,
+or a non-string value means the event has no region. Matching is an exact
+string comparison. Regions need no registration and are never created
+implicitly — an unknown region simply matches nothing.
+
+Both `organizationId` and `region` must appear exactly once and be
+non-empty; a missing, blank, or duplicated parameter yields `422` with
+`{"error": "validation_error", ...}`. Returns `200` with
+`{"organizationId": "...", "region": "...", "events": [...]}`, where events
+belong only to that organization and region and are sorted by `occurredAt`,
+then `eventId`. With no matches, `"events"` is `[]`. The response is
+compact JSON with keys in code-point order and a trailing newline.
+
+```bash
+curl 'http://127.0.0.1:8000/events/region?organizationId=org-1&region=us-east'
+```
+
+### `GET /events/region/aggregate?organizationId=...&region=...&type=...&windowSize=...`
+
+Counts events per time window for one organization, region, and type,
+without modifying the ledger. The windowing rules are exactly those of
+`GET /events/aggregate`: windows start at `0` and cover
+`[start, start + windowSize)`; without `from`/`to` only windows covered by
+matching events are returned, and with `from`/`to` every window
+intersecting the closed interval is kept, including empty ones.
+
+Query parameters:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `region`         | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. A missing, duplicated, blank, or invalid parameter
+yields `422` with a stable `{"error": "validation_error", ...}` body. The
+`200` response mirrors the plain aggregate with an added `region` key
+(compact JSON, keys in code-point order, trailing newline):
+
+```json
+{"from":null,"organizationId":"org-1","region":"us-east","to":null,"type":"incident.created","windowSize":60,"windows":[{"count":2,"end":60,"start":0}]}
+```
+
+An unknown region or organization computes as zero events: `windows` is
+`[]` without a range, or all-zero windows within a range. Both region
+endpoints are read-only — they never write events, reservations, or
+alerts, and other organizations' data is never included. Region
+attribution lives only in the server process and is cleared on restart,
+and no branch-prefixed region paths are added.
+
+```bash
+curl 'http://127.0.0.1:8000/events/region/aggregate?organizationId=org-1&region=us-east&type=incident.created&windowSize=60'
+```
+
 ### `POST /decisions/evaluate`
 
 A read-only, deterministic emergency decision over the same windows as the
