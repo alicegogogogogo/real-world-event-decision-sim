@@ -155,6 +155,31 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(listing["events"]), 1)
 
+    def test_create_and_replay_successes_carry_byte_identical_full_body(self) -> None:
+        # The verification chain starts with a successful main event commit:
+        # both 201 (created) and 200 (identical replay) must carry the same
+        # five-field body, byte for byte. A success response with no body would
+        # break snapshot/branch reconciliation at its first step.
+        event = make_event()
+
+        def raw_post(payload: Any) -> tuple[int, bytes]:
+            request = Request(
+                f"{self.base_url}/events",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                return response.status, response.read()
+
+        first_status, first_raw = raw_post(event)
+        second_status, second_raw = raw_post(event)
+        self.assertEqual((first_status, second_status), (201, 200))
+        self.assertTrue(first_raw)
+        self.assertEqual(set(json.loads(first_raw)), set(make_event().keys()))
+        self.assertEqual(json.loads(first_raw), event)
+        self.assertEqual(second_raw, first_raw)
+
     def test_same_event_id_different_fields_is_conflict(self) -> None:
         self.assertEqual(self.post_event(make_event())[0], 201)
         for override in (
