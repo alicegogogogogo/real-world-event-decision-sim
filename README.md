@@ -240,3 +240,65 @@ curl -X POST http://127.0.0.1:8000/decisions/allocate \
 - `422 Unprocessable Entity` — a non-object body, missing or extra fields,
   invalid types, duplicate or blank identifiers, or out-of-range values.
 
+## Reservation inventory
+
+Reservations are held only in the server process: restarting (or starting a
+new instance) begins with empty inventory. The first claim naming a resource
+fixes that resource's capacity; it can never be rewritten afterwards.
+
+### `POST /reservations`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly these five fields:
+
+| Field            | Rule                                      |
+| ---------------- | ----------------------------------------- |
+| `organizationId` | non-empty string                          |
+| `reservationId`  | non-empty string                          |
+| `resourceId`     | non-empty string                          |
+| `quantity`       | positive integer (no floats, no booleans) |
+| `capacity`       | positive integer (no floats, no booleans) |
+
+```bash
+curl -X POST http://127.0.0.1:8000/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","reservationId":"rsv-1","resourceId":"res-1","quantity":2,"capacity":5}'
+```
+
+The availability check and the deduction are performed atomically, so
+concurrent requests can never oversell a resource or overwrite each other.
+A resource's `remaining` is its `capacity` minus the total quantity of all
+confirmed reservations against it and never goes negative.
+
+Responses are compact JSON with a stable field order, integer values, and a
+trailing newline:
+
+- `201 Created` — new reservation confirmed; the body is
+  `{"organizationId", "reservationId", "resourceId", "quantity", "capacity",
+  "occupied", "remaining"}` where `occupied`/`remaining` are resource-wide
+  totals after this reservation.
+- `200 OK` — the same `reservationId` was resubmitted with identical fields;
+  the stored view is returned and nothing is counted twice.
+- `409 Conflict` (`{"error": "reservation_conflict"}`) — the `reservationId`
+  exists but the other fields differ.
+- `409 Conflict` (`{"error": "capacity_conflict"}`) — the resource was
+  already recorded with a different `capacity`; history is not rewritten.
+- `409 Conflict` (`{"error": "capacity_exceeded"}`) — `quantity` exceeds the
+  resource's remaining inventory; inventory and existing reservations are
+  unchanged.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON; no reservation
+  is produced.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  blank identifiers, or non-positive-integer `quantity`/`capacity`.
+
+### `GET /reservations?organizationId=...`
+
+The `organizationId` query parameter must appear exactly once and be
+non-empty. Returns `200` with `{"organizationId": "...", "reservations":
+[...]}` containing only that organization's reservations, sorted by
+`resourceId` then `reservationId` in Unicode code-point order. Each entry
+carries `quantity`, the resource's `capacity`, and the resource-wide
+`occupied` and `remaining` totals. An unknown organization returns
+`"reservations": []`. A missing, blank, or duplicated parameter yields `422`.
+

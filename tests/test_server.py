@@ -1123,5 +1123,288 @@ class ServerTest(unittest.TestCase):
             thread.join(timeout=2)
 
 
+def make_reservation(**overrides: Any) -> dict[str, Any]:
+    reservation: dict[str, Any] = {
+        "organizationId": "org-1",
+        "reservationId": "rsv-1",
+        "resourceId": "res-1",
+        "quantity": 2,
+        "capacity": 5,
+    }
+    reservation.update(overrides)
+    return reservation
+
+
+class ReservationTest(ServerTest):
+    def post_reservation(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/reservations", method="POST", body=body, content_type=content_type
+        )
+
+    # --- POST /reservations ----------------------------------------------------
+
+    def test_create_reservation_returns_201_with_inventory_view(self) -> None:
+        status, body = self.post_reservation(make_reservation())
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "rsv-1",
+                "resourceId": "res-1",
+                "quantity": 2,
+                "capacity": 5,
+                "occupied": 2,
+                "remaining": 3,
+            },
+        )
+
+    def test_reservation_response_is_compact_and_newline_terminated(self) -> None:
+        request = Request(
+            f"{self.base_url}/reservations",
+            data=json.dumps(make_reservation()).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            raw = response.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b" ", raw)
+        self.assertEqual(json.loads(raw.decode())["remaining"], 3)
+
+    def test_occupied_and_remaining_accumulate_across_reservations(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(
+            make_reservation(reservationId="rsv-2", quantity=2)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 4)
+        self.assertEqual(body["remaining"], 1)
+
+    def test_identical_replay_returns_200_without_double_counting(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(make_reservation())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["occupied"], 2)
+        self.assertEqual(body["remaining"], 3)
+
+    def test_replay_with_different_fields_is_reservation_conflict(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        for changed in (
+            make_reservation(quantity=3),
+            make_reservation(resourceId="res-2"),
+            make_reservation(organizationId="org-2"),
+            make_reservation(capacity=5, quantity=1),
+        ):
+            status, body = self.post_reservation(changed)
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "reservation_conflict")
+        # The stored reservation is untouched.
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(len(body["reservations"]), 1)
+        self.assertEqual(body["reservations"][0]["occupied"], 2)
+
+    def test_mismatched_capacity_for_known_resource_is_capacity_conflict(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(
+            make_reservation(reservationId="rsv-2", capacity=10)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "capacity_conflict")
+        # Historical capacity is not rewritten.
+        status, body = self.post_reservation(make_reservation(reservationId="rsv-3"))
+        self.assertEqual(status, 201)
+        self.assertEqual(body["capacity"], 5)
+
+    def test_over_capacity_is_capacity_exceeded_and_changes_nothing(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(
+            make_reservation(reservationId="rsv-2", quantity=4)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "capacity_exceeded")
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(len(body["reservations"]), 1)
+        self.assertEqual(body["reservations"][0]["remaining"], 3)
+
+    def test_exact_capacity_is_allowed(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(
+            make_reservation(reservationId="rsv-2", quantity=3)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 5)
+        self.assertEqual(body["remaining"], 0)
+
+    def test_capacity_is_tracked_per_resource(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.post_reservation(
+            make_reservation(
+                reservationId="rsv-2", resourceId="res-2", quantity=1, capacity=1
+            )
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["capacity"], 1)
+        self.assertEqual(body["occupied"], 1)
+
+    def test_reservation_requires_json_content_type(self) -> None:
+        for content_type in (None, "text/plain"):
+            status, body = self.post_reservation(
+                make_reservation(), content_type=content_type
+            )
+            self.assertEqual(status, 415)
+            self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_reservation_invalid_json_is_400_and_creates_nothing(self) -> None:
+        status, body = self.post_reservation(b"{not json", raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(body["reservations"], [])
+
+    def test_reservation_validation_errors_are_422(self) -> None:
+        bad_payloads = [
+            [1, 2],
+            "text",
+            make_reservation(quantity=0),
+            make_reservation(quantity=-1),
+            make_reservation(quantity=1.5),
+            make_reservation(quantity=True),
+            make_reservation(quantity="2"),
+            make_reservation(capacity=0),
+            make_reservation(capacity=False),
+            make_reservation(organizationId=""),
+            make_reservation(organizationId="   "),
+            make_reservation(reservationId=""),
+            make_reservation(resourceId=""),
+            make_reservation(resourceId=7),
+            {k: v for k, v in make_reservation().items() if k != "quantity"},
+            {**make_reservation(), "extra": 1},
+        ]
+        for payload in bad_payloads:
+            status, body = self.post_reservation(payload)
+            self.assertEqual(status, 422, payload)
+            self.assertEqual(body["error"], "validation_error", payload)
+
+    # --- GET /reservations -----------------------------------------------------
+
+    def test_list_reservations_filters_and_sorts(self) -> None:
+        self.assertEqual(
+            self.post_reservation(
+                make_reservation(reservationId="rsv-b", resourceId="res-2", capacity=9)
+            )[0],
+            201,
+        )
+        self.assertEqual(self.post_reservation(make_reservation(reservationId="rsv-a"))[0], 201)
+        self.assertEqual(
+            self.post_reservation(
+                make_reservation(
+                    reservationId="rsv-c",
+                    resourceId="res-2",
+                    capacity=9,
+                    organizationId="org-2",
+                )
+            )[0],
+            201,
+        )
+
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["organizationId"], "org-1")
+        keys = [
+            (entry["resourceId"], entry["reservationId"])
+            for entry in body["reservations"]
+        ]
+        self.assertEqual(keys, [("res-1", "rsv-a"), ("res-2", "rsv-b")])
+        entry = body["reservations"][0]
+        self.assertEqual(entry["quantity"], 2)
+        self.assertEqual(entry["capacity"], 5)
+        self.assertEqual(entry["occupied"], 2)
+        self.assertEqual(entry["remaining"], 3)
+
+    def test_list_reservations_unknown_organization_is_empty(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+        status, body = self.request("/reservations?organizationId=org-unknown")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"organizationId": "org-unknown", "reservations": []})
+
+    def test_list_reservations_query_validation(self) -> None:
+        for path in (
+            "/reservations",
+            "/reservations?organizationId=",
+            "/reservations?organizationId=%20",
+            "/reservations?organizationId=org-1&organizationId=org-1",
+        ):
+            status, body = self.request(path)
+            self.assertEqual(status, 422, path)
+            self.assertEqual(body["error"], "validation_error", path)
+
+    # --- concurrency and lifecycle ----------------------------------------------
+
+    def test_concurrent_reservations_never_oversell(self) -> None:
+        self.assertEqual(
+            self.post_reservation(make_reservation(quantity=1, capacity=10))[0], 201
+        )
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(
+                pool.map(
+                    lambda index: self.post_reservation(
+                        make_reservation(
+                            reservationId=f"rsv-{index}", quantity=1, capacity=10
+                        )
+                    ),
+                    range(2, 30),
+                )
+            )
+        statuses = [status for status, _ in results]
+        self.assertEqual(statuses.count(201), 9)
+        self.assertEqual(statuses.count(409), 19)
+        for status, body in results:
+            if status == 409:
+                self.assertEqual(body["error"], "capacity_exceeded")
+
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(len(body["reservations"]), 10)
+        for entry in body["reservations"]:
+            self.assertEqual(entry["occupied"], 10)
+            self.assertEqual(entry["remaining"], 0)
+
+    def test_concurrent_identical_reservations_count_once(self) -> None:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(
+                pool.map(lambda _: self.post_reservation(make_reservation()), range(24))
+            )
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(200), 23)
+        status, body = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(len(body["reservations"]), 1)
+        self.assertEqual(body["reservations"][0]["occupied"], 2)
+
+    def test_new_server_instance_has_empty_inventory(self) -> None:
+        self.assertEqual(self.post_reservation(make_reservation())[0], 201)
+
+        fresh = create_server(port=0)
+        thread = threading.Thread(target=fresh.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{fresh.server_port}/reservations?organizationId=org-1",
+                timeout=2,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    json.load(response),
+                    {"organizationId": "org-1", "reservations": []},
+                )
+        finally:
+            fresh.shutdown()
+            fresh.server_close()
+            thread.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()

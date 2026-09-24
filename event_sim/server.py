@@ -20,6 +20,14 @@ ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
 
+RESERVATION_FIELDS = (
+    "organizationId",
+    "reservationId",
+    "resourceId",
+    "quantity",
+    "capacity",
+)
+
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
@@ -85,6 +93,90 @@ class EventLedger:
         return values
 
 
+class ReservationLedger:
+    """In-process reservation inventory, keyed by reservationId.
+
+    Resource capacity is fixed by the first claim naming that resource and
+    can never be rewritten. Data lives only for the lifetime of this
+    instance: a new server starts with empty inventory.
+    """
+
+    def __init__(self) -> None:
+        self._reservations: dict[str, dict[str, Any]] = {}
+        self._resource_capacity: dict[str, int] = {}
+        self._resource_occupied: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def _snapshot(self, stored: dict[str, Any]) -> dict[str, Any]:
+        """Response view of a reservation; caller must hold the lock."""
+        resource_id = stored["resourceId"]
+        capacity = self._resource_capacity[resource_id]
+        occupied = self._resource_occupied[resource_id]
+        return {
+            "organizationId": stored["organizationId"],
+            "reservationId": stored["reservationId"],
+            "resourceId": resource_id,
+            "quantity": stored["quantity"],
+            "capacity": capacity,
+            "occupied": occupied,
+            "remaining": capacity - occupied,
+        }
+
+    def reserve(
+        self, reservation: dict[str, Any]
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Confirm a reservation or reconcile a replay.
+
+        The availability check and the deduction happen inside a single
+        lock hold, so concurrent requests can neither oversell a resource
+        nor overwrite each other. Returns ``(status, view)`` where status
+        is ``"created"``, ``"exists"`` (identical replay, not re-counted),
+        ``"conflict"`` (same reservationId, different fields),
+        ``"capacity_conflict"`` (resource already recorded with another
+        capacity), or ``"capacity_exceeded"`` (quantity over remaining).
+        Failure statuses return ``None`` and leave all state untouched.
+        """
+        reservation_id = reservation["reservationId"]
+        resource_id = reservation["resourceId"]
+        with self._lock:
+            existing = self._reservations.get(reservation_id)
+            if existing is not None:
+                if all(existing[field] == reservation[field] for field in RESERVATION_FIELDS):
+                    return "exists", self._snapshot(existing)
+                return "conflict", None
+
+            capacity = self._resource_capacity.get(resource_id)
+            if capacity is None:
+                capacity = reservation["capacity"]
+            elif capacity != reservation["capacity"]:
+                return "capacity_conflict", None
+
+            occupied = self._resource_occupied.get(resource_id, 0)
+            if occupied + reservation["quantity"] > capacity:
+                return "capacity_exceeded", None
+
+            stored = {field: reservation[field] for field in RESERVATION_FIELDS}
+            self._reservations[reservation_id] = stored
+            self._resource_capacity[resource_id] = capacity
+            self._resource_occupied[resource_id] = occupied + stored["quantity"]
+            return "created", self._snapshot(stored)
+
+    def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
+        """Reservation views for one organization.
+
+        Sorted by (resourceId, reservationId) in Unicode code-point order;
+        occupied/remaining reflect the resource-wide totals at read time.
+        """
+        with self._lock:
+            views = [
+                self._snapshot(stored)
+                for stored in self._reservations.values()
+                if stored["organizationId"] == organization_id
+            ]
+        views.sort(key=lambda view: (view["resourceId"], view["reservationId"]))
+        return views
+
+
 def validate_event(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body against the five-field event contract."""
     if not isinstance(data, dict):
@@ -121,6 +213,39 @@ def validate_event(data: Any) -> dict[str, Any]:
         raise EventValidationError("payload must be a JSON object")
 
     return {field: data[field] for field in EVENT_FIELDS}
+
+
+def validate_reservation_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /reservations.
+
+    Exactly the five reservation fields are allowed; identifiers must be
+    non-empty strings and quantity/capacity positive integers.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("reservation body must be a JSON object")
+
+    keys = set(data)
+    expected = set(RESERVATION_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "reservationId", "resourceId"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("quantity", "capacity"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    return {field: data[field] for field in RESERVATION_FIELDS}
 
 
 def _organization_id_from_query(query: str) -> str:
@@ -513,6 +638,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/events/aggregate":
             self._aggregate_events(parsed.query)
             return
+        if parsed.path == "/reservations":
+            self._list_reservations(parsed.query)
+            return
         self._write_json(
             HTTPStatus.NOT_FOUND,
             {"error": "not_found", "path": self.path},
@@ -525,6 +653,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/decisions/allocate":
             self._allocate_decision()
+            return
+        if parsed.path == "/reservations":
+            self._create_reservation()
             return
         if parsed.path != "/events":
             self._write_json(
@@ -656,6 +787,80 @@ class Handler(BaseHTTPRequestHandler):
         result = plan_allocation(params)
         self._write_json(HTTPStatus.OK, result)
 
+    def _create_reservation(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._write_json_line(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "unsupported_media_type"},
+            )
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._write_json_line(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+            )
+            return
+
+        try:
+            reservation = validate_reservation_request(data)
+        except EventValidationError as exc:
+            self._write_json_line(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        status, view = self.server.reservations.reserve(  # type: ignore[attr-defined]
+            reservation
+        )
+        if status == "created":
+            self._write_json_line(HTTPStatus.CREATED, view)
+        elif status == "exists":
+            # Identical replay: already counted once, nothing changes.
+            self._write_json_line(HTTPStatus.OK, view)
+        elif status == "conflict":
+            self._write_json_line(
+                HTTPStatus.CONFLICT,
+                {"error": "reservation_conflict"},
+            )
+        elif status == "capacity_conflict":
+            self._write_json_line(
+                HTTPStatus.CONFLICT,
+                {"error": "capacity_conflict"},
+            )
+        else:
+            self._write_json_line(
+                HTTPStatus.CONFLICT,
+                {"error": "capacity_exceeded"},
+            )
+
+    def _list_reservations(self, query: str) -> None:
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json_line(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+        reservations = self.server.reservations.list_for_organization(  # type: ignore[attr-defined]
+            organization_id
+        )
+        self._write_json_line(
+            HTTPStatus.OK,
+            {"organizationId": organization_id, "reservations": reservations},
+        )
+
     def _list_events(self, query: str) -> None:
         try:
             organization_id = _organization_id_from_query(query)
@@ -730,6 +935,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _write_json_line(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        """Compact, stably ordered JSON terminated by a single newline."""
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
@@ -737,6 +951,7 @@ class Handler(BaseHTTPRequestHandler):
 def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), Handler)
     server.ledger = EventLedger()  # type: ignore[attr-defined]
+    server.reservations = ReservationLedger()  # type: ignore[attr-defined]
     return server
 
 
