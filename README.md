@@ -307,6 +307,87 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
 
+## Alerting
+
+Alerts are held only in the server process alongside the event ledger:
+restarting (or starting a new instance) begins with no alerts. Alerts are a
+main-service feature only — no branch-prefixed alert paths exist, and
+snapshots capture only events, resource capacities, and reservations, never
+alerts.
+
+### `POST /alerts/evaluate`
+
+Evaluates the peak window like `POST /decisions/evaluate`, and additionally
+records an alert when the peak reaches the threshold. Requires
+`Content-Type: application/json`. The body must be a JSON object containing
+exactly these fields:
+
+| Field               | Rule                                                          |
+| ------------------- | ------------------------------------------------------------ |
+| `organizationId`    | required, non-empty string                                   |
+| `type`              | required, non-empty string                                   |
+| `windowSize`        | required, positive integer (no booleans, floats, or strings) |
+| `threshold`         | required, positive integer (no booleans, floats, or strings) |
+| `suppressionWindow` | required, positive integer (no booleans, floats, or strings) |
+| `from`              | optional; non-negative integer, present only together with `to` |
+| `to`                | optional; non-negative integer, present only together with `from` |
+
+Only events matching both `organizationId` and `type` are counted; unknown
+organizations or types compute as zero events. The peak window is computed
+with the same semantics as `POST /decisions/evaluate` (ties resolve to the
+earliest window start). The evaluation never modifies the event ledger.
+
+When the peak count reaches the threshold, the outcome depends on the most
+recent alert stored for the same `organizationId` and `type`:
+
+- **New alert** (`"action": "escalate"`) — there is no previous alert for
+  this organization and type, or the new peak start is at least
+  `suppressionWindow` after the previous alert's peak start. A new alert is
+  created with the next sequential identifier (`alert-1`, `alert-2`, ...).
+- **Suppressed** (`"action": "suppress"`) — the new peak start is less than
+  `suppressionWindow` after the previous alert's peak start. No new alert is
+  created; the previous alert's suppression count is incremented and its
+  identifier is returned.
+
+The suppression check and the alert creation commit atomically under one
+lock, so concurrent evaluations cannot both escalate the same peak or lose
+each other's suppression counts. A failed request (any `4xx`) never creates
+or modifies an alert.
+
+The `200` response is compact JSON with stable key order, integer values,
+and a trailing newline:
+
+```json
+{"action":"escalate","alertId":"alert-1","from":null,"organizationId":"org-1","peakCount":3,"peakStart":0,"suppressedCount":0,"suppressionWindow":120,"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+- `alertId` is the new or matched alert's identifier, or `null` when the
+  peak is below the threshold (`"action": "observe"`).
+- `suppressedCount` is the matched alert's cumulative suppression count
+  (`0` for a new alert and for `observe`).
+
+```bash
+curl -X POST http://127.0.0.1:8000/alerts/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","type":"incident.created","windowSize":60,"threshold":3,"suppressionWindow":120}'
+```
+
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON; no alert is
+  produced.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  invalid types, unpaired `from`/`to`, or out-of-range values.
+
+### `GET /alerts?organizationId=...`
+
+The `organizationId` query parameter must appear exactly once and be
+non-empty. Returns `200` with `{"organizationId": "...", "alerts": [...]}`
+containing only that organization's alerts, sorted by `peakStart` ascending
+and then `alertId` in Unicode code-point order. Each entry carries
+`alertId`, `type`, `peakStart`, `threshold`, and the cumulative
+`suppressedCount`. An unknown organization returns `"alerts": []`. A
+missing, blank, or duplicated parameter yields `422`.
+
 ## Snapshots and branches
 
 Snapshots capture the current main service state — every event, every
@@ -415,4 +496,6 @@ validation, ordering, and window semantics:
   return the standard JSON `404`; sub-paths under an unknown branch return
   `branch_not_found`.
 - `/decisions/allocate` remains a main-only, stateless endpoint.
+- `/alerts` and `/alerts/evaluate` are main-only as well; snapshots and
+  branches never capture or fork alert state.
 

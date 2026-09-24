@@ -28,6 +28,16 @@ RESERVATION_FIELDS = (
     "capacity",
 )
 
+ALERT_REQUIRED_FIELDS = (
+    "organizationId",
+    "type",
+    "windowSize",
+    "threshold",
+    "suppressionWindow",
+)
+ALERT_OPTIONAL_FIELDS = ("from", "to")
+ALERT_FIELDS = ALERT_REQUIRED_FIELDS + ALERT_OPTIONAL_FIELDS
+
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
 _BODY_ERROR = object()
@@ -372,6 +382,94 @@ class BranchStore:
             return self._branches.get(branch_id)
 
 
+class AlertRecord:
+    """One stored alert: an escalated peak plus its suppression tally."""
+
+    def __init__(
+        self,
+        alert_id: str,
+        organization_id: str,
+        event_type: str,
+        threshold: int,
+        peak_start: int,
+    ) -> None:
+        self.alert_id = alert_id
+        self.organization_id = organization_id
+        self.event_type = event_type
+        self.threshold = threshold
+        self.peak_start = peak_start
+        self.suppressed_count = 0
+
+
+class AlertStore:
+    """In-process alert ledger with suppression and escalation.
+
+    Alerts live only for the lifetime of this instance: a new server starts
+    with no alerts, identifiers restart at ``alert-1``, and snapshots never
+    capture them. The suppression check and the creation of a new alert
+    commit inside a single lock, so concurrent evaluations cannot both
+    escalate the same peak window or lose each other's counts.
+    """
+
+    def __init__(self) -> None:
+        self._alerts: list[AlertRecord] = []
+        self._latest: dict[tuple[str, str], AlertRecord] = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def evaluate(
+        self,
+        organization_id: str,
+        event_type: str,
+        threshold: int,
+        suppression_window: int,
+        peak_start: int,
+    ) -> tuple[str, str, int]:
+        """Decide suppress vs escalate for a threshold-reaching peak.
+
+        Returns ``(action, alert_id, suppressed_count)``. When the most
+        recent alert for the same organization and type lies less than
+        ``suppression_window`` before ``peak_start``, that alert's
+        suppression count is incremented and returned; otherwise a new
+        alert is created with the next sequential identifier.
+        """
+        with self._lock:
+            latest = self._latest.get((organization_id, event_type))
+            if (
+                latest is not None
+                and peak_start - latest.peak_start < suppression_window
+            ):
+                latest.suppressed_count += 1
+                return "suppress", latest.alert_id, latest.suppressed_count
+            self._counter += 1
+            record = AlertRecord(
+                f"alert-{self._counter}",
+                organization_id,
+                event_type,
+                threshold,
+                peak_start,
+            )
+            self._alerts.append(record)
+            self._latest[(organization_id, event_type)] = record
+            return "escalate", record.alert_id, record.suppressed_count
+
+    def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            views = [
+                {
+                    "alertId": record.alert_id,
+                    "type": record.event_type,
+                    "peakStart": record.peak_start,
+                    "threshold": record.threshold,
+                    "suppressedCount": record.suppressed_count,
+                }
+                for record in self._alerts
+                if record.organization_id == organization_id
+            ]
+        views.sort(key=lambda view: (view["peakStart"], view["alertId"]))
+        return views
+
+
 def validate_event(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body against the five-field event contract."""
     if not isinstance(data, dict):
@@ -562,6 +660,67 @@ def validate_decision_request(data: Any) -> dict[str, Any]:
         "type": data["type"],
         "windowSize": data["windowSize"],
         "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
+def validate_alert_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /alerts/evaluate.
+
+    Required fields: organizationId, type, windowSize, threshold,
+    suppressionWindow. Optional fields: from and to, which must appear
+    together. No other fields are allowed.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("alert body must be a JSON object")
+
+    keys = set(data)
+    required = set(ALERT_REQUIRED_FIELDS)
+    allowed = set(ALERT_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold", "suppressionWindow"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "suppressionWindow": data["suppressionWindow"],
         "from": from_value,
         "to": to_value,
     }
@@ -945,6 +1104,9 @@ class Handler(BaseHTTPRequestHandler):
                 query,
             )
             return
+        if path == "/alerts":
+            self._list_alerts(query)
+            return
         if path == "/reservations":
             self._list_reservations(
                 self.server.reservations,  # type: ignore[attr-defined]
@@ -1023,6 +1185,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
+            return
+        if path == "/alerts/evaluate":
+            self._evaluate_alert()
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -1117,7 +1282,7 @@ class Handler(BaseHTTPRequestHandler):
     def _branch_not_found(self, branch_id: str) -> None:
         self._write_json(
             HTTPStatus.NOT_FOUND,
-            {"error": "branch_not_found", "branchId": branch_id},
+            {"error": "branch_not_found"},
             newline=True,
         )
 
@@ -1269,6 +1434,78 @@ class Handler(BaseHTTPRequestHandler):
         result = plan_allocation(params)
         self._write_json(HTTPStatus.OK, result)
 
+    # ---------------------------------------------------------------- alerts
+
+    def _evaluate_alert(self) -> None:
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_alert_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        # The event ledger is only read; the alert decision below is the
+        # single locked mutation and never touches stored events.
+        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+            params["organizationId"], params["type"]
+        )
+        peak = evaluate_decision(occurred, params)
+        if peak["peakCount"] >= params["threshold"]:
+            action, alert_id, suppressed_count = self.server.alerts.evaluate(  # type: ignore[attr-defined]
+                params["organizationId"],
+                params["type"],
+                params["threshold"],
+                params["suppressionWindow"],
+                peak["peakStart"],
+            )
+        else:
+            action, alert_id, suppressed_count = "observe", None, 0
+
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "suppressionWindow": params["suppressionWindow"],
+                "from": params["from"],
+                "to": params["to"],
+                "peakStart": peak["peakStart"],
+                "peakCount": peak["peakCount"],
+                "action": action,
+                "alertId": alert_id,
+                "suppressedCount": suppressed_count,
+            },
+            newline=True,
+        )
+
+    def _list_alerts(self, query: str) -> None:
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        alerts = self.server.alerts.list_for_organization(  # type: ignore[attr-defined]
+            organization_id
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {"organizationId": organization_id, "alerts": alerts},
+            newline=True,
+        )
+
     # ----------------------------------------------------------- reservations
 
     def _create_reservation(
@@ -1377,6 +1614,7 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPSer
     server.reservations = ReservationInventory()  # type: ignore[attr-defined]
     server.snapshots = SnapshotStore()  # type: ignore[attr-defined]
     server.branches = BranchStore()  # type: ignore[attr-defined]
+    server.alerts = AlertStore()  # type: ignore[attr-defined]
     return server
 
 
