@@ -307,3 +307,112 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
 
+## Snapshots and branches
+
+Snapshots capture the current main service state — every event, every
+recorded resource capacity, and every reservation — under a unique name so
+that decisions can later be recomputed against that exact state. Branches fork
+a snapshot into an isolated copy that supports the existing event, aggregate,
+decision, and reservation entry points without sharing any mutable state with
+the main service or with other branches. Like everything else here, snapshots
+and branches live only in the server process and are cleared on restart; there
+is no persistence, authorization, or replay across restarts.
+
+### `POST /snapshots`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+containing exactly one field:
+
+| Field        | Rule                     |
+| ------------ | ------------------------ |
+| `snapshotId` | non-empty string         |
+
+A successful response is `201` with compact integer JSON:
+
+```json
+{"events":2,"reservations":1,"resources":1,"snapshotId":"snap-1"}
+```
+
+- `events`, `resources`, and `reservations` count the captured events,
+  distinct resources with a recorded capacity, and reservations.
+- `409 Conflict` (`{"error": "snapshot_conflict"}`) — the name already
+  exists; the original snapshot content is never replaced or mutated.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — a non-object body, a missing or extra field,
+  a blank value, or a non-string `snapshotId`.
+- Any failed request leaves both the main state and existing snapshots
+  unchanged.
+
+### `GET /snapshots`
+
+Returns `200` with `{"snapshots": [...]}`, where each entry has the same
+shape as a creation response. Entries are sorted by `snapshotId` in Unicode
+code-point order. With no snapshots the collection is an empty array.
+
+### `POST /branches`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+containing exactly these fields:
+
+| Field        | Rule                     |
+| ------------ | ------------------------ |
+| `branchId`   | non-empty string         |
+| `snapshotId` | non-empty string         |
+
+The new branch receives independent copies of the snapshot's events,
+resource capacities, and reservation balances.
+
+- `201 Created` — the branch summary is returned:
+
+```json
+{"branchId":"br-1","events":2,"reservations":1,"resources":1,"snapshotId":"snap-1"}
+```
+
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — no snapshot has that
+  name; no branch is created.
+- `409 Conflict` (`{"error": "branch_conflict"}`) — a branch with that
+  `branchId` already exists.
+- `415`, `400`, and `422` follow the same rules as other JSON write
+  endpoints; `422` (`validation_error`) covers missing, extra, blank, or
+  non-string fields.
+
+### `GET /branches/{branchId}`
+
+Returns `200` with the branch summary (see above). An unknown branch returns
+`404` with `{"error": "branch_not_found"}`.
+
+### Branch-prefixed entry points
+
+A known branch exposes the existing endpoints under
+`/branches/{branchId}/...`, with identical request contracts, query
+validation, ordering, and window semantics:
+
+| Method | Path                                      | Effect                                    |
+| ------ | ----------------------------------------- | ----------------------------------------- |
+| GET    | `/branches/{branchId}/events`             | list the branch's events                  |
+| GET    | `/branches/{branchId}/events/aggregate`   | aggregate the branch's events             |
+| POST   | `/branches/{branchId}/events`             | commit an event into the branch only      |
+| POST   | `/branches/{branchId}/decisions/evaluate` | evaluate against the branch's events only |
+| GET    | `/branches/{branchId}/reservations`       | list the branch's reservations            |
+| POST   | `/branches/{branchId}/reservations`       | reserve against branch balances only      |
+
+- Branch event commits honor `415`, `400`, `422`, identical-replay (`200`),
+  and `event_id_conflict` (`409`); writes stay in the branch.
+- Branch reservation commits honor `415`, `400`, `422`, and the replay and
+  capacity rules: identical replays return `200` without double counting,
+  while `reservation_conflict`, `capacity_conflict`, and
+  `capacity_exceeded` still return `409`; a failed commit never changes the
+  branch inventory.
+- Branch list and aggregate queries apply the same parameter rules as the
+  main endpoints; missing, duplicated, or empty parameters return `422` with
+  `validation_error`.
+- Branch evaluation is read-only over branch events, and branch aggregates
+  never count main-service events; repeated identical requests return
+  identical results.
+- No branch operation creates or rolls back main-service state, and branches
+  never observe each other's writes. Unknown sub-paths under a known branch
+  return the standard JSON `404`; sub-paths under an unknown branch return
+  `branch_not_found`.
+- `/decisions/allocate` remains a main-only, stateless endpoint.
+
