@@ -16,6 +16,10 @@ DECISION_REQUIRED_FIELDS = ("organizationId", "type", "windowSize", "threshold")
 DECISION_OPTIONAL_FIELDS = ("from", "to")
 DECISION_FIELDS = DECISION_REQUIRED_FIELDS + DECISION_OPTIONAL_FIELDS
 
+ALLOCATE_FIELDS = ("organizationId", "demands", "resources")
+DEMAND_FIELDS = ("demandId", "units", "priority")
+RESOURCE_FIELDS = ("resourceId", "capacity")
+
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
@@ -326,6 +330,160 @@ def evaluate_decision(occurred: list[int], params: dict[str, Any]) -> dict[str, 
     }
 
 
+def _validate_exact_fields(item: Any, fields: tuple[str, ...], label: str) -> None:
+    """Require ``item`` to be an object with exactly the given fields."""
+    if not isinstance(item, dict):
+        raise EventValidationError(f"{label} must be a JSON object")
+    keys = set(item)
+    expected = set(fields)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError(f"{label}: {'; '.join(detail)}")
+
+
+def validate_allocate_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /decisions/allocate.
+
+    Required fields: organizationId, demands, resources. No other fields
+    are allowed. Each demand is exactly {demandId, units, priority} and
+    each resource exactly {resourceId, capacity}; identifiers must be
+    non-empty and unique within the request.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("allocate body must be a JSON object")
+
+    keys = set(data)
+    expected = set(ALLOCATE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    organization_id = data["organizationId"]
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise EventValidationError("organizationId must be a non-empty string")
+
+    raw_demands = data["demands"]
+    if not isinstance(raw_demands, list):
+        raise EventValidationError("demands must be an array")
+    raw_resources = data["resources"]
+    if not isinstance(raw_resources, list):
+        raise EventValidationError("resources must be an array")
+
+    demands: list[dict[str, Any]] = []
+    seen_demand_ids: set[str] = set()
+    for index, item in enumerate(raw_demands):
+        _validate_exact_fields(item, DEMAND_FIELDS, f"demands[{index}]")
+        demand_id = item["demandId"]
+        if not isinstance(demand_id, str) or not demand_id.strip():
+            raise EventValidationError(
+                f"demands[{index}].demandId must be a non-empty string"
+            )
+        if demand_id in seen_demand_ids:
+            raise EventValidationError(f"duplicate demandId: {demand_id}")
+        seen_demand_ids.add(demand_id)
+        if not _is_positive_integer(item["units"]):
+            raise EventValidationError(
+                f"demands[{index}].units must be a positive integer"
+            )
+        if not _is_non_negative_integer(item["priority"]):
+            raise EventValidationError(
+                f"demands[{index}].priority must be a non-negative integer"
+            )
+        demands.append(
+            {
+                "demandId": demand_id,
+                "units": item["units"],
+                "priority": item["priority"],
+            }
+        )
+
+    resources: list[dict[str, Any]] = []
+    seen_resource_ids: set[str] = set()
+    for index, item in enumerate(raw_resources):
+        _validate_exact_fields(item, RESOURCE_FIELDS, f"resources[{index}]")
+        resource_id = item["resourceId"]
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise EventValidationError(
+                f"resources[{index}].resourceId must be a non-empty string"
+            )
+        if resource_id in seen_resource_ids:
+            raise EventValidationError(f"duplicate resourceId: {resource_id}")
+        seen_resource_ids.add(resource_id)
+        if not _is_positive_integer(item["capacity"]):
+            raise EventValidationError(
+                f"resources[{index}].capacity must be a positive integer"
+            )
+        resources.append({"resourceId": resource_id, "capacity": item["capacity"]})
+
+    return {
+        "organizationId": organization_id,
+        "demands": demands,
+        "resources": resources,
+    }
+
+
+def allocate_resources(request: dict[str, Any]) -> dict[str, Any]:
+    """Compute a deterministic whole-demand allocation plan.
+
+    Demands are processed by priority descending, ties broken by demandId
+    in Unicode lexicographic order. Each demand is placed entirely into
+    the lexicographically smallest resourceId with enough remaining
+    capacity; capacity is deducted immediately. Demands that fit nowhere
+    are reported in ``unassigned`` sorted by demandId. The function is
+    pure: it never touches the ledger or any shared state.
+    """
+    demands = sorted(
+        request["demands"], key=lambda demand: (-demand["priority"], demand["demandId"])
+    )
+    remaining = {
+        resource["resourceId"]: resource["capacity"]
+        for resource in request["resources"]
+    }
+    resource_ids = sorted(remaining)
+
+    assignments: list[dict[str, Any]] = []
+    unassigned: list[str] = []
+    total_units = 0
+    for demand in demands:
+        chosen = None
+        for resource_id in resource_ids:
+            if remaining[resource_id] >= demand["units"]:
+                chosen = resource_id
+                break
+        if chosen is None:
+            unassigned.append(demand["demandId"])
+            continue
+        remaining[chosen] -= demand["units"]
+        assignments.append(
+            {
+                "demandId": demand["demandId"],
+                "resourceId": chosen,
+                "units": demand["units"],
+            }
+        )
+        total_units += demand["units"]
+
+    unassigned.sort()
+    return {
+        "organizationId": request["organizationId"],
+        "assignments": assignments,
+        "unassigned": unassigned,
+        "totalUnits": total_units,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -352,6 +510,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/decisions/evaluate":
             self._evaluate_decision()
+            return
+        if parsed.path == "/decisions/allocate":
+            self._allocate_decision()
             return
         if parsed.path != "/events":
             self._write_json(
@@ -442,6 +603,45 @@ class Handler(BaseHTTPRequestHandler):
             params["organizationId"], params["type"]
         )
         result = evaluate_decision(occurred, params)
+        self._write_json(HTTPStatus.OK, result)
+
+    def _allocate_decision(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._write_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "unsupported_media_type"},
+            )
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+            )
+            return
+
+        try:
+            request = validate_allocate_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        # Read-only and pure: the plan depends only on this request body, so
+        # concurrent requests can never pollute each other and replays of the
+        # same body always produce the identical response.
+        result = allocate_resources(request)
         self._write_json(HTTPStatus.OK, result)
 
     def _list_events(self, query: str) -> None:

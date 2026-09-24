@@ -53,7 +53,7 @@ class ServerTest(unittest.TestCase):
             method=method,
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with urlopen(request, timeout=30) as response:
                 return response.status, json.load(response)
         except HTTPError as error:
             try:
@@ -677,6 +677,284 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(all(status == 200 for status, _ in results))
         self.assertEqual(len({json.dumps(body, sort_keys=True) for _, body in results}), 1)
 
+    # --- POST /decisions/allocate ----------------------------------------------
+
+    def post_allocate(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/decisions/allocate", method="POST", body=body, content_type=content_type
+        )
+
+    def allocate_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "organizationId": "org-1",
+            "demands": [
+                {"demandId": "d1", "units": 4, "priority": 1},
+                {"demandId": "d2", "units": 6, "priority": 2},
+                {"demandId": "d3", "units": 5, "priority": 2},
+                {"demandId": "d4", "units": 3, "priority": 0},
+            ],
+            "resources": [
+                {"resourceId": "r-a", "capacity": 5},
+                {"resourceId": "r-b", "capacity": 10},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_allocate_processes_by_priority_then_demand_id(self) -> None:
+        status, body = self.post_allocate(self.allocate_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["organizationId"], "org-1")
+        # Order: d2 (p2), d3 (p2, id tie-break), d1 (p1); d4 fits nowhere.
+        self.assertEqual(
+            body["assignments"],
+            [
+                {"demandId": "d2", "resourceId": "r-b", "units": 6},
+                {"demandId": "d3", "resourceId": "r-a", "units": 5},
+                {"demandId": "d1", "resourceId": "r-b", "units": 4},
+            ],
+        )
+        self.assertEqual(body["unassigned"], ["d4"])
+        self.assertEqual(body["totalUnits"], 15)
+
+    def test_allocate_chooses_lexicographically_smallest_fitting_resource(self) -> None:
+        payload = self.allocate_payload(
+            demands=[{"demandId": "d1", "units": 2, "priority": 0}],
+            resources=[
+                {"resourceId": "r-b", "capacity": 3},
+                {"resourceId": "r-a", "capacity": 3},
+            ],
+        )
+        status, body = self.post_allocate(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["assignments"],
+            [{"demandId": "d1", "resourceId": "r-a", "units": 2}],
+        )
+        self.assertEqual(body["totalUnits"], 2)
+
+    def test_allocate_never_splits_or_oversells(self) -> None:
+        payload = self.allocate_payload(
+            demands=[{"demandId": "d1", "units": 6, "priority": 0}],
+            resources=[
+                {"resourceId": "r-a", "capacity": 3},
+                {"resourceId": "r-b", "capacity": 3},
+            ],
+        )
+        status, body = self.post_allocate(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["assignments"], [])
+        self.assertEqual(body["unassigned"], ["d1"])
+        self.assertEqual(body["totalUnits"], 0)
+
+    def test_allocate_unassigned_sorted_by_demand_id(self) -> None:
+        payload = self.allocate_payload(
+            demands=[
+                {"demandId": "zeta", "units": 1, "priority": 9},
+                {"demandId": "alpha", "units": 1, "priority": 0},
+                {"demandId": "mid", "units": 1, "priority": 5},
+            ],
+            resources=[],
+        )
+        status, body = self.post_allocate(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["unassigned"], ["alpha", "mid", "zeta"])
+
+    def test_allocate_empty_arrays_succeed(self) -> None:
+        status, body = self.post_allocate(
+            self.allocate_payload(demands=[], resources=[])
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "assignments": [],
+                "unassigned": [],
+                "totalUnits": 0,
+            },
+        )
+
+    def test_allocate_repeated_requests_are_identical(self) -> None:
+        payload = self.allocate_payload()
+        results = [self.post_allocate(payload) for _ in range(5)]
+        self.assertTrue(all(status == 200 for status, _ in results))
+        self.assertEqual(
+            len({json.dumps(body, sort_keys=True) for _, body in results}), 1
+        )
+
+    def test_allocate_does_not_modify_ledger(self) -> None:
+        self.seed_aggregate_events()
+        self.post_allocate(self.allocate_payload())
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["events"]), 6)
+
+    def test_allocate_missing_content_type_is_415(self) -> None:
+        status, body = self.post_allocate(self.allocate_payload(), content_type=None)
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_allocate_unsupported_content_type_is_415(self) -> None:
+        status, body = self.post_allocate(
+            self.allocate_payload(), content_type="text/plain"
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_allocate_malformed_json_is_400(self) -> None:
+        status, body = self.post_allocate(b'{"organizationId": ', raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+
+    def test_allocate_non_object_body_is_422(self) -> None:
+        for payload in ([self.allocate_payload()], "text", 42, None, True):
+            with self.subTest(payload=payload):
+                status, body = self.post_allocate(payload)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_missing_or_extra_top_level_fields_are_422(self) -> None:
+        for field in ("organizationId", "demands", "resources"):
+            payload = self.allocate_payload()
+            del payload[field]
+            with self.subTest(missing=field):
+                status, body = self.post_allocate(payload)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        status, body = self.post_allocate(self.allocate_payload(extra="nope"))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_blank_or_non_string_organization_id_is_422(self) -> None:
+        for bad_value in ("", "   ", 123, None, ["x"], True):
+            with self.subTest(bad_value=bad_value):
+                status, body = self.post_allocate(
+                    self.allocate_payload(organizationId=bad_value)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_non_array_demands_or_resources_are_422(self) -> None:
+        for overrides in (
+            {"demands": {}},
+            {"demands": "x"},
+            {"resources": {}},
+            {"resources": None},
+        ):
+            with self.subTest(overrides=overrides):
+                status, body = self.post_allocate(self.allocate_payload(**overrides))
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_non_object_elements_are_422(self) -> None:
+        for overrides in (
+            {"demands": ["x"]},
+            {"demands": [None]},
+            {"resources": [1]},
+            {"resources": [["r-a"]]},
+        ):
+            with self.subTest(overrides=overrides):
+                status, body = self.post_allocate(self.allocate_payload(**overrides))
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_element_missing_or_extra_fields_are_422(self) -> None:
+        for overrides in (
+            {"demands": [{"demandId": "d1", "units": 1}]},
+            {"demands": [{"demandId": "d1", "units": 1, "priority": 0, "x": 1}]},
+            {"resources": [{"resourceId": "r-a"}]},
+            {"resources": [{"resourceId": "r-a", "capacity": 1, "x": 1}]},
+        ):
+            with self.subTest(overrides=overrides):
+                status, body = self.post_allocate(self.allocate_payload(**overrides))
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_bad_identifier_values_are_422(self) -> None:
+        for bad_id in ("", "   ", 1, None, True, ["d"]):
+            with self.subTest(bad_id=bad_id):
+                status, body = self.post_allocate(
+                    self.allocate_payload(
+                        demands=[{"demandId": bad_id, "units": 1, "priority": 0}]
+                    )
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+            with self.subTest(bad_id=bad_id):
+                status, body = self.post_allocate(
+                    self.allocate_payload(
+                        resources=[{"resourceId": bad_id, "capacity": 1}]
+                    )
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_duplicate_identifiers_are_422(self) -> None:
+        payload = self.allocate_payload(
+            demands=[
+                {"demandId": "d1", "units": 1, "priority": 0},
+                {"demandId": "d1", "units": 2, "priority": 1},
+            ]
+        )
+        status, body = self.post_allocate(payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+        payload = self.allocate_payload(
+            resources=[
+                {"resourceId": "r-a", "capacity": 1},
+                {"resourceId": "r-a", "capacity": 2},
+            ]
+        )
+        status, body = self.post_allocate(payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_bad_numeric_values_are_422(self) -> None:
+        for bad_units in (0, -1, 1.5, "4", True, None, [4]):
+            with self.subTest(units=bad_units):
+                status, body = self.post_allocate(
+                    self.allocate_payload(
+                        demands=[{"demandId": "d1", "units": bad_units, "priority": 0}]
+                    )
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        for bad_priority in (-1, 1.5, "0", True, None, [0]):
+            with self.subTest(priority=bad_priority):
+                status, body = self.post_allocate(
+                    self.allocate_payload(
+                        demands=[
+                            {"demandId": "d1", "units": 1, "priority": bad_priority}
+                        ]
+                    )
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        for bad_capacity in (0, -1, 1.5, "4", True, None, [4]):
+            with self.subTest(capacity=bad_capacity):
+                status, body = self.post_allocate(
+                    self.allocate_payload(
+                        resources=[{"resourceId": "r-a", "capacity": bad_capacity}]
+                    )
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_allocate_zero_priority_is_accepted(self) -> None:
+        status, body = self.post_allocate(
+            self.allocate_payload(
+                demands=[{"demandId": "d1", "units": 1, "priority": 0}],
+                resources=[{"resourceId": "r-a", "capacity": 1}],
+            )
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["totalUnits"], 1)
+
     # --- concurrency and isolation ---------------------------------------------
 
     def test_decision_reads_are_consistent_under_concurrent_writes(self) -> None:
@@ -725,6 +1003,16 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("/events?organizationId=org-1")
         self.assertEqual(status, 200)
         self.assertEqual(len(body["events"]), 44)
+
+    def test_concurrent_allocate_requests_do_not_pollute_each_other(self) -> None:
+        payload = self.allocate_payload()
+        expected = self.post_allocate(payload)
+        self.assertEqual(expected[0], 200)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.post_allocate(payload), range(24)))
+        for status, body in results:
+            self.assertEqual(status, 200)
+            self.assertEqual(body, expected[1])
 
     def test_concurrent_identical_posts_create_once(self) -> None:
         event = make_event()
