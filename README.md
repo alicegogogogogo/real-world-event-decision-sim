@@ -307,3 +307,73 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
 
+## Snapshots and branches
+
+Snapshots and branches live only in the server process alongside the ledger
+and inventory: restarting begins with none of them. A snapshot captures the
+events, resource capacities, and reservation balances at creation time; a
+branch is an isolated, writable copy of one snapshot. Nothing in a snapshot
+or branch shares mutable state with the main service or with any other
+branch, and no branch operation ever creates or falls back to main state.
+
+### `POST /snapshots`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly one field, `snapshotId` (non-empty string).
+
+- `201 Created` — snapshot stored; the response is
+  `{"snapshotId": "...", "events": N, "reservations": N}` with the counts
+  captured at creation time.
+- `409 Conflict` (`{"error": "snapshot_conflict"}`) — the name already
+  exists; the original snapshot is unchanged.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — missing, extra, blank, or wrongly typed
+  fields. Failed requests never change the main state.
+
+### `GET /snapshots`
+
+Returns `200` with `{"snapshots": [...]}`, one summary per snapshot sorted
+by `snapshotId` in Unicode code-point order; with no snapshots the list is
+empty.
+
+### `POST /branches`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly `branchId` and `snapshotId`, both non-empty strings. The new
+branch deep-copies the snapshot's events, resource capacities, and
+reservation balances.
+
+- `201 Created` — branch created; the response is
+  `{"branchId": "...", "snapshotId": "...", "events": N, "reservations": N}`.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot does
+  not exist.
+- `409 Conflict` (`{"error": "branch_conflict"}`) — the branch name already
+  exists.
+- `415` / `400` / `422` — same media-type, syntax, and validation rules as
+  `POST /snapshots`.
+
+### `GET /branches/{branchId}`
+
+Returns `200` with the branch summary
+(`branchId`, `snapshotId`, and current `events`/`reservations` counts).
+An unknown branch yields `404` with `{"error": "branch_not_found"}`.
+
+### Branch-prefixed endpoints
+
+Every branch exposes the existing event, decision, and reservation entry
+points under its own prefix, with identical semantics scoped to the
+branch's isolated state:
+
+- `GET|POST /branches/{branchId}/events`
+- `GET /branches/{branchId}/events/aggregate?...`
+- `POST /branches/{branchId}/decisions/evaluate`
+- `GET|POST /branches/{branchId}/reservations`
+
+Sorting, windowing, idempotency, replay, and conflict rules
+(`event_id_conflict`, `reservation_conflict`, `capacity_conflict`,
+`capacity_exceeded`) behave exactly as on the main service, and the same
+`415`/`400`/`422` validation applies. Writes stay inside the branch;
+reads never include main or other-branch state. Any operation on an
+unknown branch returns `404` with `{"error": "branch_not_found"}`.
+

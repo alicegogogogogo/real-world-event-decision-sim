@@ -1464,5 +1464,460 @@ class ServerTest(unittest.TestCase):
             thread.join(timeout=2)
 
 
+class SnapshotBranchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = create_server(port=0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        body: bytes | None = None,
+        content_type: str | None = "application/json",
+    ) -> tuple[int, Any]:
+        headers = {}
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            try:
+                return error.code, json.load(error)
+            finally:
+                error.close()
+
+    def post_event(self, event: Any) -> tuple[int, Any]:
+        return self.request(
+            "/events", method="POST", body=json.dumps(event).encode()
+        )
+
+    def reservation_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "organizationId": "org-1",
+            "reservationId": "res-1",
+            "resourceId": "r-a",
+            "quantity": 2,
+            "capacity": 5,
+        }
+        payload.update(overrides)
+        return payload
+
+    def post_reservation(self, payload: Any) -> tuple[int, Any]:
+        return self.request(
+            "/reservations", method="POST", body=json.dumps(payload).encode()
+        )
+
+    def post_snapshot(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/snapshots", method="POST", body=body, content_type=content_type
+        )
+
+    def post_branch(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/branches", method="POST", body=body, content_type=content_type
+        )
+
+    def branch_event(self, branch_id: str, event: Any) -> tuple[int, Any]:
+        return self.request(
+            f"/branches/{branch_id}/events",
+            method="POST",
+            body=json.dumps(event).encode(),
+        )
+
+    def branch_reservation(self, branch_id: str, payload: Any) -> tuple[int, Any]:
+        return self.request(
+            f"/branches/{branch_id}/reservations",
+            method="POST",
+            body=json.dumps(payload).encode(),
+        )
+
+    def seed_main(self) -> None:
+        self.assertEqual(self.post_event(make_event())[0], 201)
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+
+    # --- POST /snapshots -------------------------------------------------
+
+    def test_create_snapshot_returns_201_with_counts(self) -> None:
+        self.seed_main()
+        status, body = self.post_snapshot({"snapshotId": "snap-1"})
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body, {"snapshotId": "snap-1", "events": 1, "reservations": 1}
+        )
+
+    def test_snapshot_missing_content_type_is_415(self) -> None:
+        status, body = self.post_snapshot(b"{}", raw=True, content_type=None)
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_snapshot_malformed_json_is_400(self) -> None:
+        status, body = self.post_snapshot(b"{", raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+
+    def test_snapshot_invalid_bodies_are_422(self) -> None:
+        for payload in (
+            {},
+            {"snapshotId": "s-1", "extra": 1},
+            {"snapshotId": ""},
+            {"snapshotId": "   "},
+            {"snapshotId": 7},
+            {"snapshotId": None},
+            ["snapshotId"],
+        ):
+            status, body = self.post_snapshot(payload)
+            self.assertEqual(status, 422, payload)
+            self.assertEqual(body["error"], "validation_error")
+
+    def test_duplicate_snapshot_is_409_and_original_is_kept(self) -> None:
+        self.assertEqual(self.post_snapshot({"snapshotId": "snap-1"})[0], 201)
+        self.seed_main()
+        status, body = self.post_snapshot({"snapshotId": "snap-1"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "snapshot_conflict")
+        # The stored snapshot still reflects the empty main state.
+        status, body = self.post_branch(
+            {"branchId": "br-1", "snapshotId": "snap-1"}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["events"], 0)
+        self.assertEqual(body["reservations"], 0)
+
+    def test_failed_snapshot_requests_do_not_change_main_state(self) -> None:
+        self.post_snapshot({"snapshotId": "snap-1"})
+        self.post_snapshot({"snapshotId": "snap-1"})
+        self.post_snapshot({})
+        self.post_snapshot(b"{", raw=True)
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], [])
+        status, body = self.request("/snapshots")
+        self.assertEqual([s["snapshotId"] for s in body["snapshots"]], ["snap-1"])
+
+    # --- GET /snapshots ---------------------------------------------------
+
+    def test_list_snapshots_empty(self) -> None:
+        status, body = self.request("/snapshots")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"snapshots": []})
+
+    def test_list_snapshots_sorted_by_code_point(self) -> None:
+        for snapshot_id in ("ä", "b", "A"):
+            self.assertEqual(
+                self.post_snapshot({"snapshotId": snapshot_id})[0], 201
+            )
+        status, body = self.request("/snapshots")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["snapshotId"] for item in body["snapshots"]],
+            ["A", "b", "ä"],
+        )
+        for item in body["snapshots"]:
+            self.assertEqual(item["events"], 0)
+            self.assertEqual(item["reservations"], 0)
+
+    # --- POST /branches ---------------------------------------------------
+
+    def test_create_branch_returns_201_with_summary(self) -> None:
+        self.seed_main()
+        self.assertEqual(self.post_snapshot({"snapshotId": "snap-1"})[0], 201)
+        status, body = self.post_branch(
+            {"branchId": "br-1", "snapshotId": "snap-1"}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body,
+            {
+                "branchId": "br-1",
+                "snapshotId": "snap-1",
+                "events": 1,
+                "reservations": 1,
+            },
+        )
+
+    def test_branch_missing_content_type_is_415(self) -> None:
+        status, body = self.post_branch(b"{}", raw=True, content_type=None)
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_branch_malformed_json_is_400(self) -> None:
+        status, body = self.post_branch(b"{", raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+
+    def test_branch_invalid_bodies_are_422(self) -> None:
+        for payload in (
+            {},
+            {"branchId": "b-1"},
+            {"snapshotId": "s-1"},
+            {"branchId": "b-1", "snapshotId": "s-1", "extra": 1},
+            {"branchId": "", "snapshotId": "s-1"},
+            {"branchId": "  ", "snapshotId": "s-1"},
+            {"branchId": "b-1", "snapshotId": ""},
+            {"branchId": 1, "snapshotId": "s-1"},
+            {"branchId": "b-1", "snapshotId": ["s-1"]},
+        ):
+            status, body = self.post_branch(payload)
+            self.assertEqual(status, 422, payload)
+            self.assertEqual(body["error"], "validation_error")
+
+    def test_branch_unknown_snapshot_is_404(self) -> None:
+        status, body = self.post_branch(
+            {"branchId": "br-1", "snapshotId": "nope"}
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "snapshot_not_found")
+
+    def test_duplicate_branch_is_409(self) -> None:
+        self.post_snapshot({"snapshotId": "snap-1"})
+        payload = {"branchId": "br-1", "snapshotId": "snap-1"}
+        self.assertEqual(self.post_branch(payload)[0], 201)
+        status, body = self.post_branch(payload)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "branch_conflict")
+
+    # --- GET /branches/{branchId} ------------------------------------------
+
+    def test_get_branch_summary(self) -> None:
+        self.post_snapshot({"snapshotId": "snap-1"})
+        self.post_branch({"branchId": "br-1", "snapshotId": "snap-1"})
+        status, body = self.request("/branches/br-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "branchId": "br-1",
+                "snapshotId": "snap-1",
+                "events": 0,
+                "reservations": 0,
+            },
+        )
+
+    def test_get_unknown_branch_is_404(self) -> None:
+        status, body = self.request("/branches/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "branch_not_found")
+
+    def test_unknown_branch_operations_are_404(self) -> None:
+        for method, path, body in (
+            ("GET", "/branches/nope/events?organizationId=org-1", None),
+            ("GET", "/branches/nope/reservations?organizationId=org-1", None),
+            (
+                "GET",
+                "/branches/nope/events/aggregate?organizationId=org-1&type=t&windowSize=10",
+                None,
+            ),
+            ("POST", "/branches/nope/events", make_event()),
+            ("POST", "/branches/nope/reservations", self.reservation_payload()),
+        ):
+            payload = json.dumps(body).encode() if body is not None else None
+            status, response = self.request(path, method=method, body=payload)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(response["error"], "branch_not_found")
+
+    # --- Branch isolation ---------------------------------------------------
+
+    def make_branch(self, branch_id: str = "br-1") -> None:
+        self.seed_main()
+        self.assertEqual(self.post_snapshot({"snapshotId": "snap-1"})[0], 201)
+        self.assertEqual(
+            self.post_branch({"branchId": branch_id, "snapshotId": "snap-1"})[0],
+            201,
+        )
+
+    def test_branch_does_not_see_later_main_writes(self) -> None:
+        self.make_branch()
+        self.assertEqual(
+            self.post_event(make_event(eventId="evt-2", occurredAt=200))[0], 201
+        )
+        status, body = self.request("/branches/br-1/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["eventId"] for e in body["events"]], ["evt-1"])
+
+    def test_branch_writes_stay_in_branch(self) -> None:
+        self.make_branch()
+        status, _ = self.branch_event(
+            "br-1", make_event(eventId="evt-b", occurredAt=50)
+        )
+        self.assertEqual(status, 201)
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual([e["eventId"] for e in body["events"]], ["evt-1"])
+        status, body = self.request("/branches/br-1/events?organizationId=org-1")
+        self.assertEqual(
+            [e["eventId"] for e in body["events"]], ["evt-b", "evt-1"]
+        )
+
+    def test_branches_are_isolated_from_each_other(self) -> None:
+        self.make_branch("br-1")
+        self.assertEqual(
+            self.post_branch({"branchId": "br-2", "snapshotId": "snap-1"})[0],
+            201,
+        )
+        self.branch_event("br-1", make_event(eventId="evt-b1", occurredAt=10))
+        status, body = self.request("/branches/br-2/events?organizationId=org-1")
+        self.assertEqual([e["eventId"] for e in body["events"]], ["evt-1"])
+
+    def test_branch_event_replay_and_conflict(self) -> None:
+        self.make_branch()
+        event = make_event(eventId="evt-b", occurredAt=50)
+        self.assertEqual(self.branch_event("br-1", event)[0], 201)
+        self.assertEqual(self.branch_event("br-1", event)[0], 200)
+        status, body = self.branch_event(
+            "br-1", make_event(eventId="evt-b", occurredAt=51)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "event_id_conflict")
+
+    def test_branch_event_media_and_validation_errors(self) -> None:
+        self.make_branch()
+        status, body = self.request(
+            "/branches/br-1/events",
+            method="POST",
+            body=b"{}",
+            content_type=None,
+        )
+        self.assertEqual(status, 415)
+        status, body = self.request(
+            "/branches/br-1/events", method="POST", body=b"{"
+        )
+        self.assertEqual(status, 400)
+        status, body = self.branch_event("br-1", {"eventId": "evt-x"})
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_branch_aggregate_and_evaluate_use_branch_events(self) -> None:
+        self.make_branch()
+        # Same 60-wide window as the inherited main event (occurredAt=100).
+        self.branch_event("br-1", make_event(eventId="evt-b", occurredAt=110))
+        query = "organizationId=org-1&type=incident.created&windowSize=60"
+        status, body = self.request(f"/branches/br-1/events/aggregate?{query}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["windows"], [{"start": 60, "end": 120, "count": 2}])
+        # Main aggregate is unchanged by the branch write.
+        status, body = self.request(f"/events/aggregate?{query}")
+        self.assertEqual(body["windows"], [{"start": 60, "end": 120, "count": 1}])
+
+        decision = {
+            "organizationId": "org-1",
+            "type": "incident.created",
+            "windowSize": 60,
+            "threshold": 2,
+        }
+        first = self.request(
+            "/branches/br-1/decisions/evaluate",
+            method="POST",
+            body=json.dumps(decision).encode(),
+        )
+        second = self.request(
+            "/branches/br-1/decisions/evaluate",
+            method="POST",
+            body=json.dumps(decision).encode(),
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(first[1]["peakCount"], 2)
+        self.assertEqual(first[1]["action"], "escalate")
+        # The main evaluation still sees only the main event.
+        status, body = self.request(
+            "/decisions/evaluate",
+            method="POST",
+            body=json.dumps(decision).encode(),
+        )
+        self.assertEqual(body["peakCount"], 1)
+        self.assertEqual(body["action"], "observe")
+
+    def test_branch_list_query_validation_is_422(self) -> None:
+        self.make_branch()
+        status, body = self.request("/branches/br-1/events")
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+        status, body = self.request(
+            "/branches/br-1/events?organizationId=org-1&organizationId=org-1"
+        )
+        self.assertEqual(status, 422)
+        status, body = self.request("/branches/br-1/reservations")
+        self.assertEqual(status, 422)
+
+    def test_branch_reservations_have_isolated_balances(self) -> None:
+        self.make_branch()
+        # Branch inherited res-1 (2 of 5 on r-a); 4 more would exceed it.
+        status, body = self.branch_reservation(
+            "br-1",
+            self.reservation_payload(reservationId="res-b", quantity=4),
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "capacity_exceeded")
+        status, body = self.branch_reservation(
+            "br-1",
+            self.reservation_payload(reservationId="res-b", quantity=3),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 5)
+        self.assertEqual(body["remaining"], 0)
+        # The branch balance does not leak into the main inventory.
+        status, body = self.request("/reservations?organizationId=org-1")
+        (main_view,) = body["reservations"]
+        self.assertEqual(main_view["occupied"], 2)
+        self.assertEqual(main_view["remaining"], 3)
+        # Main reservations do not leak into the branch either.
+        self.post_reservation(
+            self.reservation_payload(reservationId="res-2", quantity=1)
+        )
+        status, body = self.request(
+            "/branches/br-1/reservations?organizationId=org-1"
+        )
+        self.assertEqual(
+            [r["reservationId"] for r in body["reservations"]],
+            ["res-1", "res-b"],
+        )
+
+    def test_branch_reservation_replay_and_conflict(self) -> None:
+        self.make_branch()
+        payload = self.reservation_payload(reservationId="res-b", quantity=1)
+        self.assertEqual(self.branch_reservation("br-1", payload)[0], 201)
+        self.assertEqual(self.branch_reservation("br-1", payload)[0], 200)
+        status, body = self.branch_reservation(
+            "br-1", self.reservation_payload(reservationId="res-b", quantity=2)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "reservation_conflict")
+        # Replaying the inherited reservationId with different fields conflicts.
+        status, body = self.branch_reservation(
+            "br-1", self.reservation_payload(quantity=1)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "reservation_conflict")
+
+    def test_branch_summary_tracks_branch_writes(self) -> None:
+        self.make_branch()
+        self.branch_event("br-1", make_event(eventId="evt-b", occurredAt=5))
+        status, body = self.request("/branches/br-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], 2)
+        self.assertEqual(body["reservations"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

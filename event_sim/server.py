@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 SERVICE_NAME = "real-world-event-decision-sim"
@@ -27,6 +28,9 @@ RESERVATION_FIELDS = (
     "quantity",
     "capacity",
 )
+
+SNAPSHOT_FIELDS = ("snapshotId",)
+BRANCH_FIELDS = ("branchId", "snapshotId")
 
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
@@ -95,6 +99,18 @@ class EventLedger:
             ]
         values.sort()
         return values
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._events)
+
+    def clone(self) -> "EventLedger":
+        """Deep-copy the ledger so the copy shares no mutable state."""
+        with self._lock:
+            events = copy.deepcopy(self._events)
+        ledger = EventLedger()
+        ledger._events = events
+        return ledger
 
 
 class ReservationInventory:
@@ -180,6 +196,20 @@ class ReservationInventory:
             ]
         views.sort(key=lambda view: (view["resourceId"], view["reservationId"]))
         return views
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._reservations)
+
+    def clone(self) -> "ReservationInventory":
+        """Deep-copy capacities and reservations; the copy is independent."""
+        with self._lock:
+            capacities = dict(self._capacities)
+            reservations = copy.deepcopy(self._reservations)
+        inventory = ReservationInventory()
+        inventory._capacities = capacities
+        inventory._reservations = reservations
+        return inventory
 
 
 def validate_event(data: Any) -> dict[str, Any]:
@@ -583,6 +613,80 @@ def validate_reservation_request(data: Any) -> dict[str, Any]:
     return {field: data[field] for field in RESERVATION_FIELDS}
 
 
+class IsolatedState:
+    """A self-contained copy of the event ledger and reservation inventory.
+
+    Snapshots and branches each hold one of these; nothing inside is shared
+    with the main service or with any other snapshot or branch.
+    """
+
+    def __init__(
+        self,
+        ledger: EventLedger,
+        reservations: ReservationInventory,
+        snapshot_id: str | None = None,
+    ) -> None:
+        self.ledger = ledger
+        self.reservations = reservations
+        self.snapshot_id = snapshot_id
+
+
+def validate_snapshot_request(data: Any) -> str:
+    """Validate a decoded JSON body for POST /snapshots.
+
+    The body must be an object with exactly one field, ``snapshotId``,
+    holding a non-empty string.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("snapshot body must be a JSON object")
+
+    keys = set(data)
+    expected = set(SNAPSHOT_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    snapshot_id = data["snapshotId"]
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        raise EventValidationError("snapshotId must be a non-empty string")
+    return snapshot_id
+
+
+def validate_branch_request(data: Any) -> tuple[str, str]:
+    """Validate a decoded JSON body for POST /branches.
+
+    The body must be an object with exactly ``branchId`` and
+    ``snapshotId``, both non-empty strings.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("branch body must be a JSON object")
+
+    keys = set(data)
+    expected = set(BRANCH_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    branch_id = data["branchId"]
+    snapshot_id = data["snapshotId"]
+    for field, value in (("branchId", branch_id), ("snapshotId", snapshot_id)):
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return branch_id, snapshot_id
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -627,25 +731,66 @@ def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _branch_route(path: str) -> tuple[str, str] | None:
+    """Split ``/branches/{branchId}[/sub...]`` into ``(branchId, subpath)``.
+
+    Returns ``None`` for paths outside the branch prefix; the subpath is
+    ``""`` for the bare branch resource itself.
+    """
+    if not path.startswith("/branches/"):
+        return None
+    rest = path[len("/branches/"):]
+    branch_id, _, sub = rest.partition("/")
+    if not branch_id:
+        return None
+    return unquote(branch_id), "/" + sub if sub else ""
+
+
+def _snapshot_summary(snapshot_id: str, state: IsolatedState) -> dict[str, Any]:
+    return {
+        "snapshotId": snapshot_id,
+        "events": state.ledger.count(),
+        "reservations": state.reservations.count(),
+    }
+
+
+def _branch_summary(branch_id: str, state: IsolatedState) -> dict[str, Any]:
+    return {
+        "branchId": branch_id,
+        "snapshotId": state.snapshot_id,
+        "events": state.ledger.count(),
+        "reservations": state.reservations.count(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlsplit(self.path)
-        if parsed.path == "/health":
+        path = parsed.path
+        if path == "/health":
             self._write_json(
                 HTTPStatus.OK,
                 {"service": SERVICE_NAME, "status": "ok"},
             )
             return
-        if parsed.path == "/events":
-            self._list_events(parsed.query)
+        if path == "/snapshots":
+            self._list_snapshots()
             return
-        if parsed.path == "/events/aggregate":
-            self._aggregate_events(parsed.query)
+        branch = _branch_route(path)
+        if branch is not None:
+            branch_id, subpath = branch
+            self._dispatch_branch_get(branch_id, subpath, parsed.query)
             return
-        if parsed.path == "/reservations":
-            self._list_reservations(parsed.query)
+        if path == "/events":
+            self._list_events(parsed.query, self.server.ledger)  # type: ignore[attr-defined]
+            return
+        if path == "/events/aggregate":
+            self._aggregate_events(parsed.query, self.server.ledger)  # type: ignore[attr-defined]
+            return
+        if path == "/reservations":
+            self._list_reservations(parsed.query, self.server.reservations)  # type: ignore[attr-defined]
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -654,43 +799,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlsplit(self.path)
-        if parsed.path == "/reservations":
-            self._create_reservation()
+        path = parsed.path
+        if path == "/snapshots":
+            self._create_snapshot()
             return
-        if parsed.path == "/decisions/evaluate":
-            self._evaluate_decision()
+        if path == "/branches":
+            self._create_branch()
             return
-        if parsed.path == "/decisions/allocate":
+        branch = _branch_route(path)
+        if branch is not None:
+            branch_id, subpath = branch
+            self._dispatch_branch_post(branch_id, subpath)
+            return
+        if path == "/reservations":
+            self._create_reservation(self.server.reservations)  # type: ignore[attr-defined]
+            return
+        if path == "/decisions/evaluate":
+            self._evaluate_decision(self.server.ledger)  # type: ignore[attr-defined]
+            return
+        if path == "/decisions/allocate":
             self._allocate_decision()
             return
-        if parsed.path != "/events":
-            self._write_json(
-                HTTPStatus.NOT_FOUND,
-                {"error": "not_found", "path": self.path},
-            )
+        if path == "/events":
+            self._create_event(self.server.ledger)  # type: ignore[attr-defined]
             return
+        self._write_json(
+            HTTPStatus.NOT_FOUND,
+            {"error": "not_found", "path": self.path},
+        )
 
-        content_type = self.headers.get("Content-Type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type != "application/json":
-            self._write_json(
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                {"error": "unsupported_media_type"},
-            )
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            length = 0
-        raw_body = self.rfile.read(length) if length > 0 else b""
-        try:
-            data = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "invalid_json"},
-            )
+    def _create_event(self, ledger: EventLedger) -> None:
+        data = self._json_request_body()
+        if data is _BODY_ERROR:
             return
 
         try:
@@ -702,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, stored = self.server.ledger.add(event)  # type: ignore[attr-defined]
+        status, stored = ledger.add(event)
         if status == "created":
             self._write_json(HTTPStatus.CREATED, stored)
         elif status == "exists":
@@ -713,28 +853,9 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "event_id_conflict"},
             )
 
-    def _evaluate_decision(self) -> None:
-        content_type = self.headers.get("Content-Type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type != "application/json":
-            self._write_json(
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                {"error": "unsupported_media_type"},
-            )
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            length = 0
-        raw_body = self.rfile.read(length) if length > 0 else b""
-        try:
-            data = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "invalid_json"},
-            )
+    def _evaluate_decision(self, ledger: EventLedger) -> None:
+        data = self._json_request_body()
+        if data is _BODY_ERROR:
             return
 
         try:
@@ -748,34 +869,15 @@ class Handler(BaseHTTPRequestHandler):
 
         # Read-only: the ledger is never mutated by a decision request, and
         # the snapshot is taken in a single locked copy for consistency.
-        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+        occurred = ledger.occurred_at_values(
             params["organizationId"], params["type"]
         )
         result = evaluate_decision(occurred, params)
         self._write_json(HTTPStatus.OK, result)
 
     def _allocate_decision(self) -> None:
-        content_type = self.headers.get("Content-Type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type != "application/json":
-            self._write_json(
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                {"error": "unsupported_media_type"},
-            )
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except (TypeError, ValueError):
-            length = 0
-        raw_body = self.rfile.read(length) if length > 0 else b""
-        try:
-            data = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "invalid_json"},
-            )
+        data = self._json_request_body()
+        if data is _BODY_ERROR:
             return
 
         try:
@@ -824,7 +926,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return _BODY_ERROR
 
-    def _create_reservation(self) -> None:
+    def _create_reservation(self, inventory: ReservationInventory) -> None:
         data = self._json_request_body(newline=True)
         if data is _BODY_ERROR:
             return
@@ -839,9 +941,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, view = self.server.reservations.reserve(  # type: ignore[attr-defined]
-            reservation
-        )
+        status, view = inventory.reserve(reservation)
         if status == "created":
             self._write_json(HTTPStatus.CREATED, view, newline=True)
         elif status == "exists":
@@ -849,7 +949,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._write_json(HTTPStatus.CONFLICT, {"error": status}, newline=True)
 
-    def _list_reservations(self, query: str) -> None:
+    def _list_reservations(
+        self, query: str, inventory: ReservationInventory
+    ) -> None:
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -859,16 +961,14 @@ class Handler(BaseHTTPRequestHandler):
                 newline=True,
             )
             return
-        reservations = self.server.reservations.list_for_organization(  # type: ignore[attr-defined]
-            organization_id
-        )
+        reservations = inventory.list_for_organization(organization_id)
         self._write_json(
             HTTPStatus.OK,
             {"organizationId": organization_id, "reservations": reservations},
             newline=True,
         )
 
-    def _list_events(self, query: str) -> None:
+    def _list_events(self, query: str, ledger: EventLedger) -> None:
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -877,15 +977,13 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
             )
             return
-        events = self.server.ledger.list_for_organization(  # type: ignore[attr-defined]
-            organization_id
-        )
+        events = ledger.list_for_organization(organization_id)
         self._write_json(
             HTTPStatus.OK,
             {"organizationId": organization_id, "events": events},
         )
 
-    def _aggregate_events(self, query: str) -> None:
+    def _aggregate_events(self, query: str, ledger: EventLedger) -> None:
         try:
             params = _aggregate_params_from_query(query)
         except EventValidationError as exc:
@@ -898,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
         window_size = params["windowSize"]
         from_value = params["from"]
         to_value = params["to"]
-        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+        occurred = ledger.occurred_at_values(
             params["organizationId"], params["type"]
         )
 
@@ -934,6 +1032,149 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _create_snapshot(self) -> None:
+        data = self._json_request_body()
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            snapshot_id = validate_snapshot_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        # Copy first, then publish under the name lock: a failed or
+        # conflicting request never touches the main state, and a stored
+        # snapshot is never rewritten.
+        state = IsolatedState(
+            self.server.ledger.clone(),  # type: ignore[attr-defined]
+            self.server.reservations.clone(),  # type: ignore[attr-defined]
+        )
+        with self.server.states_lock:  # type: ignore[attr-defined]
+            snapshots = self.server.snapshots  # type: ignore[attr-defined]
+            if snapshot_id in snapshots:
+                self._write_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "snapshot_conflict"},
+                )
+                return
+            snapshots[snapshot_id] = state
+        self._write_json(
+            HTTPStatus.CREATED,
+            _snapshot_summary(snapshot_id, state),
+        )
+
+    def _list_snapshots(self) -> None:
+        with self.server.states_lock:  # type: ignore[attr-defined]
+            items = sorted(self.server.snapshots.items())  # type: ignore[attr-defined]
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "snapshots": [
+                    _snapshot_summary(snapshot_id, state)
+                    for snapshot_id, state in items
+                ]
+            },
+        )
+
+    def _create_branch(self) -> None:
+        data = self._json_request_body()
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            branch_id, snapshot_id = validate_branch_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        with self.server.states_lock:  # type: ignore[attr-defined]
+            branches = self.server.branches  # type: ignore[attr-defined]
+            if branch_id in branches:
+                self._write_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "branch_conflict"},
+                )
+                return
+            snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+            if snapshot is None:
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "snapshot_not_found"},
+                )
+                return
+            # The branch deep-copies the snapshot so later writes on either
+            # side never share mutable state.
+            state = IsolatedState(
+                snapshot.ledger.clone(),
+                snapshot.reservations.clone(),
+                snapshot_id=snapshot_id,
+            )
+            branches[branch_id] = state
+        self._write_json(
+            HTTPStatus.CREATED,
+            _branch_summary(branch_id, state),
+        )
+
+    def _branch_state(self, branch_id: str) -> IsolatedState | None:
+        with self.server.states_lock:  # type: ignore[attr-defined]
+            return self.server.branches.get(branch_id)  # type: ignore[attr-defined]
+
+    def _dispatch_branch_get(
+        self, branch_id: str, subpath: str, query: str
+    ) -> None:
+        state = self._branch_state(branch_id)
+        if state is None:
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "branch_not_found"},
+            )
+            return
+        if subpath == "":
+            self._write_json(HTTPStatus.OK, _branch_summary(branch_id, state))
+            return
+        if subpath == "/events":
+            self._list_events(query, state.ledger)
+            return
+        if subpath == "/events/aggregate":
+            self._aggregate_events(query, state.ledger)
+            return
+        if subpath == "/reservations":
+            self._list_reservations(query, state.reservations)
+            return
+        self._write_json(
+            HTTPStatus.NOT_FOUND,
+            {"error": "not_found", "path": self.path},
+        )
+
+    def _dispatch_branch_post(self, branch_id: str, subpath: str) -> None:
+        state = self._branch_state(branch_id)
+        if state is None:
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "branch_not_found"},
+            )
+            return
+        if subpath == "/events":
+            self._create_event(state.ledger)
+            return
+        if subpath == "/decisions/evaluate":
+            self._evaluate_decision(state.ledger)
+            return
+        if subpath == "/reservations":
+            self._create_reservation(state.reservations)
+            return
+        self._write_json(
+            HTTPStatus.NOT_FOUND,
+            {"error": "not_found", "path": self.path},
+        )
+
     def _write_json(
         self, status: HTTPStatus, payload: dict[str, Any], *, newline: bool = False
     ) -> None:
@@ -954,6 +1195,11 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPSer
     server = ThreadingHTTPServer((host, port), Handler)
     server.ledger = EventLedger()  # type: ignore[attr-defined]
     server.reservations = ReservationInventory()  # type: ignore[attr-defined]
+    # Snapshots and branches live only in this process: a restart begins
+    # with none of them, exactly like the ledger and the inventory.
+    server.snapshots = {}  # type: ignore[attr-defined]
+    server.branches = {}  # type: ignore[attr-defined]
+    server.states_lock = threading.Lock()  # type: ignore[attr-defined]
     return server
 
 
