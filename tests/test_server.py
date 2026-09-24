@@ -1122,6 +1122,347 @@ class ServerTest(unittest.TestCase):
             fresh.server_close()
             thread.join(timeout=2)
 
+    # --- POST /reservations ----------------------------------------------------
+
+    def reservation_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "organizationId": "org-1",
+            "reservationId": "res-1",
+            "resourceId": "r-a",
+            "quantity": 2,
+            "capacity": 5,
+        }
+        payload.update(overrides)
+        return payload
+
+    def post_reservation(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/reservations", method="POST", body=body, content_type=content_type
+        )
+
+    def test_create_reservation_returns_201_with_balances(self) -> None:
+        status, body = self.post_reservation(self.reservation_payload())
+        self.assertEqual(status, 201)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "reservationId": "res-1",
+                "resourceId": "r-a",
+                "quantity": 2,
+                "capacity": 5,
+                "occupied": 2,
+                "remaining": 3,
+            },
+        )
+
+    def test_reservation_response_ends_with_newline(self) -> None:
+        body = json.dumps(self.reservation_payload()).encode()
+        request = Request(
+            f"{self.base_url}/reservations",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            raw = response.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw[:-1])["remaining"], 3)
+
+    def test_reservation_balances_accumulate_per_resource(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+        status, body = self.post_reservation(
+            self.reservation_payload(reservationId="res-2", quantity=2)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 4)
+        self.assertEqual(body["remaining"], 1)
+        # A different resource tracks its own capacity and balances.
+        status, body = self.post_reservation(
+            self.reservation_payload(
+                reservationId="res-3", resourceId="r-b", quantity=1, capacity=2
+            )
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 1)
+        self.assertEqual(body["remaining"], 1)
+
+    def test_reservation_exact_fit_is_allowed(self) -> None:
+        status, body = self.post_reservation(
+            self.reservation_payload(quantity=5, capacity=5)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["occupied"], 5)
+        self.assertEqual(body["remaining"], 0)
+
+    def test_identical_reservation_replay_returns_200_without_double_count(self) -> None:
+        first_status, first_body = self.post_reservation(self.reservation_payload())
+        second_status, second_body = self.post_reservation(self.reservation_payload())
+        self.assertEqual(first_status, 201)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(first_body, second_body)
+        self.assertEqual(second_body["occupied"], 2)
+        self.assertEqual(second_body["remaining"], 3)
+
+        status, listing = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["reservations"]), 1)
+
+    def test_same_reservation_id_different_fields_is_conflict(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+        for override in (
+            {"organizationId": "org-2"},
+            {"resourceId": "r-b"},
+            {"quantity": 3},
+            {"capacity": 6},
+        ):
+            with self.subTest(override=override):
+                status, body = self.post_reservation(
+                    self.reservation_payload(**override)
+                )
+                self.assertEqual(status, 409)
+                self.assertEqual(body["error"], "reservation_conflict")
+
+        # The stored reservation is unchanged and still not double counted.
+        status, body = self.post_reservation(self.reservation_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["occupied"], 2)
+
+    def test_existing_resource_with_different_capacity_is_conflict(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+        status, body = self.post_reservation(
+            self.reservation_payload(reservationId="res-2", capacity=7)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "capacity_conflict")
+
+        # The recorded capacity is not rewritten.
+        status, body = self.post_reservation(
+            self.reservation_payload(reservationId="res-3", quantity=3)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body["capacity"], 5)
+        self.assertEqual(body["remaining"], 0)
+
+    def test_reservation_exceeding_remaining_is_conflict_without_mutation(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+        status, body = self.post_reservation(
+            self.reservation_payload(reservationId="res-2", quantity=4)
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "capacity_exceeded")
+
+        # Nothing was deducted and no reservation was recorded.
+        status, listing = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["reservations"]), 1)
+        self.assertEqual(listing["reservations"][0]["occupied"], 2)
+        self.assertEqual(listing["reservations"][0]["remaining"], 3)
+
+    def test_reservation_missing_content_type_is_415(self) -> None:
+        status, body = self.post_reservation(
+            self.reservation_payload(), content_type=None
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_reservation_unsupported_content_type_is_415(self) -> None:
+        status, body = self.post_reservation(
+            self.reservation_payload(), content_type="text/plain"
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+    def test_reservation_content_type_with_charset_is_accepted(self) -> None:
+        status, _ = self.post_reservation(
+            self.reservation_payload(), content_type="application/json; charset=utf-8"
+        )
+        self.assertEqual(status, 201)
+
+    def test_reservation_malformed_json_is_400_without_reservation(self) -> None:
+        status, body = self.post_reservation(b'{"organizationId": ', raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+        status, listing = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["reservations"], [])
+
+    def test_reservation_non_object_body_is_422(self) -> None:
+        for bad_body in ([], "text", 42, None, True):
+            with self.subTest(bad_body=bad_body):
+                status, body = self.post_reservation(bad_body)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_reservation_missing_or_extra_field_is_422(self) -> None:
+        for field in (
+            "organizationId",
+            "reservationId",
+            "resourceId",
+            "quantity",
+            "capacity",
+        ):
+            payload = self.reservation_payload()
+            del payload[field]
+            with self.subTest(missing=field):
+                status, body = self.post_reservation(payload)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        status, body = self.post_reservation(self.reservation_payload(extra="nope"))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_reservation_blank_or_non_string_identifiers_are_422(self) -> None:
+        for field in ("organizationId", "reservationId", "resourceId"):
+            for bad_value in ("", "   ", 123, None, ["x"], True):
+                with self.subTest(field=field, bad_value=bad_value):
+                    status, body = self.post_reservation(
+                        self.reservation_payload(**{field: bad_value})
+                    )
+                    self.assertEqual(status, 422)
+                    self.assertEqual(body["error"], "validation_error")
+
+    def test_reservation_bad_integers_are_422(self) -> None:
+        for field in ("quantity", "capacity"):
+            for bad_value in (0, -1, 1.5, "2", True, None, [2], 1.0):
+                with self.subTest(field=field, bad_value=bad_value):
+                    status, body = self.post_reservation(
+                        self.reservation_payload(**{field: bad_value})
+                    )
+                    self.assertEqual(status, 422)
+                    self.assertEqual(body["error"], "validation_error")
+
+    # --- GET /reservations -----------------------------------------------------
+
+    def test_list_reservations_filters_by_organization_and_sorts(self) -> None:
+        for payload in (
+            self.reservation_payload(
+                organizationId="org-a", reservationId="res-2", resourceId="r-b"
+            ),
+            self.reservation_payload(
+                organizationId="org-a", reservationId="res-1", resourceId="r-b"
+            ),
+            self.reservation_payload(
+                organizationId="org-a", reservationId="res-3", resourceId="r-a"
+            ),
+            self.reservation_payload(
+                organizationId="org-b", reservationId="res-9", resourceId="r-z"
+            ),
+        ):
+            self.assertEqual(self.post_reservation(payload)[0], 201)
+
+        status, body = self.request("/reservations?organizationId=org-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["organizationId"], "org-a")
+        self.assertEqual(
+            [(r["resourceId"], r["reservationId"]) for r in body["reservations"]],
+            [("r-a", "res-3"), ("r-b", "res-1"), ("r-b", "res-2")],
+        )
+        for reservation in body["reservations"]:
+            self.assertEqual(reservation["organizationId"], "org-a")
+            self.assertEqual(
+                set(reservation),
+                {
+                    "organizationId",
+                    "reservationId",
+                    "resourceId",
+                    "quantity",
+                    "capacity",
+                    "occupied",
+                    "remaining",
+                },
+            )
+        # Per-resource balances are shared across the resource's reservations.
+        by_id = {r["reservationId"]: r for r in body["reservations"]}
+        self.assertEqual(by_id["res-1"]["occupied"], 4)
+        self.assertEqual(by_id["res-1"]["remaining"], 1)
+        self.assertEqual(by_id["res-2"]["occupied"], 4)
+        self.assertEqual(by_id["res-3"]["occupied"], 2)
+        self.assertEqual(by_id["res-3"]["remaining"], 3)
+
+    def test_list_reservations_unknown_organization_returns_empty(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+        status, body = self.request("/reservations?organizationId=other")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"organizationId": "other", "reservations": []})
+
+    def test_list_reservations_requires_single_non_empty_organization_id(self) -> None:
+        for query in (
+            "/reservations",
+            "/reservations?organizationId=",
+            "/reservations?organizationId=%20%20",
+            "/reservations?organizationId=a&organizationId=b",
+        ):
+            with self.subTest(query=query):
+                status, body = self.request(query)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    # --- reservation concurrency ------------------------------------------------
+
+    def test_concurrent_reservations_never_oversell(self) -> None:
+        # Capacity 10, twenty competing reservations of 1 each.
+        def attempt(index: int) -> tuple[int, Any]:
+            return self.post_reservation(
+                self.reservation_payload(
+                    reservationId=f"res-{index}", quantity=1, capacity=10
+                )
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(attempt, range(20)))
+
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 10)
+        self.assertEqual(statuses.count(409), 10)
+        for status, body in results:
+            if status == 409:
+                self.assertEqual(body["error"], "capacity_exceeded")
+
+        status, listing = self.request("/reservations?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["reservations"]), 10)
+        for reservation in listing["reservations"]:
+            self.assertEqual(reservation["occupied"], 10)
+            self.assertEqual(reservation["remaining"], 0)
+
+    def test_concurrent_identical_reservations_create_once(self) -> None:
+        payload = self.reservation_payload()
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(
+                pool.map(lambda _: self.post_reservation(payload), range(24))
+            )
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(200), 23)
+        for _, body in results:
+            self.assertEqual(body["occupied"], 2)
+            self.assertEqual(body["remaining"], 3)
+
+    def test_new_server_instance_has_empty_reservations(self) -> None:
+        self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
+
+        fresh = create_server(port=0)
+        thread = threading.Thread(target=fresh.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{fresh.server_port}/reservations?organizationId=org-1",
+                timeout=2,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    json.load(response),
+                    {"organizationId": "org-1", "reservations": []},
+                )
+        finally:
+            fresh.shutdown()
+            fresh.server_close()
+            thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
