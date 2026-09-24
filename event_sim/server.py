@@ -16,6 +16,16 @@ DECISION_REQUIRED_FIELDS = ("organizationId", "type", "windowSize", "threshold")
 DECISION_OPTIONAL_FIELDS = ("from", "to")
 DECISION_FIELDS = DECISION_REQUIRED_FIELDS + DECISION_OPTIONAL_FIELDS
 
+ALERT_REQUIRED_FIELDS = (
+    "organizationId",
+    "type",
+    "windowSize",
+    "threshold",
+    "suppressionWindow",
+)
+ALERT_OPTIONAL_FIELDS = ("from", "to")
+ALERT_FIELDS = ALERT_REQUIRED_FIELDS + ALERT_OPTIONAL_FIELDS
+
 ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
@@ -372,6 +382,67 @@ class BranchStore:
             return self._branches.get(branch_id)
 
 
+class AlertStore:
+    """In-process alert ledger with per-organization/type suppression.
+
+    An alert is raised at a peak window start when the peak count reaches the
+    request threshold. A repeat peak within the suppression window of a prior
+    alert's peak start increments that alert's suppressed count instead of
+    creating a new alert; a peak at or beyond the window opens a new alert.
+    Suppression checks and creation happen under one lock, so concurrent
+    evaluations cannot create or suppress against a stale view. State lives
+    only for the lifetime of this instance and is cleared on restart.
+    """
+
+    def __init__(self) -> None:
+        self._alerts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def record(
+        self,
+        organization_id: str,
+        event_type: str,
+        peak_start: int,
+        threshold: int,
+        suppression_window: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Raise or suppress an alert for an organization/type peak.
+
+        Returns ``(status, alert)`` where status is ``"escalate"`` for a new
+        alert or ``"suppress"`` when the peak falls inside the suppression
+        window of the most recent prior alert. A suppressed peak increments
+        that alert's ``suppressedCount``.
+        """
+        with self._lock:
+            by_type = self._alerts.setdefault(organization_id, {})
+            alerts = by_type.setdefault(event_type, [])
+            if alerts:
+                latest = alerts[-1]
+                if peak_start - latest["peakStart"] < suppression_window:
+                    latest["suppressedCount"] += 1
+                    return "suppress", latest
+            self._counter += 1
+            alert = {
+                "alertId": f"alert-{self._counter}",
+                "organizationId": organization_id,
+                "type": event_type,
+                "peakStart": peak_start,
+                "threshold": threshold,
+                "suppressedCount": 0,
+            }
+            alerts.append(alert)
+            return "escalate", alert
+
+    def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            by_type = self._alerts.get(organization_id, {})
+            alerts = [dict(alert) for group in by_type.values() for alert in group]
+        # Peak start ascending, then alertId in Unicode code-point order.
+        alerts.sort(key=lambda alert: (alert["peakStart"], alert["alertId"]))
+        return alerts
+
+
 def validate_event(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body against the five-field event contract."""
     if not isinstance(data, dict):
@@ -614,6 +685,67 @@ def evaluate_decision(occurred: list[int], params: dict[str, Any]) -> dict[str, 
         "peakStart": peak_start,
         "peakCount": peak_count,
         "action": action,
+    }
+
+
+def validate_alert_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /alerts/evaluate.
+
+    Required fields: organizationId, type, windowSize, threshold, and
+    suppressionWindow. Optional fields: from and to, which must appear
+    together. No other fields are allowed.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("alert body must be a JSON object")
+
+    keys = set(data)
+    required = set(ALERT_REQUIRED_FIELDS)
+    allowed = set(ALERT_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold", "suppressionWindow"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "suppressionWindow": data["suppressionWindow"],
+        "from": from_value,
+        "to": to_value,
     }
 
 
@@ -900,35 +1032,30 @@ class Handler(BaseHTTPRequestHandler):
             if len(segments) == 1 and segments[0]:
                 self._get_branch(unquote(segments[0]))
                 return
-            if len(segments) == 2 and segments[0]:
+            if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
                 branch = self.server.branches.get(  # type: ignore[attr-defined]
                     branch_id
                 )
                 if branch is None:
-                    self._branch_not_found(branch_id)
+                    self._branch_not_found()
                     return
-                if segments[1] == "events":
-                    self._list_events(branch.ledger, query, newline=True)
+                if len(segments) == 2:
+                    if segments[1] == "events":
+                        self._list_events(branch.ledger, query, newline=True)
+                        return
+                    if segments[1] == "reservations":
+                        self._list_reservations(
+                            branch.reservations, query, newline=True
+                        )
+                        return
+                if (
+                    len(segments) == 3
+                    and segments[1] == "events"
+                    and segments[2] == "aggregate"
+                ):
+                    self._aggregate_events(branch.ledger, query, newline=True)
                     return
-                if segments[1] == "reservations":
-                    self._list_reservations(branch.reservations, query, newline=True)
-                    return
-            if (
-                len(segments) == 3
-                and segments[0]
-                and segments[1] == "events"
-                and segments[2] == "aggregate"
-            ):
-                branch_id = unquote(segments[0])
-                branch = self.server.branches.get(  # type: ignore[attr-defined]
-                    branch_id
-                )
-                if branch is None:
-                    self._branch_not_found(branch_id)
-                    return
-                self._aggregate_events(branch.ledger, query, newline=True)
-                return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "not_found", "path": self.path},
@@ -952,6 +1079,9 @@ class Handler(BaseHTTPRequestHandler):
                 newline=True,
             )
             return
+        if path == "/alerts":
+            self._list_alerts(query)
+            return
         self._write_json(
             HTTPStatus.NOT_FOUND,
             {"error": "not_found", "path": self.path},
@@ -973,35 +1103,28 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
-            if len(segments) == 2 and segments[0]:
+            if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
                 branch = self.server.branches.get(  # type: ignore[attr-defined]
                     branch_id
                 )
                 if branch is None:
-                    self._branch_not_found(branch_id)
+                    self._branch_not_found()
                     return
-                if segments[1] == "events":
-                    self._create_event(branch.ledger, newline=True)
+                if len(segments) == 2:
+                    if segments[1] == "events":
+                        self._create_event(branch.ledger, newline=True)
+                        return
+                    if segments[1] == "reservations":
+                        self._create_reservation(branch.reservations, newline=True)
+                        return
+                if (
+                    len(segments) == 3
+                    and segments[1] == "decisions"
+                    and segments[2] == "evaluate"
+                ):
+                    self._evaluate_decision(branch.ledger, newline=True)
                     return
-                if segments[1] == "reservations":
-                    self._create_reservation(branch.reservations, newline=True)
-                    return
-            if (
-                len(segments) == 3
-                and segments[0]
-                and segments[1] == "decisions"
-                and segments[2] == "evaluate"
-            ):
-                branch_id = unquote(segments[0])
-                branch = self.server.branches.get(  # type: ignore[attr-defined]
-                    branch_id
-                )
-                if branch is None:
-                    self._branch_not_found(branch_id)
-                    return
-                self._evaluate_decision(branch.ledger, newline=True)
-                return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "not_found", "path": self.path},
@@ -1020,6 +1143,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/decisions/evaluate":
             self._evaluate_decision(self.server.ledger)  # type: ignore[attr-defined]
+            return
+        if path == "/alerts/evaluate":
+            self._evaluate_alert()
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
@@ -1110,14 +1236,14 @@ class Handler(BaseHTTPRequestHandler):
     def _get_branch(self, branch_id: str) -> None:
         branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
         if branch is None:
-            self._branch_not_found(branch_id)
+            self._branch_not_found()
             return
         self._write_json(HTTPStatus.OK, branch.summary())
 
-    def _branch_not_found(self, branch_id: str) -> None:
+    def _branch_not_found(self) -> None:
         self._write_json(
             HTTPStatus.NOT_FOUND,
-            {"error": "branch_not_found", "branchId": branch_id},
+            {"error": "branch_not_found"},
             newline=True,
         )
 
@@ -1269,6 +1395,94 @@ class Handler(BaseHTTPRequestHandler):
         result = plan_allocation(params)
         self._write_json(HTTPStatus.OK, result)
 
+    # ------------------------------------------------------------------ alerts
+
+    def _evaluate_alert(self) -> None:
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_alert_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        # The ledger is never mutated by an alert request; the peak is read
+        # from a single locked snapshot of the matching events.
+        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+            params["organizationId"], params["type"]
+        )
+        peak = evaluate_decision(occurred, params)
+        peak_start = peak["peakStart"]
+        peak_count = peak["peakCount"]
+
+        if peak_count < params["threshold"]:
+            alert_id = None
+            suppressed_count = None
+            action = "observe"
+        else:
+            # The suppression decision and the create/commit run in one lock,
+            # so concurrent threshold hits cannot both open an alert.
+            action, alert = self.server.alerts.record(  # type: ignore[attr-defined]
+                params["organizationId"],
+                params["type"],
+                peak_start,
+                params["threshold"],
+                params["suppressionWindow"],
+            )
+            alert_id = alert["alertId"]
+            suppressed_count = alert["suppressedCount"]
+
+        result = {
+            "organizationId": params["organizationId"],
+            "type": params["type"],
+            "windowSize": params["windowSize"],
+            "threshold": params["threshold"],
+            "suppressionWindow": params["suppressionWindow"],
+            "from": params["from"],
+            "to": params["to"],
+            "peakStart": peak_start,
+            "peakCount": peak_count,
+            "action": action,
+            "alertId": alert_id,
+            "suppressedCount": suppressed_count,
+        }
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _list_alerts(self, query: str) -> None:
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        alerts = self.server.alerts.list_for_organization(  # type: ignore[attr-defined]
+            organization_id
+        )
+        entries = [
+            {
+                "alertId": alert["alertId"],
+                "type": alert["type"],
+                "peakStart": alert["peakStart"],
+                "threshold": alert["threshold"],
+                "suppressedCount": alert["suppressedCount"],
+            }
+            for alert in alerts
+        ]
+        self._write_json(
+            HTTPStatus.OK,
+            {"organizationId": organization_id, "alerts": entries},
+            newline=True,
+        )
+
     # ----------------------------------------------------------- reservations
 
     def _create_reservation(
@@ -1377,6 +1591,7 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPSer
     server.reservations = ReservationInventory()  # type: ignore[attr-defined]
     server.snapshots = SnapshotStore()  # type: ignore[attr-defined]
     server.branches = BranchStore()  # type: ignore[attr-defined]
+    server.alerts = AlertStore()  # type: ignore[attr-defined]
     return server
 
 

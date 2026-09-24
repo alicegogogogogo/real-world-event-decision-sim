@@ -307,6 +307,83 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
 
+## Alert suppression and escalation
+
+Alerts are held only in the main service process alongside the event
+ledger; restarting (or starting a new instance) begins with no alerts.
+Snapshots and branches never capture alerts, and the alert entry points
+exist only on the main service — no `/branches/{branchId}/alerts/...`
+paths are added.
+
+### `POST /alerts/evaluate`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+containing exactly these fields:
+
+| Field               | Rule                                                          |
+| ------------------- | ------------------------------------------------------------ |
+| `organizationId`    | required, non-empty string                                   |
+| `type`              | required, non-empty string                                   |
+| `windowSize`        | required, positive integer (no booleans, floats, or strings) |
+| `threshold`         | required, positive integer (no booleans, floats, or strings) |
+| `suppressionWindow` | required, positive integer (no booleans, floats, or strings) |
+| `from`              | optional; non-negative integer, present only together with `to` |
+| `to`                | optional; non-negative integer, present only together with `from` |
+
+The peak uses the exact same windowing as `POST /decisions/evaluate`: only
+events matching both `organizationId` and `type` are counted, windows
+start at `0` and cover `[start, start + windowSize)`, ties resolve to the
+earliest window start, and an unknown organization or type computes as
+zero events. The event ledger is never modified.
+
+- When the peak is below the threshold, `action` is `"observe"`, no alert
+  is written, `alertId` is `null`, and `suppressedCount` is `null`.
+- When the peak reaches the threshold, the peak start is compared with the
+  most recent prior alert for the same organization and type:
+  - `peakStart` not earlier than the prior start and at least
+    `suppressionWindow` away (`peakStart - priorStart >=
+    suppressionWindow`) creates a new alert; `action` is `"escalate"`,
+    `alertId` is the new id (`alert-1`, `alert-2`, …, one global sequence
+    across all organizations and types), and `suppressedCount` is `0`.
+  - A peak start less than `suppressionWindow` after the prior alert's
+    peak start increments that alert's suppression count instead; `action`
+    is `"suppress"`, `alertId` is the prior alert's id, and
+    `suppressedCount` is the new total. The first threshold hit for an
+    organization/type always creates an alert.
+
+The suppression decision and the alert creation commit atomically under
+one lock, so concurrent threshold hits cannot both open alerts or suppress
+against a stale view. The `200` response echoes every request parameter
+and adds the result fields (compact JSON, stable key order, integer values,
+trailing newline):
+
+```json
+{"action":"escalate","alertId":"alert-1","from":null,"organizationId":"org-1","peakCount":3,"peakStart":60,"suppressedCount":0,"suppressionWindow":120,"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/alerts/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","type":"incident.created","windowSize":60,"threshold":3,"suppressionWindow":120}'
+```
+
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON; no alert is
+  written.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  blank or non-string identifiers, booleans/floats where integers are
+  required, non-positive values, unpaired `from`/`to`, or `from > to`.
+
+### `GET /alerts?organizationId=...`
+
+The `organizationId` query parameter must appear exactly once and be
+non-empty. Returns `200` with `{"organizationId": "...", "alerts": [...]}`
+containing only that organization's alerts. Each entry carries `alertId`,
+`type`, `peakStart`, `threshold`, and `suppressedCount`, sorted by
+`peakStart` ascending and then `alertId` in Unicode code-point order. An
+unknown organization returns `"alerts": []`. A missing, blank, or
+duplicated parameter yields `422`.
+
 ## Snapshots and branches
 
 Snapshots capture the current main service state — every event, every
@@ -314,9 +391,12 @@ recorded resource capacity, and every reservation — under a unique name so
 that decisions can later be recomputed against that exact state. Branches fork
 a snapshot into an isolated copy that supports the existing event, aggregate,
 decision, and reservation entry points without sharing any mutable state with
-the main service or with other branches. Like everything else here, snapshots
-and branches live only in the server process and are cleared on restart; there
-is no persistence, authorization, or replay across restarts.
+the main service or with other branches. Snapshots and branches capture only
+events, resource capacities, and reservations — alerts are never captured, and
+the alert entry points remain main-only with no branch-prefixed sub-paths.
+Like everything else here, snapshots and branches live only in the server
+process and are cleared on restart; there is no persistence, authorization, or
+replay across restarts.
 
 ### `POST /snapshots`
 
