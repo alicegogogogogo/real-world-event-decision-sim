@@ -16,6 +16,10 @@ DECISION_REQUIRED_FIELDS = ("organizationId", "type", "windowSize", "threshold")
 DECISION_OPTIONAL_FIELDS = ("from", "to")
 DECISION_FIELDS = DECISION_REQUIRED_FIELDS + DECISION_OPTIONAL_FIELDS
 
+ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
+DEMAND_FIELDS = ("demandId", "units", "priority")
+RESOURCE_FIELDS = ("resourceId", "capacity")
+
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
@@ -326,6 +330,172 @@ def evaluate_decision(occurred: list[int], params: dict[str, Any]) -> dict[str, 
     }
 
 
+def validate_allocation_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /decisions/allocate.
+
+    Required fields: organizationId, demands, resources, and no others.
+    Each demand/resource element must be an object with exactly its fixed
+    fields; identifiers must be unique within the request and non-blank.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("allocation body must be a JSON object")
+
+    keys = set(data)
+    required = set(ALLOCATION_REQUIRED_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    organization_id = data["organizationId"]
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise EventValidationError("organizationId must be a non-empty string")
+
+    raw_demands = data["demands"]
+    raw_resources = data["resources"]
+    if not isinstance(raw_demands, list) or not isinstance(raw_resources, list):
+        raise EventValidationError("demands and resources must be arrays")
+
+    demands: list[dict[str, Any]] = []
+    seen_demand_ids: set[str] = set()
+    for index, element in enumerate(raw_demands):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"demands[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(DEMAND_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"demands[{index}]: {'; '.join(element_detail)}"
+            )
+        demand_id = element["demandId"]
+        if not isinstance(demand_id, str) or not demand_id.strip():
+            raise EventValidationError(
+                f"demands[{index}].demandId must be a non-empty string"
+            )
+        if demand_id in seen_demand_ids:
+            raise EventValidationError(
+                f"duplicate demandId: {demand_id}"
+            )
+        if not _is_positive_integer(element["units"]):
+            raise EventValidationError(
+                f"demands[{index}].units must be a positive integer"
+            )
+        if not _is_non_negative_integer(element["priority"]):
+            raise EventValidationError(
+                f"demands[{index}].priority must be a non-negative integer"
+            )
+        seen_demand_ids.add(demand_id)
+        demands.append(
+            {
+                "demandId": demand_id,
+                "units": element["units"],
+                "priority": element["priority"],
+            }
+        )
+
+    resources: dict[str, int] = {}
+    for index, element in enumerate(raw_resources):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"resources[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(RESOURCE_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"resources[{index}]: {'; '.join(element_detail)}"
+            )
+        resource_id = element["resourceId"]
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise EventValidationError(
+                f"resources[{index}].resourceId must be a non-empty string"
+            )
+        if resource_id in resources:
+            raise EventValidationError(
+                f"duplicate resourceId: {resource_id}"
+            )
+        if not _is_positive_integer(element["capacity"]):
+            raise EventValidationError(
+                f"resources[{index}].capacity must be a positive integer"
+            )
+        resources[resource_id] = element["capacity"]
+
+    return {
+        "organizationId": organization_id,
+        "demands": demands,
+        "resources": resources,
+    }
+
+
+def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate whole demands to resources by deterministic rules.
+
+    Demands are handled by priority descending, then demandId in Unicode
+    code-point order. A demand goes wholly to the lexicographically smallest
+    resourceId with enough remaining capacity; otherwise it is unassigned.
+    """
+    demands = params["demands"]
+    remaining = dict(params["resources"])
+
+    ordered_demands = sorted(
+        demands, key=lambda demand: (-demand["priority"], demand["demandId"])
+    )
+    ordered_resources = sorted(remaining)
+
+    assignments: list[dict[str, Any]] = []
+    unassigned: list[str] = []
+    total_units = 0
+    for demand in ordered_demands:
+        demand_id = demand["demandId"]
+        units = demand["units"]
+        chosen = None
+        for resource_id in ordered_resources:
+            if remaining[resource_id] >= units:
+                chosen = resource_id
+                break
+        if chosen is None:
+            unassigned.append(demand_id)
+            continue
+        remaining[chosen] -= units
+        assignments.append(
+            {"demandId": demand_id, "resourceId": chosen, "units": units}
+        )
+        total_units += units
+
+    unassigned.sort()
+    return {
+        "organizationId": params["organizationId"],
+        "assignments": assignments,
+        "unassigned": unassigned,
+        "totalUnits": total_units,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -352,6 +522,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/decisions/evaluate":
             self._evaluate_decision()
+            return
+        if parsed.path == "/decisions/allocate":
+            self._allocate_decision()
             return
         if parsed.path != "/events":
             self._write_json(
@@ -442,6 +615,45 @@ class Handler(BaseHTTPRequestHandler):
             params["organizationId"], params["type"]
         )
         result = evaluate_decision(occurred, params)
+        self._write_json(HTTPStatus.OK, result)
+
+    def _allocate_decision(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._write_json(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                {"error": "unsupported_media_type"},
+            )
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+            )
+            return
+
+        try:
+            params = validate_allocation_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        # Read-only and stateless: the plan is computed from the request body
+        # alone, so identical submissions and concurrent requests never
+        # interfere with each other or with the ledger.
+        result = plan_allocation(params)
         self._write_json(HTTPStatus.OK, result)
 
     def _list_events(self, query: str) -> None:

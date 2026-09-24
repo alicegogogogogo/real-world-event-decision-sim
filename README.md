@@ -178,3 +178,65 @@ curl -X POST http://127.0.0.1:8000/decisions/evaluate \
 - `422 Unprocessable Entity` — a non-object body, missing or extra fields,
   invalid types, unpaired `from`/`to`, or out-of-range values.
 
+### `POST /decisions/allocate`
+
+A read-only, deterministic resource plan computed entirely from the request
+body. Nothing is written to the event ledger, no earlier plan is inherited,
+and concurrent requests cannot affect each other. Requires
+`Content-Type: application/json`. The body must be a JSON object containing
+exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string                                   |
+| `demands`        | required array (may be empty) of demand objects              |
+| `resources`      | required array (may be empty) of resource objects            |
+
+A demand object has exactly `demandId` (non-empty string, unique within the
+request), `units` (positive integer), and `priority` (non-negative integer).
+A resource object has exactly `resourceId` (non-empty string, unique within
+the request) and `capacity` (positive integer). Booleans, floats, negative or
+zero values where a positive integer is required, wrong element types, blank
+or duplicate identifiers, and unknown fields are all rejected.
+
+Demands are handled by `priority` descending; ties resolve by `demandId` in
+Unicode code-point order. A demand is placed wholly into the
+lexicographically smallest `resourceId` whose remaining capacity covers its
+units, and that capacity is deducted immediately. Demands are never split and
+capacity is never oversold; a demand that fits in no remaining resource goes
+to `unassigned` — priorities and units are never adjusted to place more
+demands.
+
+The `200` response has a fixed shape:
+
+```json
+{
+  "organizationId": "org-1",
+  "assignments": [
+    {"demandId": "d-a", "resourceId": "r-a", "units": 2},
+    {"demandId": "d-b", "resourceId": "r-b", "units": 4}
+  ],
+  "unassigned": ["d-big"],
+  "totalUnits": 6
+}
+```
+
+- `assignments` lists `{"demandId", "resourceId", "units"}` objects in
+  processing order.
+- `unassigned` lists the demandIds that could not be placed, sorted by
+  `demandId`.
+- `totalUnits` counts only units that were assigned.
+- Empty `demands`/`resources` arrays are valid and return empty results;
+  identical submissions return byte-for-byte identical JSON.
+
+```bash
+curl -X POST http://127.0.0.1:8000/decisions/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","demands":[{"demandId":"d-a","units":2,"priority":1}],"resources":[{"resourceId":"r-a","capacity":5}]}'
+```
+
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  invalid types, duplicate or blank identifiers, or out-of-range values.
+
