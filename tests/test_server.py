@@ -6,9 +6,14 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
 from event_sim.server import SERVICE_NAME, create_server
+
+# Sentinel for the request helpers: pick a registered token matching the
+# request's organization (defaulting to org-1) instead of an explicit one.
+_AUTO_TOKEN = object()
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -29,11 +34,53 @@ class ServerTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self._tokens: dict[tuple[str, str], str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def register_token(self, organization_id: str = "org-1", role: str = "write") -> str:
+        key = (organization_id, role)
+        token = self._tokens.get(key)
+        if token is None:
+            token = "test-token-" + quote(f"{organization_id}-{role}", safe="")
+            status, _ = self.request(
+                "/auth/tokens",
+                method="POST",
+                body=json.dumps(
+                    {
+                        "token": token,
+                        "organizationId": organization_id,
+                        "role": role,
+                    }
+                ).encode(),
+                token=None,
+            )
+            # Concurrent registration of the same token replays as 200.
+            self.assertIn(status, (200, 201))
+            self._tokens[key] = token
+        return token
+
+    def _auto_token(self, path: str, body: bytes | None) -> str:
+        organization_id = None
+        if body is not None:
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and isinstance(
+                payload.get("organizationId"), str
+            ):
+                organization_id = payload["organizationId"]
+        if organization_id is None or not organization_id.strip():
+            values = parse_qs(urlsplit(path).query).get("organizationId")
+            if values and len(values) == 1 and values[0].strip():
+                organization_id = values[0]
+            else:
+                organization_id = "org-1"
+        return self.register_token(organization_id)
 
     def request(
         self,
@@ -42,10 +89,15 @@ class ServerTest(unittest.TestCase):
         method: str = "GET",
         body: bytes | None = None,
         content_type: str | None = "application/json",
+        token: Any = _AUTO_TOKEN,
     ) -> tuple[int, Any]:
         headers = {}
         if content_type is not None:
             headers["Content-Type"] = content_type
+        if token is _AUTO_TOKEN:
+            token = self._auto_token(path, body)
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         request = Request(
             f"{self.base_url}{path}",
             data=body,
@@ -53,7 +105,7 @@ class ServerTest(unittest.TestCase):
             method=method,
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with urlopen(request, timeout=30) as response:
                 return response.status, json.load(response)
         except HTTPError as error:
             try:
@@ -161,15 +213,19 @@ class ServerTest(unittest.TestCase):
         # five-field body, byte for byte. A success response with no body would
         # break snapshot/branch reconciliation at its first step.
         event = make_event()
+        token = self.register_token("org-1")
 
         def raw_post(payload: Any) -> tuple[int, bytes]:
             request = Request(
                 f"{self.base_url}/events",
                 data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
                 method="POST",
             )
-            with urlopen(request, timeout=5) as response:
+            with urlopen(request, timeout=30) as response:
                 return response.status, response.read()
 
         first_status, first_raw = raw_post(event)
@@ -1143,8 +1199,14 @@ class ServerTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
+            # A fresh process starts with no registered tokens, so a
+            # credential must be registered before any protected entry point.
+            self._register_token_on(fresh, "fresh-token", "org-1")
             with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}/events?organizationId=org-1",
+                Request(
+                    f"http://127.0.0.1:{fresh.server_port}/events?organizationId=org-1",
+                    headers={"Authorization": "Bearer fresh-token"},
+                ),
                 timeout=2,
             ) as response:
                 self.assertEqual(response.status, 200)
@@ -1199,10 +1261,13 @@ class ServerTest(unittest.TestCase):
         request = Request(
             f"{self.base_url}/reservations",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.register_token('org-1')}",
+            },
             method="POST",
         )
-        with urlopen(request, timeout=5) as response:
+        with urlopen(request, timeout=30) as response:
             raw = response.read()
         self.assertTrue(raw.endswith(b"\n"))
         self.assertEqual(json.loads(raw[:-1])["remaining"], 3)
@@ -1487,6 +1552,21 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(body["occupied"], 2)
             self.assertEqual(body["remaining"], 3)
 
+    def _register_token_on(
+        self, server: Any, token: str, organization_id: str, role: str = "write"
+    ) -> None:
+        body = json.dumps(
+            {"token": token, "organizationId": organization_id, "role": role}
+        ).encode()
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/auth/tokens",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30) as response:
+            self.assertEqual(response.status, 201)
+
     def test_new_server_instance_has_empty_reservations(self) -> None:
         self.assertEqual(self.post_reservation(self.reservation_payload())[0], 201)
 
@@ -1494,8 +1574,12 @@ class ServerTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
+            self._register_token_on(fresh, "fresh-token", "org-1")
             with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}/reservations?organizationId=org-1",
+                Request(
+                    f"http://127.0.0.1:{fresh.server_port}/reservations?organizationId=org-1",
+                    headers={"Authorization": "Bearer fresh-token"},
+                ),
                 timeout=2,
             ) as response:
                 self.assertEqual(response.status, 200)

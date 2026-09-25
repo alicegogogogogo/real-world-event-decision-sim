@@ -28,6 +28,59 @@ python -m unittest discover -s tests -v
 - Unknown paths return a JSON `not_found` error with HTTP 404.
 - `python -m event_sim --help` documents the command-line entry point.
 
+## Authentication and organization isolation
+
+Every entry point except `GET /health` and `POST /auth/tokens` requires an
+`Authorization: Bearer <token>` header naming a registered token. A missing
+header, a non-Bearer value, a malformed token, or an unregistered token
+returns `401` with `{"error": "unauthorized"}`. Credentials live only in the
+server process: a restart clears every token, and an unregistered token
+cannot reach any protected entry point.
+
+### `POST /auth/tokens`
+
+Registers a credential. Requires `Content-Type: application/json`. The body
+must be a JSON object with exactly these three fields (in any order):
+
+| Field            | Rule                        |
+| ---------------- | --------------------------- |
+| `token`          | non-empty string            |
+| `organizationId` | non-empty string            |
+| `role`           | `"read"` or `"write"`       |
+
+- `201 Created` — new credential registered; the response echoes the three
+  fields as compact JSON with keys in code-point order and one trailing
+  newline.
+- `200 OK` — the same token was resubmitted with identical fields; nothing
+  is registered twice and the body matches the creation response.
+- `409 Conflict` (`{"error": "auth_conflict"}`) — the token exists with
+  different fields.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — fields are missing,
+  extra, blank, or of the wrong type; nothing is registered.
+
+### Authorization rules
+
+- The `organizationId` in a request (query parameter or body field) must
+  match the token's registered organization; cross-organization reads and
+  writes return `403` with `{"error": "forbidden"}` and never change state.
+- Snapshots and branches belong to the organization of the credential that
+  created them. `GET /snapshots` lists only the caller's own snapshots;
+  forking another organization's snapshot or reaching another
+  organization's branch (including all branch-prefixed entry points)
+  returns `403`.
+- The `read` role may call every non-mutating entry point: all list,
+  aggregate, replay, and region queries, plus the decision computations
+  (`POST /decisions/evaluate`, `POST /decisions/allocate`, and their branch
+  counterparts).
+- Only the `write` role may call state-changing entry points: submitting
+  events and reservations (main or branch), evaluating alerts, and creating
+  snapshots and branches. A `read` credential calling a write entry point
+  returns `403`; the role check and the write commit under the same lock,
+  so a failed request never changes the ledger or the inventory.
+
+
 ## Event ledger
 
 Events are held only in the server process: restarting (or starting a new
@@ -454,8 +507,8 @@ the main service or with other branches. Snapshots and branches capture only
 events, resource capacities, and reservations — alerts are never captured, and
 the alert entry points remain main-only with no branch-prefixed sub-paths.
 Like everything else here, snapshots and branches live only in the server
-process and are cleared on restart; there is no persistence, authorization, or
-replay across restarts.
+process and are cleared on restart; there is no persistence or replay across
+restarts.
 
 ### `POST /snapshots`
 

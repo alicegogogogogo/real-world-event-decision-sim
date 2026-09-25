@@ -38,6 +38,9 @@ RESERVATION_FIELDS = (
     "capacity",
 )
 
+TOKEN_FIELDS = ("token", "organizationId", "role")
+TOKEN_ROLES = ("read", "write")
+
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
 _BODY_ERROR = object()
@@ -45,6 +48,44 @@ _BODY_ERROR = object()
 
 class EventValidationError(ValueError):
     """The submitted event object fails the ledger's field rules."""
+
+
+class TokenStore:
+    """In-process registry of bearer credentials, keyed by token.
+
+    Registrations are append-only: a registered token is never updated or
+    removed, so an authorization decision made from one lookup stays valid
+    for the rest of the request. State lives only for the lifetime of this
+    instance — a restart clears every credential, and an unregistered token
+    cannot reach any protected entry point.
+    """
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, dict[str, str]] = {}
+        self._lock = threading.Lock()
+
+    def register(self, credential: dict[str, str]) -> str:
+        """Register a credential or reconcile a replay.
+
+        Returns ``"created"`` for a new token, ``"exists"`` when the same
+        token is resubmitted with identical fields (nothing is registered
+        twice), or ``"conflict"`` when the token exists with different
+        fields.
+        """
+        with self._lock:
+            existing = self._tokens.get(credential["token"])
+            if existing is None:
+                self._tokens[credential["token"]] = dict(credential)
+                return "created"
+            if existing == credential:
+                return "exists"
+            return "conflict"
+
+    def lookup(self, token: str) -> dict[str, str] | None:
+        """Return a copy of the credential for ``token``, or None."""
+        with self._lock:
+            entry = self._tokens.get(token)
+            return dict(entry) if entry is not None else None
 
 
 def event_region(event: dict[str, Any]) -> str | None:
@@ -73,16 +114,25 @@ class EventLedger:
         self._lock = threading.Lock()
 
     def add(
-        self, event: dict[str, Any]
-    ) -> tuple[str, dict[str, Any]]:
+        self, event: dict[str, Any], *, organization_id: str | None = None
+    ) -> tuple[str, dict[str, Any] | None]:
         """Insert an event or reconcile a replay.
 
         Returns ``(status, event)`` where status is ``"created"`` for a new
         eventId, ``"exists"`` for an identical replay, or ``"conflict"`` when
-        the same eventId carries different fields.
+        the same eventId carries different fields. When ``organization_id``
+        is given, the event's organization must match it; the check runs
+        inside the same lock as the insert, so a forbidden write can never
+        interleave with a state change. A forbidden write returns
+        ``("forbidden", None)`` and leaves the ledger untouched.
         """
         event_id = event["eventId"]
         with self._lock:
+            if (
+                organization_id is not None
+                and event["organizationId"] != organization_id
+            ):
+                return "forbidden", None
             existing = self._events.get(event_id)
             if existing is None:
                 stored = {field: event[field] for field in EVENT_FIELDS}
@@ -232,7 +282,7 @@ class ReservationInventory:
         }
 
     def reserve(
-        self, reservation: dict[str, Any]
+        self, reservation: dict[str, Any], *, organization_id: str | None = None
     ) -> tuple[str, dict[str, Any] | None]:
         """Commit a reservation or reconcile a replay, atomically.
 
@@ -242,10 +292,19 @@ class ReservationInventory:
         exists with different fields, ``"capacity_conflict"`` when the
         resource's recorded capacity differs from the declared one, or
         ``"capacity_exceeded"`` when the remaining balance cannot cover the
-        quantity. Only ``"created"`` mutates state; the view carries the
-        post-commit occupied and remaining balances.
+        quantity. When ``organization_id`` is given, the reservation's
+        organization must match it; that authorization check runs inside the
+        same lock as the balance check and deduction, so a forbidden write
+        returns ``("forbidden", None)`` and never changes the inventory.
+        Only ``"created"`` mutates state; the view carries the post-commit
+        occupied and remaining balances.
         """
         with self._lock:
+            if (
+                organization_id is not None
+                and reservation["organizationId"] != organization_id
+            ):
+                return "forbidden", None
             existing = self._reservations.get(reservation["reservationId"])
             if existing is not None:
                 if all(
@@ -315,17 +374,20 @@ class ReservationInventory:
 class Snapshot:
     """An immutable, deep-copied capture of one main-state point in time.
 
-    Holds every event plus reservation capacities and reservations.
+    Holds every event plus reservation capacities and reservations. Each
+    snapshot belongs to the organization of the credential that created it.
     """
 
     def __init__(
         self,
         snapshot_id: str,
+        organization_id: str,
         events: dict[str, dict[str, Any]],
         capacities: dict[str, int],
         reservations: dict[str, dict[str, Any]],
     ) -> None:
         self.snapshot_id = snapshot_id
+        self.organization_id = organization_id
         self._events = {
             event_id: dict(event) for event_id, event in events.items()
         }
@@ -366,13 +428,15 @@ class SnapshotStore:
     def create(
         self,
         snapshot_id: str,
+        organization_id: str,
         ledger: EventLedger,
         reservations: ReservationInventory,
     ) -> tuple[str, Snapshot]:
         """Capture ``ledger`` and ``reservations`` under ``snapshot_id``.
 
-        Returns ``("created", snapshot)`` or ``("conflict", snapshot)`` when
-        the name already exists; an existing snapshot is never replaced.
+        The snapshot is owned by ``organization_id``. Returns
+        ``("created", snapshot)`` or ``("conflict", snapshot)`` when the name
+        already exists; an existing snapshot is never replaced.
         """
         with self._lock:
             existing = self._snapshots.get(snapshot_id)
@@ -380,6 +444,7 @@ class SnapshotStore:
                 return "conflict", existing
             snapshot = Snapshot(
                 snapshot_id,
+                organization_id,
                 ledger.snapshot(),
                 *reservations.snapshot(),
             )
@@ -390,9 +455,14 @@ class SnapshotStore:
         with self._lock:
             return self._snapshots.get(snapshot_id)
 
-    def summaries(self) -> list[dict[str, Any]]:
+    def summaries(self, organization_id: str) -> list[dict[str, Any]]:
+        """Summaries of the snapshots owned by one organization."""
         with self._lock:
-            snapshots = list(self._snapshots.values())
+            snapshots = [
+                snapshot
+                for snapshot in self._snapshots.values()
+                if snapshot.organization_id == organization_id
+            ]
         snapshots.sort(key=lambda snapshot: snapshot.snapshot_id)
         return [
             {
@@ -409,11 +479,19 @@ class Branch:
     """An isolated fork of the main service state built from one snapshot.
 
     A branch owns its own ledger and reservation inventory; writes land only
-    in the branch and never touch the main service or any other branch.
+    in the branch and never touch the main service or any other branch. Each
+    branch belongs to the organization of the credential that created it.
     """
 
-    def __init__(self, branch_id: str, snapshot_id: str, snapshot: Snapshot) -> None:
+    def __init__(
+        self,
+        branch_id: str,
+        organization_id: str,
+        snapshot_id: str,
+        snapshot: Snapshot,
+    ) -> None:
         self.branch_id = branch_id
+        self.organization_id = organization_id
         self.snapshot_id = snapshot_id
         self.ledger, self.reservations = snapshot.materialize()
 
@@ -434,8 +512,10 @@ class BranchStore:
         self._branches: dict[str, Branch] = {}
         self._lock = threading.Lock()
 
-    def create(self, branch_id: str, snapshot: Snapshot) -> tuple[str, Branch]:
-        """Fork ``snapshot`` under ``branch_id``.
+    def create(
+        self, branch_id: str, organization_id: str, snapshot: Snapshot
+    ) -> tuple[str, Branch]:
+        """Fork ``snapshot`` under ``branch_id``, owned by ``organization_id``.
 
         Returns ``("created", branch)`` or ``("conflict", branch)`` when a
         branch with that name already exists.
@@ -444,7 +524,7 @@ class BranchStore:
             existing = self._branches.get(branch_id)
             if existing is not None:
                 return "conflict", existing
-            branch = Branch(branch_id, snapshot.snapshot_id, snapshot)
+            branch = Branch(branch_id, organization_id, snapshot.snapshot_id, snapshot)
             self._branches[branch_id] = branch
             return "created", branch
 
@@ -512,6 +592,41 @@ class AlertStore:
         # Peak start ascending, then alertId in Unicode code-point order.
         alerts.sort(key=lambda alert: (alert["peakStart"], alert["alertId"]))
         return alerts
+
+
+def validate_token_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /auth/tokens.
+
+    The body must be a JSON object with exactly the fields ``token``,
+    ``organizationId``, and ``role`` (in any order). ``token`` and
+    ``organizationId`` must be non-empty strings; ``role`` must be ``read``
+    or ``write``. The token is kept verbatim, with no normalization.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("token body must be a JSON object")
+
+    keys = set(data)
+    expected = set(TOKEN_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("token", "organizationId"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    role = data["role"]
+    if role not in TOKEN_ROLES:
+        raise EventValidationError("role must be one of: read, write")
+
+    return {field: data[field] for field in TOKEN_FIELDS}
 
 
 def validate_event(data: Any) -> dict[str, Any]:
@@ -1277,30 +1392,33 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/snapshots":
-            self._list_snapshots()
+            principal = self._authenticate()
+            if principal is None:
+                return
+            self._list_snapshots(principal)
             return
 
         if path.startswith("/branches/"):
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
             if len(segments) == 1 and segments[0]:
-                self._get_branch(unquote(segments[0]))
+                self._get_branch(unquote(segments[0]), principal)
                 return
             if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
-                branch = self.server.branches.get(  # type: ignore[attr-defined]
-                    branch_id
-                )
+                branch = self._owned_branch(branch_id, principal)
                 if branch is None:
-                    self._branch_not_found()
                     return
                 if len(segments) == 2:
                     if segments[1] == "events":
-                        self._list_events(branch.ledger, query, newline=True)
+                        self._list_events(branch.ledger, query, principal, newline=True)
                         return
                     if segments[1] == "reservations":
                         self._list_reservations(
-                            branch.reservations, query, newline=True
+                            branch.reservations, query, principal, newline=True
                         )
                         return
                 if (
@@ -1308,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
                     and segments[1] == "events"
                     and segments[2] == "aggregate"
                 ):
-                    self._aggregate_events(branch.ledger, query, newline=True)
+                    self._aggregate_events(branch.ledger, query, principal, newline=True)
                     return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
@@ -1318,47 +1436,77 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/events":
-            self._list_events(self.server.ledger, query)  # type: ignore[attr-defined]
+            principal = self._authenticate()
+            if principal is None:
+                return
+            self._list_events(self.server.ledger, query, principal)  # type: ignore[attr-defined]
             return
         if path == "/events/replay":
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             self._replay_events(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
+                principal,
             )
             return
         if path == "/events/replay/compare":
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             self._compare_replays(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
+                principal,
             )
             return
         if path == "/events/region":
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             self._list_events_by_region(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
+                principal,
             )
             return
         if path == "/events/region/aggregate":
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             self._aggregate_events_by_region(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
+                principal,
             )
             return
         if path == "/events/aggregate":
+            principal = self._authenticate()
+            if principal is None:
+                return
             self._aggregate_events(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
+                principal,
             )
             return
         if path == "/reservations":
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             self._list_reservations(
                 self.server.reservations,  # type: ignore[attr-defined]
                 query,
+                principal,
                 newline=True,
             )
             return
         if path == "/alerts":
-            self._list_alerts(query)
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
+            self._list_alerts(query, principal)
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -1371,37 +1519,53 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
 
+        if path == "/auth/tokens":
+            self._register_token()
+            return
+
         if path == "/snapshots":
-            self._create_snapshot()
+            principal = self._authenticate()
+            if principal is None or not self._require_write_role(principal):
+                return
+            self._create_snapshot(principal)
             return
         if path == "/branches":
-            self._create_branch()
+            principal = self._authenticate()
+            if principal is None or not self._require_write_role(principal):
+                return
+            self._create_branch(principal)
             return
 
         if path.startswith("/branches/"):
+            principal = self._authenticate(newline=True)
+            if principal is None:
+                return
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
             if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
-                branch = self.server.branches.get(  # type: ignore[attr-defined]
-                    branch_id
-                )
+                branch = self._owned_branch(branch_id, principal)
                 if branch is None:
-                    self._branch_not_found()
                     return
                 if len(segments) == 2:
                     if segments[1] == "events":
-                        self._create_event(branch.ledger, newline=True)
+                        if not self._require_write_role(principal, newline=True):
+                            return
+                        self._create_event(branch.ledger, principal, newline=True)
                         return
                     if segments[1] == "reservations":
-                        self._create_reservation(branch.reservations, newline=True)
+                        if not self._require_write_role(principal, newline=True):
+                            return
+                        self._create_reservation(
+                            branch.reservations, principal, newline=True
+                        )
                         return
                 if (
                     len(segments) == 3
                     and segments[1] == "decisions"
                     and segments[2] == "evaluate"
                 ):
-                    self._evaluate_decision(branch.ledger, newline=True)
+                    self._evaluate_decision(branch.ledger, principal, newline=True)
                     return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
@@ -1411,31 +1575,159 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/events":
-            self._create_event(self.server.ledger)  # type: ignore[attr-defined]
+            principal = self._authenticate()
+            if principal is None or not self._require_write_role(principal):
+                return
+            self._create_event(self.server.ledger, principal)  # type: ignore[attr-defined]
             return
         if path == "/reservations":
+            principal = self._authenticate(newline=True)
+            if principal is None or not self._require_write_role(principal, newline=True):
+                return
             self._create_reservation(
                 self.server.reservations,  # type: ignore[attr-defined]
+                principal,
                 newline=True,
             )
             return
         if path == "/decisions/evaluate":
-            self._evaluate_decision(self.server.ledger)  # type: ignore[attr-defined]
+            principal = self._authenticate()
+            if principal is None:
+                return
+            self._evaluate_decision(self.server.ledger, principal)  # type: ignore[attr-defined]
             return
         if path == "/alerts/evaluate":
-            self._evaluate_alert()
+            principal = self._authenticate(newline=True)
+            if principal is None or not self._require_write_role(principal, newline=True):
+                return
+            self._evaluate_alert(principal)
             return
         if path == "/decisions/allocate":
-            self._allocate_decision()
+            principal = self._authenticate()
+            if principal is None:
+                return
+            self._allocate_decision(principal)
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
             {"error": "not_found", "path": self.path},
         )
 
+    # ------------------------------------------------------------------- auth
+
+    def _authenticate(self, *, newline: bool = False) -> dict[str, str] | None:
+        """Resolve the bearer credential, or write 401 and return None.
+
+        Every entry point except /health and /auth/tokens requires an
+        ``Authorization: Bearer <token>`` header naming a registered token.
+        A missing header, a non-Bearer shape, a malformed token, or an
+        unregistered token all fail closed with ``unauthorized``.
+        """
+        token = None
+        header = self.headers.get("Authorization")
+        if header is not None:
+            parts = header.split(" ")
+            if len(parts) == 2 and parts[0] == "Bearer" and parts[1]:
+                token = parts[1]
+        principal = (
+            self.server.tokens.lookup(token)  # type: ignore[attr-defined]
+            if token is not None
+            else None
+        )
+        if principal is None:
+            self._write_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "unauthorized"},
+                newline=newline,
+            )
+            return None
+        return principal
+
+    def _require_write_role(
+        self, principal: dict[str, str], *, newline: bool = False
+    ) -> bool:
+        """Gate a state-changing entry point on the write role.
+
+        A read-only credential calling a write entry point fails with 403
+        before any body is parsed, so no write is ever attempted; the
+        credential itself is immutable once registered, so the decision
+        cannot be invalidated before the store's own lock commits the write.
+        """
+        if principal["role"] == "write":
+            return True
+        self._forbidden(newline=newline)
+        return False
+
+    def _organization_allowed(
+        self,
+        principal: dict[str, str],
+        organization_id: str,
+        *,
+        newline: bool = False,
+    ) -> bool:
+        """Check that a request's organization matches the credential's."""
+        if organization_id == principal["organizationId"]:
+            return True
+        self._forbidden(newline=newline)
+        return False
+
+    def _forbidden(self, *, newline: bool = False) -> None:
+        self._write_json(
+            HTTPStatus.FORBIDDEN,
+            {"error": "forbidden"},
+            newline=newline,
+        )
+
+    def _owned_branch(
+        self, branch_id: str, principal: dict[str, str]
+    ) -> Branch | None:
+        """Return the branch if the principal's organization owns it.
+
+        Writes ``branch_not_found`` (404) for an unknown branch and
+        ``forbidden`` (403) for a branch owned by another organization; in
+        both cases None is returned and the caller must return immediately.
+        """
+        branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
+        if branch is None:
+            self._branch_not_found()
+            return None
+        if branch.organization_id != principal["organizationId"]:
+            self._forbidden(newline=True)
+            return None
+        return branch
+
+    def _register_token(self) -> None:
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            credential = validate_token_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        status = self.server.tokens.register(credential)  # type: ignore[attr-defined]
+        if status == "conflict":
+            self._write_json(
+                HTTPStatus.CONFLICT,
+                {"error": "auth_conflict"},
+                newline=True,
+            )
+            return
+        self._write_json(
+            HTTPStatus.CREATED if status == "created" else HTTPStatus.OK,
+            credential,
+            newline=True,
+        )
+
     # ------------------------------------------------------------- snapshots
 
-    def _create_snapshot(self) -> None:
+    def _create_snapshot(self, principal: dict[str, str]) -> None:
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1451,6 +1743,7 @@ class Handler(BaseHTTPRequestHandler):
 
         status, snapshot = self.server.snapshots.create(  # type: ignore[attr-defined]
             snapshot_id,
+            principal["organizationId"],
             self.server.ledger,  # type: ignore[attr-defined]
             self.server.reservations,  # type: ignore[attr-defined]
         )
@@ -1470,15 +1763,19 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "snapshot_conflict"},
             )
 
-    def _list_snapshots(self) -> None:
+    def _list_snapshots(self, principal: dict[str, str]) -> None:
         self._write_json(
             HTTPStatus.OK,
-            {"snapshots": self.server.snapshots.summaries()},  # type: ignore[attr-defined]
+            {
+                "snapshots": self.server.snapshots.summaries(  # type: ignore[attr-defined]
+                    principal["organizationId"]
+                )
+            },
         )
 
     # --------------------------------------------------------------- branches
 
-    def _create_branch(self) -> None:
+    def _create_branch(self, principal: dict[str, str]) -> None:
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1499,9 +1796,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "snapshot_not_found"},
             )
             return
+        if snapshot.organization_id != principal["organizationId"]:
+            self._forbidden()
+            return
 
         status, branch = self.server.branches.create(  # type: ignore[attr-defined]
-            branch_id, snapshot
+            branch_id, principal["organizationId"], snapshot
         )
         if status == "created":
             self._write_json(HTTPStatus.CREATED, branch.summary())
@@ -1511,10 +1811,13 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "branch_conflict"},
             )
 
-    def _get_branch(self, branch_id: str) -> None:
+    def _get_branch(self, branch_id: str, principal: dict[str, str]) -> None:
         branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
         if branch is None:
             self._branch_not_found()
+            return
+        if branch.organization_id != principal["organizationId"]:
+            self._forbidden(newline=True)
             return
         self._write_json(HTTPStatus.OK, branch.summary())
 
@@ -1527,7 +1830,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- events
 
-    def _create_event(self, ledger: EventLedger, *, newline: bool = False) -> None:
+    def _create_event(
+        self, ledger: EventLedger, principal: dict[str, str], *, newline: bool = False
+    ) -> None:
         data = self._json_request_body(newline=newline)
         if data is _BODY_ERROR:
             return
@@ -1542,8 +1847,14 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, stored = ledger.add(event)
-        if status == "created":
+        # The organization check and the insert commit under the ledger's
+        # own lock, so a forbidden write never changes the ledger.
+        status, stored = ledger.add(
+            event, organization_id=principal["organizationId"]
+        )
+        if status == "forbidden":
+            self._forbidden(newline=newline)
+        elif status == "created":
             self._write_json(HTTPStatus.CREATED, stored, newline=newline)
         elif status == "exists":
             self._write_json(HTTPStatus.OK, stored, newline=newline)
@@ -1555,7 +1866,12 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _list_events(
-        self, ledger: EventLedger, query: str, *, newline: bool = False
+        self,
+        ledger: EventLedger,
+        query: str,
+        principal: dict[str, str],
+        *,
+        newline: bool = False,
     ) -> None:
         try:
             organization_id = _organization_id_from_query(query)
@@ -1566,6 +1882,8 @@ class Handler(BaseHTTPRequestHandler):
                 newline=newline,
             )
             return
+        if not self._organization_allowed(principal, organization_id, newline=newline):
+            return
         events = ledger.list_for_organization(organization_id)
         self._write_json(
             HTTPStatus.OK,
@@ -1573,7 +1891,9 @@ class Handler(BaseHTTPRequestHandler):
             newline=newline,
         )
 
-    def _replay_events(self, ledger: EventLedger, query: str) -> None:
+    def _replay_events(
+        self, ledger: EventLedger, query: str, principal: dict[str, str]
+    ) -> None:
         try:
             params = _replay_params_from_query(query)
         except EventValidationError as exc:
@@ -1582,6 +1902,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=True
+        ):
             return
         # Read-only: the replay is a single locked snapshot of the ledger.
         events = ledger.list_for_organization_as_of(
@@ -1593,7 +1917,9 @@ class Handler(BaseHTTPRequestHandler):
             newline=True,
         )
 
-    def _compare_replays(self, ledger: EventLedger, query: str) -> None:
+    def _compare_replays(
+        self, ledger: EventLedger, query: str, principal: dict[str, str]
+    ) -> None:
         try:
             params = _replay_compare_params_from_query(query)
         except EventValidationError as exc:
@@ -1602,6 +1928,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=True
+        ):
             return
         # Read-only: both replays read the same current ledger and nothing
         # is written back, so identical requests return identical bytes.
@@ -1627,7 +1957,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _aggregate_events(
-        self, ledger: EventLedger, query: str, *, newline: bool = False
+        self,
+        ledger: EventLedger,
+        query: str,
+        principal: dict[str, str],
+        *,
+        newline: bool = False,
     ) -> None:
         try:
             params = _aggregate_params_from_query(query)
@@ -1637,6 +1972,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=newline,
             )
+            return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=newline
+        ):
             return
 
         window_size = params["windowSize"]
@@ -1662,7 +2001,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _list_events_by_region(
-        self, ledger: EventLedger, query: str
+        self, ledger: EventLedger, query: str, principal: dict[str, str]
     ) -> None:
         try:
             params = _region_list_params_from_query(query)
@@ -1672,6 +2011,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=True
+        ):
             return
         events = ledger.list_for_organization_region(
             params["organizationId"], params["region"]
@@ -1687,7 +2030,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _aggregate_events_by_region(
-        self, ledger: EventLedger, query: str
+        self, ledger: EventLedger, query: str, principal: dict[str, str]
     ) -> None:
         try:
             params = _region_aggregate_params_from_query(query)
@@ -1697,6 +2040,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=True
+        ):
             return
 
         window_size = params["windowSize"]
@@ -1726,7 +2073,7 @@ class Handler(BaseHTTPRequestHandler):
     # --------------------------------------------------------------- decisions
 
     def _evaluate_decision(
-        self, ledger: EventLedger, *, newline: bool = False
+        self, ledger: EventLedger, principal: dict[str, str], *, newline: bool = False
     ) -> None:
         data = self._json_request_body(newline=newline)
         if data is _BODY_ERROR:
@@ -1741,6 +2088,10 @@ class Handler(BaseHTTPRequestHandler):
                 newline=newline,
             )
             return
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=newline
+        ):
+            return
 
         # Read-only: the ledger is never mutated by a decision request, and
         # the snapshot is taken in a single locked copy for consistency.
@@ -1750,7 +2101,7 @@ class Handler(BaseHTTPRequestHandler):
         result = evaluate_decision(occurred, params)
         self._write_json(HTTPStatus.OK, result, newline=newline)
 
-    def _allocate_decision(self) -> None:
+    def _allocate_decision(self, principal: dict[str, str]) -> None:
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1763,6 +2114,8 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
             )
             return
+        if not self._organization_allowed(principal, params["organizationId"]):
+            return
 
         # Read-only and stateless: the plan is computed from the request body
         # alone, so identical submissions and concurrent requests never
@@ -1772,7 +2125,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ alerts
 
-    def _evaluate_alert(self) -> None:
+    def _evaluate_alert(self, principal: dict[str, str]) -> None:
         data = self._json_request_body(newline=True)
         if data is _BODY_ERROR:
             return
@@ -1785,6 +2138,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        # A cross-organization evaluation is forbidden whether or not it
+        # would have written an alert; nothing is recorded on failure.
+        if not self._organization_allowed(
+            principal, params["organizationId"], newline=True
+        ):
             return
 
         # The ledger is never mutated by an alert request; the peak is read
@@ -1829,7 +2188,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         self._write_json(HTTPStatus.OK, result, newline=True)
 
-    def _list_alerts(self, query: str) -> None:
+    def _list_alerts(self, query: str, principal: dict[str, str]) -> None:
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -1838,6 +2197,8 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._organization_allowed(principal, organization_id, newline=True):
             return
         alerts = self.server.alerts.list_for_organization(  # type: ignore[attr-defined]
             organization_id
@@ -1863,6 +2224,7 @@ class Handler(BaseHTTPRequestHandler):
     def _create_reservation(
         self,
         reservations: ReservationInventory,
+        principal: dict[str, str],
         *,
         newline: bool = False,
     ) -> None:
@@ -1880,8 +2242,15 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, view = reservations.reserve(reservation)
-        if status == "created":
+        # The organization check, the balance check, and the deduction all
+        # commit under the inventory's own lock, so a forbidden write never
+        # changes the inventory.
+        status, view = reservations.reserve(
+            reservation, organization_id=principal["organizationId"]
+        )
+        if status == "forbidden":
+            self._forbidden(newline=newline)
+        elif status == "created":
             self._write_json(HTTPStatus.CREATED, view, newline=newline)
         elif status == "exists":
             self._write_json(HTTPStatus.OK, view, newline=newline)
@@ -1892,6 +2261,7 @@ class Handler(BaseHTTPRequestHandler):
         self,
         reservations: ReservationInventory,
         query: str,
+        principal: dict[str, str],
         *,
         newline: bool = False,
     ) -> None:
@@ -1903,6 +2273,8 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=newline,
             )
+            return
+        if not self._organization_allowed(principal, organization_id, newline=newline):
             return
         views = reservations.list_for_organization(organization_id)
         self._write_json(
@@ -1962,6 +2334,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), Handler)
+    server.tokens = TokenStore()  # type: ignore[attr-defined]
     server.ledger = EventLedger()  # type: ignore[attr-defined]
     server.reservations = ReservationInventory()  # type: ignore[attr-defined]
     server.snapshots = SnapshotStore()  # type: ignore[attr-defined]

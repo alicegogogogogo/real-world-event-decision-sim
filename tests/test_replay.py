@@ -5,9 +5,14 @@ import threading
 import unittest
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
 from event_sim.server import create_server
+
+# Sentinel for the request helpers: pick a registered token matching the
+# request's organization (defaulting to org-1) instead of an explicit one.
+_AUTO_TOKEN = object()
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -28,21 +33,71 @@ class ReplayEndpointsTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self._tokens: dict[tuple[str, str], str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
 
+    def register_token(self, organization_id: str = "org-1", role: str = "write") -> str:
+        key = (organization_id, role)
+        token = self._tokens.get(key)
+        if token is None:
+            token = "test-token-" + quote(f"{organization_id}-{role}", safe="")
+            status, _, _ = self.request_raw(
+                "/auth/tokens",
+                method="POST",
+                body=json.dumps(
+                    {
+                        "token": token,
+                        "organizationId": organization_id,
+                        "role": role,
+                    }
+                ).encode(),
+                token=None,
+            )
+            self.assertEqual(status, 201)
+            self._tokens[key] = token
+        return token
+
+    def _auto_token(self, path: str, body: bytes | None) -> str:
+        organization_id = None
+        if body is not None:
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and isinstance(
+                payload.get("organizationId"), str
+            ):
+                organization_id = payload["organizationId"]
+        if organization_id is None or not organization_id.strip():
+            values = parse_qs(urlsplit(path).query).get("organizationId")
+            if values and len(values) == 1 and values[0].strip():
+                organization_id = values[0]
+            else:
+                organization_id = "org-1"
+        return self.register_token(organization_id)
+
     def request_raw(
-        self, path: str, *, method: str = "GET", body: bytes | None = None
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        body: bytes | None = None,
+        token: Any = _AUTO_TOKEN,
     ) -> tuple[int, bytes, Any]:
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        if token is _AUTO_TOKEN:
+            token = self._auto_token(path, body)
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
         request = Request(
             f"{self.base_url}{path}", data=body, headers=headers, method=method
         )
         try:
-            with urlopen(request, timeout=5) as response:
+            with urlopen(request, timeout=30) as response:
                 raw = response.read()
                 return response.status, raw, json.loads(raw)
         except HTTPError as error:
@@ -198,9 +253,26 @@ class ReplayEndpointsTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
+            # A fresh process has no registered tokens; register one first.
+            credential = json.dumps(
+                {"token": "fresh-token", "organizationId": "org-1", "role": "write"}
+            ).encode()
             with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}"
-                "/events/replay?organizationId=org-1&asOf=100",
+                Request(
+                    f"http://127.0.0.1:{fresh.server_port}/auth/tokens",
+                    data=credential,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=2,
+            ) as response:
+                self.assertEqual(response.status, 201)
+            with urlopen(
+                Request(
+                    f"http://127.0.0.1:{fresh.server_port}"
+                    "/events/replay?organizationId=org-1&asOf=100",
+                    headers={"Authorization": "Bearer fresh-token"},
+                ),
                 timeout=2,
             ) as response:
                 self.assertEqual(response.status, 200)
