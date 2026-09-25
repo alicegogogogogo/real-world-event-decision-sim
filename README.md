@@ -86,7 +86,8 @@ data is forbidden.
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`, `POST /snapshots/compare`,
   `POST /snapshots/compare/events`,
-  `POST /snapshots/compare/reservations`, and the other
+  `POST /snapshots/compare/reservations`,
+  `POST /snapshots/compare/resources`, and the other
   read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
@@ -1145,3 +1146,87 @@ curl -X POST http://127.0.0.1:8000/snapshots/compare/reservations \
 Every non-`200` result is read-only as well: a failed comparison creates no
 snapshot and changes no event, reservation, alert, or main-service state.
 
+### `POST /snapshots/compare/resources`
+
+A read-only, resource-capacity comparison of two existing snapshots. The
+other snapshot comparisons align events or reservations; this entry point
+aligns the capacities and reservation balances the two snapshots captured at
+their own creation times, by `resourceId`, and reports one balance row per
+resource plus the deterministic difference summary. Nothing in either
+snapshot, in any branch, or in the main service is read for mutation or
+written — snapshots are immutable, alert state is untouched, and identical
+submissions return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. Requires `Content-Type: application/json` and a
+Bearer credential bound to the request's `organizationId`. The body must be
+a JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both snapshots must belong to it |
+| `left`           | required, non-empty snapshot name (the left-hand side)      |
+| `right`          | required, non-empty snapshot name (the right-hand side)     |
+
+Using the same snapshot name for `left` and `right` is legal; the two sides
+are then the same capture and every row is equal.
+
+A snapshot captures a resource's `capacity` (fixed by the first reservation
+that names it) and its reservations; `occupied` is the total captured
+quantity reserved against it and `remaining` is `capacity - occupied`. A
+resource missing from one side is treated as not existing there, so that
+side's `capacity`, `occupied`, and `remaining` all read as zero. Resources
+are aligned by `resourceId`:
+
+- `resources` — one row per resource in the union of the two sides, sorted
+  by `resourceId` in Unicode code-point order. Each row is
+  `{"resourceId", "left", "right", "equal"}`, where `left`/`right` each
+  carry `capacity`, `occupied`, and `remaining`, and `equal` is true exactly
+  when all three pairs agree (a resource absent on one side gets zeros, so
+  an only-one-side resource is unequal).
+- `leftOnly` — identifiers that appear only in the left snapshot.
+- `rightOnly` — identifiers that appear only in the right snapshot.
+- `same` — identifiers present on both sides whose `capacity`, `occupied`,
+  and `remaining` all match.
+- `diff` — identifiers present on both sides that disagree in at least one
+  of those three balances. Each entry is `{"resourceId", "fields"}`, where
+  `fields` names the mismatched fields, drawn only from `capacity`,
+  `occupied`, and `remaining`.
+
+Identifiers and field names are sorted in Unicode code-point order. Each
+group array is accompanied by a count key named after the group plus
+`Count` (`leftOnlyCount`, `rightOnlyCount`, `sameCount`, `diffCount`). When
+neither snapshot holds any resource, the `resources` array and all four
+groups are empty and all counts are `0`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+values kept as integers, booleans kept as booleans, and one trailing
+newline:
+
+```json
+{"diff":[{"fields":["occupied","remaining"],"resourceId":"pool"}],"diffCount":1,"leftOnly":[],"leftOnlyCount":0,"resources":[{"equal":false,"left":{"capacity":0,"occupied":0,"remaining":0},"resourceId":"only-r","right":{"capacity":7,"occupied":4,"remaining":3}},{"equal":false,"left":{"capacity":10,"occupied":3,"remaining":7},"resourceId":"pool","right":{"capacity":10,"occupied":5,"remaining":5}},{"equal":true,"left":{"capacity":5,"occupied":1,"remaining":4},"resourceId":"shared","right":{"capacity":5,"occupied":1,"remaining":4}}],"rightOnly":["only-r"],"rightOnlyCount":1,"same":["shared"],"sameCount":1}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/snapshots/compare/resources \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"snap-a","right":"snap-b"}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named snapshots belongs to another
+  organization. The organization decision happens before snapshot names are
+  inspected, and snapshots are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — either `left` or
+  `right` has never existed as a snapshot. Both participating snapshots
+  must already exist; a comparison never implicitly creates a snapshot.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, or a blank or non-string
+  `organizationId`/`left`/`right`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+snapshot and changes no event, reservation, alert, or main-service state.
