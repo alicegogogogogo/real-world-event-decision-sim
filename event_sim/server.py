@@ -76,6 +76,12 @@ SNAPSHOT_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
+SNAPSHOT_RESOURCE_COMPARE_FIELDS = ("organizationId", "left", "right")
+
+# Resource balances align by resourceId; only these three balances
+# participate in the same/diff decision for an identifier present on a side.
+RESOURCE_COMPARE_FIELDS = ("capacity", "occupied", "remaining")
+
 # Reservations align by reservationId; only these four fields participate in
 # the same/diff decision for an identifier present on both sides.
 RESERVATION_COMPARE_FIELDS = (
@@ -557,6 +563,30 @@ class Snapshot:
             reservation_id: dict(record)
             for reservation_id, record in self._reservations.items()
         }
+
+    def resource_balances(self) -> dict[str, dict[str, int]]:
+        """Return a deep copy of the captured per-resource balances.
+
+        Each resource with a recorded capacity maps to its ``capacity``,
+        ``occupied`` (the total captured quantity reserved against it) and
+        ``remaining`` (``capacity - occupied``). A snapshot holds only its
+        owning organization's resources, so the copy needs no further
+        organization filtering; it is immutable after capture, so the copy
+        keeps a read-only comparison from sharing mutable snapshot state.
+        """
+        balances: dict[str, dict[str, int]] = {}
+        for resource_id, capacity in self._capacities.items():
+            occupied = sum(
+                record["quantity"]
+                for record in self._reservations.values()
+                if record["resourceId"] == resource_id
+            )
+            balances[resource_id] = {
+                "capacity": capacity,
+                "occupied": occupied,
+                "remaining": capacity - occupied,
+            }
+        return balances
 
 
 class SnapshotStore:
@@ -1653,6 +1683,37 @@ def validate_snapshot_reservation_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS}
 
 
+def validate_snapshot_resource_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /snapshots/compare/resources.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are snapshot names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "snapshot resource comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(SNAPSHOT_RESOURCE_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in SNAPSHOT_RESOURCE_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in SNAPSHOT_RESOURCE_COMPARE_FIELDS}
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1995,6 +2056,74 @@ def compare_snapshot_reservations(
     return _compare_reservations(left_reservations, right_reservations)
 
 
+def compare_snapshot_resources(
+    left_balances: dict[str, dict[str, int]],
+    right_balances: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Compare two snapshots' resource balances aligned by resourceId.
+
+    Each mapping is a deep copy of one snapshot's captured per-resource
+    ``capacity``/``occupied``/``remaining`` balances (already scoped to one
+    organization at capture time), so the rows and four groups derive from
+    immutable copies and nothing is written. The union of the two sides'
+    resource ids produces one ``resources`` row each, sorted by resourceId in
+    Unicode code-point order; a resource missing on a side is treated as
+    absent and that side carries all three balances as zero. A row's
+    ``equal`` marker is true exactly when the two sides' three balances all
+    agree.
+
+    Identifiers only on the left land in ``leftOnly``, only on the right in
+    ``rightOnly``. An identifier on both sides counts toward ``same`` when
+    all three balances match and lands in ``diff`` otherwise, as
+    ``{"resourceId", "fields"}`` naming the mismatched balances, drawn only
+    from ``capacity``, ``occupied`` and ``remaining``. Identifiers and field
+    names are sorted in Unicode code-point order; each group also gets a
+    ``<group>Count`` key. When neither snapshot holds a resource, every group
+    (and the row array) is empty and every count is zero.
+    """
+    zero_balances = {"capacity": 0, "occupied": 0, "remaining": 0}
+
+    left_only = sorted(set(left_balances) - set(right_balances))
+    right_only = sorted(set(right_balances) - set(left_balances))
+    same: list[str] = []
+    diff: list[dict[str, Any]] = []
+    resources: list[dict[str, Any]] = []
+
+    for resource_id in sorted(set(left_balances) | set(right_balances)):
+        left = left_balances.get(resource_id, zero_balances)
+        right = right_balances.get(resource_id, zero_balances)
+        fields = sorted(
+            field
+            for field in RESOURCE_COMPARE_FIELDS
+            if left[field] != right[field]
+        )
+        resources.append(
+            {
+                "resourceId": resource_id,
+                "left": {field: left[field] for field in RESOURCE_COMPARE_FIELDS},
+                "right": {field: right[field] for field in RESOURCE_COMPARE_FIELDS},
+                "equal": not fields,
+            }
+        )
+        if resource_id in left_balances and resource_id in right_balances:
+            if fields:
+                diff.append({"resourceId": resource_id, "fields": fields})
+            else:
+                same.append(resource_id)
+
+    return {
+        "resources": resources,
+        "leftOnly": left_only,
+        "leftOnlyCount": len(left_only),
+        "rightOnly": right_only,
+        "rightOnlyCount": len(right_only),
+        "same": same,
+        "sameCount": len(same),
+        "diff": diff,
+        "diffCount": len(diff),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -2145,6 +2274,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/snapshots/compare/reservations":
             self._compare_snapshot_reservations()
+            return
+        if path == "/snapshots/compare/resources":
+            self._compare_snapshot_resources()
             return
 
         if path.startswith("/branches/"):
@@ -2773,6 +2905,69 @@ class Handler(BaseHTTPRequestHandler):
         result = compare_snapshot_reservations(
             left_reservations, right_reservations
         )
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_resources(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_resource_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the other snapshot comparisons: the organization decision happens
+        # before either snapshot name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; a comparison never implicitly
+        # creates one. The fixed left-then-right order makes the verdict
+        # deterministic: a missing left outranks any problem on the right,
+        # and a foreign snapshot is forbidden before the other name is even
+        # looked up.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's capacities and reservations were already scoped to the
+        # owning organization at capture time; the balances are recomputed
+        # from deep copies, so a comparison never shares mutable snapshot
+        # state and nothing is written, making identical submissions
+        # byte-identical JSON.
+        left_balances = left_snapshot.resource_balances()
+        right_balances = right_snapshot.resource_balances()
+        result = compare_snapshot_resources(left_balances, right_balances)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
