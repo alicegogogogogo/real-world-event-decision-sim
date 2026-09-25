@@ -94,7 +94,10 @@ Snapshots and branches belong to the organization that created them: a
 snapshot captures only that organization's events, resource capacities, and
 reservations; a branch forks only a snapshot owned by the same organization;
 and branch entry points authenticate with the same rules as the main service.
-Cross-organization access to a snapshot or branch is `403`.
+Cross-organization access to a snapshot or branch is `403`. Snapshot and
+branch names are unique across the whole service: reusing a taken name
+conflicts (`409`) no matter which organization owns it, while only a name
+that has never existed yields `404`.
 
 ## Event ledger
 
@@ -513,17 +516,47 @@ duplicated parameter yields `422`.
 
 ## Snapshots and branches
 
-Snapshots capture the current main service state — every event, every
-recorded resource capacity, and every reservation — under a unique name so
-that decisions can later be recomputed against that exact state. Branches fork
-a snapshot into an isolated copy that supports the existing event, aggregate,
-decision, and reservation entry points without sharing any mutable state with
-the main service or with other branches. Snapshots and branches capture only
-events, resource capacities, and reservations — alerts are never captured, and
-the alert entry points remain main-only with no branch-prefixed sub-paths.
-Like everything else here, snapshots and branches live only in the server
-process and are cleared on restart; there is no persistence, authorization, or
-replay across restarts.
+A snapshot captures the creator organization's main-service state — that
+organization's events, resource capacities, and reservations — under a
+service-wide unique name so that decisions can later be recomputed against
+that exact state. Other organizations' data never enters a snapshot, and the
+`events`, `resources`, and `reservations` counts in every snapshot or branch
+summary count only the owning organization's records; two snapshots created
+against the same state report identical counts. Branches fork a snapshot into
+an isolated copy holding only that organization's slice of the state, and
+support the existing event, aggregate, decision, and reservation entry points
+without sharing any mutable state with the main service or with other
+branches. Snapshots and branches capture only events, resource capacities,
+and reservations — alerts are never captured, and the alert entry points
+remain main-only with no branch-prefixed sub-paths. Like everything else
+here, snapshots and branches live only in the server process and are cleared
+on restart; there is no persistence, authorization, or replay across
+restarts.
+
+Snapshot and branch names are unique across the whole service and belong to
+the organization that created them:
+
+- Reusing a taken snapshot name fails with `409` (`snapshot_conflict`) no
+  matter which organization owns the name, and the original snapshot is
+  never replaced; reusing a taken branch name fails with `409`
+  (`branch_conflict`) and the existing branch is unaffected.
+- Forking another organization's snapshot or reading another organization's
+  branch fails with `403` (`forbidden`) and returns no snapshot or branch
+  content. Only a name that has never been used yields `404`
+  (`snapshot_not_found` or `branch_not_found`), and a `404` never implicitly
+  creates anything.
+- Branch creation checks the snapshot's ownership before the branch-name
+  conflict, so another organization's snapshot name always yields `403`.
+- The snapshot listing and branch summaries are visible only within the
+  owning organization.
+- Inside a branch, event and reservation identifiers are compared only
+  against the organization's own captured records: another organization's
+  event ids, reservation ids, and resource capacity records never cause
+  conflicts in the branch and never affect branch balances.
+- The authorization decision and the write commit under one lock for alert
+  evaluation, snapshot creation, and branch creation alike: a rejected
+  request leaves no alert, snapshot, or branch behind, and concurrent
+  creation of the same name lets exactly one request succeed.
 
 ### `POST /snapshots`
 
@@ -540,10 +573,14 @@ A successful response is `201` with compact integer JSON:
 {"events":2,"reservations":1,"resources":1,"snapshotId":"snap-1"}
 ```
 
-- `events`, `resources`, and `reservations` count the captured events,
-  distinct resources with a recorded capacity, and reservations.
+- `events`, `resources`, and `reservations` count only the creator
+  organization's captured events, distinct resources with a recorded
+  capacity, and reservations; other organizations' data is never captured
+  or counted. Snapshots created against the same state report identical
+  counts.
 - `409 Conflict` (`{"error": "snapshot_conflict"}`) — the name already
-  exists; the original snapshot content is never replaced or mutated.
+  exists, regardless of which organization created it; the original
+  snapshot content is never replaced or mutated.
 - `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
 - `400 Bad Request` — body is not syntactically valid JSON.
 - `422 Unprocessable Entity` — a non-object body, a missing or extra field,
@@ -554,8 +591,10 @@ A successful response is `201` with compact integer JSON:
 ### `GET /snapshots`
 
 Returns `200` with `{"snapshots": [...]}`, where each entry has the same
-shape as a creation response. Entries are sorted by `snapshotId` in Unicode
-code-point order. With no snapshots the collection is an empty array.
+shape as a creation response. Only the requesting organization's snapshots
+are listed; other organizations' snapshots are never visible. Entries are
+sorted by `snapshotId` in Unicode code-point order. With no snapshots the
+collection is an empty array.
 
 ### `POST /branches`
 
@@ -568,7 +607,8 @@ containing exactly these fields:
 | `snapshotId` | non-empty string         |
 
 The new branch receives independent copies of the snapshot's events,
-resource capacities, and reservation balances.
+resource capacities, and reservation balances — all of which belong only to
+the snapshot's owning organization.
 
 - `201 Created` — the branch summary is returned:
 
@@ -576,10 +616,14 @@ resource capacities, and reservation balances.
 {"branchId":"br-1","events":2,"reservations":1,"resources":1,"snapshotId":"snap-1"}
 ```
 
+- `403 Forbidden` (`{"error": "forbidden"}`) — the snapshot belongs to
+  another organization. Ownership is checked before the branch-name
+  conflict, no snapshot content is returned, and no branch is created.
 - `404 Not Found` (`{"error": "snapshot_not_found"}`) — no snapshot has that
   name; no branch is created.
 - `409 Conflict` (`{"error": "branch_conflict"}`) — a branch with that
-  `branchId` already exists.
+  `branchId` already exists, regardless of which organization created it;
+  the existing branch is unaffected.
 - `415`, `400`, and `422` follow the same rules as other JSON write
   endpoints; `422` (`validation_error`) covers missing, extra, blank, or
   non-string fields.
@@ -587,7 +631,8 @@ resource capacities, and reservation balances.
 ### `GET /branches/{branchId}`
 
 Returns `200` with the branch summary (see above). An unknown branch returns
-`404` with `{"error": "branch_not_found"}`.
+`404` with `{"error": "branch_not_found"}`. Another organization's branch
+returns `403` (`{"error": "forbidden"}`) with no summary content.
 
 ### Branch-prefixed entry points
 
@@ -606,6 +651,11 @@ validation, ordering, and window semantics:
 
 - Branch event commits honor `415`, `400`, `422`, identical-replay (`200`),
   and `event_id_conflict` (`409`); writes stay in the branch.
+- Identifier and capacity checks inside a branch are judged only against
+  the organization's own captured records: another organization's event
+  ids, reservation ids, and resource capacity records never cause
+  `event_id_conflict`, `reservation_conflict`, or `capacity_conflict` in
+  the branch and never move its balances.
 - Branch reservation commits honor `415`, `400`, `422`, and the replay and
   capacity rules: identical replays return `200` without double counting,
   while `reservation_conflict`, `capacity_conflict`, and
