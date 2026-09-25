@@ -83,7 +83,8 @@ data is forbidden.
   entry points: the event list, aggregate, region, and replay (including
   replay comparison) queries, the reservation/alert listings,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
-  `POST /branches/compare`, `POST /branches/compare/events`, and the other
+  `POST /branches/compare`, `POST /branches/compare/events`,
+  `POST /branches/compare/reservations`, and the other
   read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
@@ -815,6 +816,80 @@ values kept as integers, and one trailing newline:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/branches/compare/events \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"br-a","right":"br-b"}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named branches belongs to another
+  organization. The organization decision happens before branch names are
+  inspected, and branches are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "branch_not_found"}`) — either `left` or
+  `right` has never existed as a branch. Both participating branches must
+  already exist; a comparison never implicitly creates a branch.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, or a blank or non-string
+  `organizationId`/`left`/`right`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+branch and changes no event, reservation, alert, or main-service state.
+
+### `POST /branches/compare/reservations`
+
+A read-only, reservation-level comparison of two existing branches. Where
+`POST /branches/compare/events` aligns events by `eventId`, this entry point
+aligns the two branches' reservations by `reservationId` and reports the
+deterministic difference summary. Nothing in either branch, in any other
+branch, or in the main service is read for mutation or written, alert state
+is untouched, and identical submissions return byte-for-byte identical JSON.
+Both `read` and `write` credentials may call it. Requires
+`Content-Type: application/json` and a Bearer credential bound to the
+request's `organizationId`. The body must be a JSON object containing
+exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both branches must belong to it |
+| `left`           | required, non-empty branch name (the left-hand side)         |
+| `right`          | required, non-empty branch name (the right-hand side)        |
+
+Using the same branch name for `left` and `right` is legal; the two sides
+are then equal by construction and every shared reservation lands in
+`same`.
+
+Reservations are aligned by `reservationId`:
+
+- `leftOnly` — identifiers that appear only in the left branch.
+- `rightOnly` — identifiers that appear only in the right branch.
+- `same` — identifiers on both sides whose `organizationId`, `resourceId`,
+  `quantity`, and `capacity` all match.
+- `diff` — identifiers on both sides that disagree in at least one of those
+  four fields. Each entry is `{"reservationId", "fields"}`, where `fields`
+  names the mismatched fields, drawn only from `organizationId`,
+  `resourceId`, `quantity`, and `capacity`; no other content participates
+  in the comparison.
+
+Identifiers and field names are sorted in Unicode code-point order. Each
+group array is accompanied by a count key named after the group plus
+`Count` (`leftOnlyCount`, `rightOnlyCount`, `sameCount`, `diffCount`). When
+neither branch holds any reservation for the organization, all four groups
+are empty arrays and all four counts are `0`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"diff":[{"fields":["capacity","quantity"],"reservationId":"res-2"}],"diffCount":1,"leftOnly":["res-1"],"leftOnlyCount":1,"rightOnly":["res-4"],"rightOnlyCount":1,"same":["res-3"],"sameCount":1}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/branches/compare/reservations \
   -H 'Authorization: Bearer tok-1' \
   -H 'Content-Type: application/json' \
   -d '{"organizationId":"org-1","left":"br-a","right":"br-b"}'
