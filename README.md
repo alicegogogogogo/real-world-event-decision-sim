@@ -82,8 +82,8 @@ data is forbidden.
 - A `read` token may call only the state-free query and decision-computation
   entry points: the event list, aggregate, region, and replay (including
   replay comparison) queries, the reservation/alert listings,
-  `POST /decisions/evaluate`, `POST /decisions/allocate`, and the
-  read-only branch entry points.
+  `POST /decisions/evaluate`, `POST /decisions/allocate`,
+  `POST /branches/compare`, and the other read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
   `read` token against a write entry point receives `403`. The authorization
@@ -687,4 +687,83 @@ validation, ordering, and window semantics:
 - The region queries (`/events/region` and `/events/region/aggregate`) are
   main-only; no branch-prefixed region paths are added.
 - `/decisions/allocate` remains a main-only, stateless endpoint.
+
+### `POST /branches/compare`
+
+A read-only comparison of two existing branches' window counts and peak
+decisions. Each side recomputes its window counts and peak from that
+branch's own events only; nothing in either branch, in any other branch, or
+in the main service is read for mutation or written, and identical
+submissions return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. Requires `Content-Type: application/json` and a
+Bearer credential bound to the request's `organizationId`. The body must be
+a JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both branches must belong to it |
+| `left`           | required, non-empty branch name (the left-hand side)         |
+| `right`          | required, non-empty branch name (the right-hand side)        |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+Using the same branch name for `left` and `right` is legal; the two sides
+are then equal by construction. Window division matches the aggregate and
+decision entry points exactly: windows start at `0` and cover
+`[start, start + windowSize)`, and an event counts toward the window of
+`floor(occurredAt / windowSize) * windowSize`.
+
+- Without `from`/`to`, the `windows` rows cover the **union** of the windows
+  hit by matching events on either side, aligned row-by-row by `start`
+  ascending. A window hit by only one side shows the other side's count as
+  `0`. When neither side has a matching event, `windows` is `[]`.
+- With `from`/`to`, only events in the closed interval
+  `from <= occurredAt <= to` count, and **every** window intersecting that
+  interval gets a row, including windows empty on both sides.
+- Each row is `{"start", "leftCount", "rightCount", "equal"}`, with
+  `equal` true exactly when the two counts agree.
+- `decision.left` and `decision.right` each carry `peakStart`,
+  `peakCount`, and `action`: the peak is the largest window count, ties
+  resolve to the earliest window start, and `action` is `"escalate"` when
+  the peak reaches `threshold` and `"observe"` otherwise. `decision.equal`
+  is true exactly when the two sides' peak results agree. An empty side has
+  `peakStart: null`, `peakCount: 0`, and `action: "observe"`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+values kept as integers, booleans kept as booleans, and one trailing
+newline:
+
+```json
+{"decision":{"equal":false,"left":{"action":"observe","peakCount":2,"peakStart":0},"right":{"action":"escalate","peakCount":3,"peakStart":60}},"from":null,"left":"br-a","organizationId":"org-1","right":"br-b","threshold":3,"to":null,"type":"incident.created","windowSize":60,"windows":[{"equal":false,"leftCount":2,"rightCount":1,"start":0},{"equal":false,"leftCount":0,"rightCount":3,"start":60}]}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/branches/compare \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"br-a","right":"br-b","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named branches belongs to another
+  organization. The organization decision happens before branch names are
+  inspected, and branches are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "branch_not_found"}`) — either `left` or
+  `right` has never existed as a branch. Both participating branches must
+  already exist; a comparison never implicitly creates a branch.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, a blank or non-string `organizationId`/`left`/
+  `right`/`type`, non-positive-integer `windowSize`/`threshold`, unpaired or
+  non-integer `from`/`to`, or `from > to`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+branch and changes no event, reservation, or decision state.
 

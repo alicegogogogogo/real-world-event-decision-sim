@@ -42,6 +42,19 @@ RESERVATION_FIELDS = (
 TOKEN_FIELDS = ("token", "organizationId", "role")
 ROLES = ("read", "write")
 
+BRANCH_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "type",
+    "windowSize",
+    "threshold",
+)
+BRANCH_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+BRANCH_COMPARE_FIELDS = (
+    BRANCH_COMPARE_REQUIRED_FIELDS + BRANCH_COMPARE_OPTIONAL_FIELDS
+)
+
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
 _BODY_ERROR = object()
@@ -93,6 +106,17 @@ class TokenRegistry:
     def lookup(self, token: str) -> Subject | None:
         with self._lock:
             return self._tokens.get(token)
+
+    def run_locked(self, commit: Callable[[], Any]) -> Any:
+        """Run ``commit`` holding the registry lock.
+
+        Snapshot and branch creation make their single role decision earlier
+        (from the request-scoped subject) and then run the capture/fork
+        sequence here, so it stays indivisible from every other
+        registry-guarded write without re-reading a credential.
+        """
+        with self._lock:
+            return commit()
 
     def commit_write(
         self,
@@ -1335,6 +1359,69 @@ def validate_branch_request(data: Any) -> tuple[str, str]:
     return data["branchId"], data["snapshotId"]
 
 
+def validate_branch_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /branches/compare.
+
+    Required fields: organizationId, left, right, type, windowSize,
+    threshold. Optional fields: from and to, which must appear together. No
+    other fields are allowed. ``left`` and ``right`` are branch names; the
+    same name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("branch comparison body must be a JSON object")
+
+    keys = set(data)
+    required = set(BRANCH_COMPARE_REQUIRED_FIELDS)
+    allowed = set(BRANCH_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1412,6 +1499,111 @@ def _windows_from_occurred(
         {"start": start, "end": start + window_size, "count": counts.get(start, 0)}
         for start in starts
     ]
+
+
+def _branch_window_counts(
+    occurred: list[int], params: dict[str, Any]
+) -> dict[int, int]:
+    """Count one side's matching events per window start, with range filter.
+
+    Shares the window division and closed-interval filtering used by the
+    aggregate and decision entry points.
+    """
+    window_size = params["windowSize"]
+    from_value = params["from"]
+    to_value = params["to"]
+    counts: dict[int, int] = {}
+    for timestamp in occurred:
+        if from_value is not None and not (from_value <= timestamp <= to_value):
+            continue
+        start = (timestamp // window_size) * window_size
+        counts[start] = counts.get(start, 0) + 1
+    return counts
+
+
+def _branch_window_starts(params: dict[str, Any]) -> list[int]:
+    """Window starts a comparison must align, using the aggregate contract.
+
+    Without a range there is no fixed grid; the caller unions the two sides'
+    hit windows. With a range every window intersecting the closed interval
+    is present, so both sides share the same start list.
+    """
+    if params["from"] is None:
+        return []
+    window_size = params["windowSize"]
+    first = (params["from"] // window_size) * window_size
+    last = (params["to"] // window_size) * window_size
+    return list(range(first, last + 1, window_size))
+
+
+def compare_branches(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two branches' window counts and peaks from timestamp snapshots.
+
+    Each ``occurred`` list is a single locked snapshot of one branch's
+    matching events, so the window rows and the peak for a side derive from
+    the same read; nothing is written. Without a range, rows cover the union
+    of the two sides' hit windows; with a range, rows cover every window
+    intersecting ``[from, to]``, empty windows kept. Rows align by start
+    ascending and carry each side's count plus an ``equal`` marker. The
+    ``decision`` block holds each side's peak and action and a marker saying
+    whether the two peak results agree.
+    """
+    left_counts = _branch_window_counts(left_occurred, params)
+    right_counts = _branch_window_counts(right_occurred, params)
+
+    range_starts = _branch_window_starts(params)
+    if range_starts:
+        starts = range_starts
+    else:
+        starts = sorted(set(left_counts) | set(right_counts))
+
+    windows = []
+    for start in starts:
+        left_count = left_counts.get(start, 0)
+        right_count = right_counts.get(start, 0)
+        windows.append(
+            {
+                "start": start,
+                "leftCount": left_count,
+                "rightCount": right_count,
+                "equal": left_count == right_count,
+            }
+        )
+
+    left_peak = evaluate_decision(left_occurred, params)
+    right_peak = evaluate_decision(right_occurred, params)
+    left_decision = {
+        "peakStart": left_peak["peakStart"],
+        "peakCount": left_peak["peakCount"],
+        "action": left_peak["action"],
+    }
+    right_decision = {
+        "peakStart": right_peak["peakStart"],
+        "peakCount": right_peak["peakCount"],
+        "action": right_peak["action"],
+    }
+    decision = {
+        "left": left_decision,
+        "right": right_decision,
+        "equal": left_decision == right_decision,
+    }
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "type": params["type"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "decision": decision,
+        "windows": windows,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1547,6 +1739,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/branches":
             self._create_branch()
             return
+        if path == "/branches/compare":
+            self._compare_branches()
+            return
 
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
@@ -1649,6 +1844,11 @@ class Handler(BaseHTTPRequestHandler):
         subject = self._require_subject(newline=False)
         if subject is None:
             return
+
+        # The single permission decision for this request: the write role is
+        # settled once, before the body is read (403 outranks 415/400/422).
+        # The token is never re-read afterward; the capture below only runs
+        # under the registry lock.
         if subject.role != "write":
             self._forbidden(newline=False)
             return
@@ -1667,9 +1867,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # The snapshot belongs to the creator's organization and captures only
-        # that organization's state. The role check, the capture, and the
-        # insert run under the registry lock, so a read-only credential can
-        # never slip a snapshot in and a rejected request stores nothing.
+        # that organization's state. The capture and the insert run under the
+        # registry lock, so concurrent requests serialize on a name and a
+        # rejected validation request stores nothing.
         def capture() -> tuple[str, Snapshot]:
             return self.server.snapshots.create(  # type: ignore[attr-defined]
                 snapshot_id,
@@ -1678,13 +1878,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.reservations,  # type: ignore[attr-defined]
             )
 
-        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
-            self.token, subject.organization_id, capture
+        create_status, snapshot = self.server.tokens.run_locked(  # type: ignore[attr-defined]
+            capture
         )
-        if status == "forbidden":
-            self._forbidden(newline=False)
-            return
-        create_status, snapshot = result
         if create_status == "created":
             self._write_json(
                 HTTPStatus.CREATED,
@@ -1720,6 +1916,10 @@ class Handler(BaseHTTPRequestHandler):
         subject = self._require_subject(newline=False)
         if subject is None:
             return
+        # The one permission decision for this request: a write credential is
+        # required, checked before the body is read. The token is never
+        # re-read afterward; snapshot ownership and the duplicate-name insert
+        # below run together under the registry lock.
         if subject.role != "write":
             self._forbidden(newline=False)
             return
@@ -1755,13 +1955,9 @@ class Handler(BaseHTTPRequestHandler):
                 branch_id, snapshot
             )
 
-        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
-            self.token, subject.organization_id, fork
+        create_status, branch = self.server.tokens.run_locked(  # type: ignore[attr-defined]
+            fork
         )
-        if status == "forbidden":
-            self._forbidden(newline=False)
-            return
-        create_status, branch = result
         if create_status == "forbidden":
             self._forbidden(newline=False)
             return
@@ -1796,6 +1992,67 @@ class Handler(BaseHTTPRequestHandler):
             {"error": "branch_not_found"},
             newline=True,
         )
+
+    def _compare_branches(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped. The organization decision
+        # happens before either branch name is inspected, so a foreign
+        # organization cannot probe which branch names exist.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; the fixed left-then-right order
+        # makes the verdict deterministic, and a missing name is reported as
+        # branch_not_found without ever creating a branch.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side reads its own ledger in one locked snapshot, then both
+        # sides are recomputed purely from those copies; nothing is written,
+        # so identical submissions return byte-identical JSON.
+        left_occurred = left_branch.ledger.occurred_at_values(
+            organization_id, params["type"]
+        )
+        right_occurred = right_branch.ledger.occurred_at_values(
+            organization_id, params["type"]
+        )
+        result = compare_branches(left_occurred, right_occurred, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
 
