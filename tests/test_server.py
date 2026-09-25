@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from event_sim.server import SERVICE_NAME, create_server
+from tests import _support
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -29,6 +30,7 @@ class ServerTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.token_cache: dict[str, str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -42,10 +44,17 @@ class ServerTest(unittest.TestCase):
         method: str = "GET",
         body: bytes | None = None,
         content_type: str | None = "application/json",
+        auth: bool = True,
     ) -> tuple[int, Any]:
         headers = {}
         if content_type is not None:
             headers["Content-Type"] = content_type
+        if auth:
+            headers.update(
+                _support.authorization_header(
+                    self.token_cache, self.base_url, path, body
+                )
+            )
         request = Request(
             f"{self.base_url}{path}",
             data=body,
@@ -163,10 +172,16 @@ class ServerTest(unittest.TestCase):
         event = make_event()
 
         def raw_post(payload: Any) -> tuple[int, bytes]:
+            body = json.dumps(payload).encode()
             request = Request(
                 f"{self.base_url}/events",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    **_support.authorization_header(
+                        self.token_cache, self.base_url, "/events", body
+                    ),
+                },
                 method="POST",
             )
             with urlopen(request, timeout=5) as response:
@@ -1143,10 +1158,13 @@ class ServerTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
-            with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}/events?organizationId=org-1",
-                timeout=2,
-            ) as response:
+            fresh_base = f"http://127.0.0.1:{fresh.server_port}"
+            token = _support.ensure_token({}, fresh_base, "org-1")
+            request = Request(
+                f"{fresh_base}/events?organizationId=org-1",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urlopen(request, timeout=2) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     json.load(response),
@@ -1199,7 +1217,12 @@ class ServerTest(unittest.TestCase):
         request = Request(
             f"{self.base_url}/reservations",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                **_support.authorization_header(
+                    self.token_cache, self.base_url, "/reservations", body
+                ),
+            },
             method="POST",
         )
         with urlopen(request, timeout=5) as response:
@@ -1494,10 +1517,13 @@ class ServerTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
-            with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}/reservations?organizationId=org-1",
-                timeout=2,
-            ) as response:
+            fresh_base = f"http://127.0.0.1:{fresh.server_port}"
+            token = _support.ensure_token({}, fresh_base, "org-1")
+            request = Request(
+                f"{fresh_base}/reservations?organizationId=org-1",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urlopen(request, timeout=2) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     json.load(response),

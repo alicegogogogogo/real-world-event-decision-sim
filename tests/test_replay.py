@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from event_sim.server import create_server
+from tests import _support
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -28,6 +29,7 @@ class ReplayEndpointsTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.token_cache: dict[str, str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -37,7 +39,12 @@ class ReplayEndpointsTest(unittest.TestCase):
     def request_raw(
         self, path: str, *, method: str = "GET", body: bytes | None = None
     ) -> tuple[int, bytes, Any]:
-        headers = {"Content-Type": "application/json"} if body is not None else {}
+        headers: dict[str, str] = {"Content-Type": "application/json"} if body is not None else {}
+        headers.update(
+            _support.authorization_header(
+                self.token_cache, self.base_url, path, body
+            )
+        )
         request = Request(
             f"{self.base_url}{path}", data=body, headers=headers, method=method
         )
@@ -198,11 +205,14 @@ class ReplayEndpointsTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
-            with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}"
+            fresh_base = f"http://127.0.0.1:{fresh.server_port}"
+            token = _support.ensure_token({}, fresh_base, "org-1")
+            request = Request(
+                f"{fresh_base}"
                 "/events/replay?organizationId=org-1&asOf=100",
-                timeout=2,
-            ) as response:
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urlopen(request, timeout=2) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     json.load(response),

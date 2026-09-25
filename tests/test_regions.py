@@ -9,6 +9,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from event_sim.server import create_server
+from tests import _support
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -29,6 +30,7 @@ class RegionEndpointsTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.token_cache: dict[str, str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -38,7 +40,12 @@ class RegionEndpointsTest(unittest.TestCase):
     def request_raw(
         self, path: str, *, method: str = "GET", body: bytes | None = None
     ) -> tuple[int, bytes, Any]:
-        headers = {"Content-Type": "application/json"} if body is not None else {}
+        headers: dict[str, str] = {"Content-Type": "application/json"} if body is not None else {}
+        headers.update(
+            _support.authorization_header(
+                self.token_cache, self.base_url, path, body
+            )
+        )
         request = Request(
             f"{self.base_url}{path}", data=body, headers=headers, method=method
         )

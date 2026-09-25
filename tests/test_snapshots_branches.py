@@ -9,6 +9,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from event_sim.server import create_server
+from tests import _support
 
 
 def make_event(**overrides: Any) -> dict[str, Any]:
@@ -41,6 +42,7 @@ class SnapshotBranchTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.token_cache: dict[str, str] = {}
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -54,9 +56,14 @@ class SnapshotBranchTest(unittest.TestCase):
         method: str = "GET",
         body: bytes | None = None,
         content_type: str | None = "application/json",
+        auth: bool = True,
     ) -> tuple[int, Any]:
         status, _, parsed = self.request_raw(
-            path, method=method, body=body, content_type=content_type
+            path,
+            method=method,
+            body=body,
+            content_type=content_type,
+            auth=auth,
         )
         return status, parsed
 
@@ -67,10 +74,17 @@ class SnapshotBranchTest(unittest.TestCase):
         method: str = "GET",
         body: bytes | None = None,
         content_type: str | None = "application/json",
+        auth: bool = True,
     ) -> tuple[int, bytes, Any]:
         headers = {}
         if content_type is not None:
             headers["Content-Type"] = content_type
+        if auth:
+            headers.update(
+                _support.authorization_header(
+                    self.token_cache, self.base_url, path, body
+                )
+            )
         request = Request(
             f"{self.base_url}{path}",
             data=body,
@@ -874,15 +888,20 @@ class SnapshotBranchTest(unittest.TestCase):
         thread = threading.Thread(target=fresh.serve_forever, daemon=True)
         thread.start()
         try:
-            with urlopen(
-                f"http://127.0.0.1:{fresh.server_port}/snapshots", timeout=2
-            ) as response:
+            fresh_base = f"http://127.0.0.1:{fresh.server_port}"
+            token = _support.ensure_token({}, fresh_base, "org-1")
+            snap_request = Request(
+                f"{fresh_base}/snapshots",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urlopen(snap_request, timeout=2) as response:
                 self.assertEqual(json.load(response), {"snapshots": []})
+            branch_request = Request(
+                f"{fresh_base}/branches/br-1",
+                headers={"Authorization": f"Bearer {token}"},
+            )
             with self.assertRaises(HTTPError) as raised:
-                urlopen(
-                    f"http://127.0.0.1:{fresh.server_port}/branches/br-1",
-                    timeout=2,
-                )
+                urlopen(branch_request, timeout=2)
             self.assertEqual(raised.exception.code, 404)
             raised.exception.close()
         finally:

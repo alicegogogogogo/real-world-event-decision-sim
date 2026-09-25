@@ -28,6 +28,74 @@ python -m unittest discover -s tests -v
 - Unknown paths return a JSON `not_found` error with HTTP 404.
 - `python -m event_sim --help` documents the command-line entry point.
 
+## Credentials and organization isolation
+
+Every entry point except `GET /health` and the credential registration entry
+point requires a request-scoped Bearer credential. Credentials are held only
+in the server process: restarting (or starting a new instance) begins with an
+empty credential registry, and an unregistered token reaches nothing.
+
+### `POST /auth/tokens`
+
+The one entry point that requires no credential. Requires
+`Content-Type: application/json`. The body must be a JSON object with exactly
+these three fields, in any order:
+
+| Field            | Rule                                  |
+| ---------------- | ------------------------------------- |
+| `token`          | non-empty string                      |
+| `organizationId` | non-empty string                      |
+| `role`           | one of `read` or `write`              |
+
+- `201 Created` — new token registered. The body echoes the three fields as
+  compact JSON with keys sorted by code point and one trailing newline:
+  `{"organizationId":"org-1","role":"write","token":"tok-1"}\n`.
+- `200 OK` — the same token was resubmitted with the identical organization
+  and role; it is not registered a second time and the same body is echoed.
+- `409 Conflict` (`{"error": "auth_conflict"}`) — the token is already bound
+  to a different organization or role. The binding is never rewritten.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing/extra field, a blank or non-string `token`/`organizationId`, or a
+  `role` other than `read`/`write`. No record is stored.
+
+```bash
+curl -X POST http://127.0.0.1:8000/auth/tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"tok-1","organizationId":"org-1","role":"write"}'
+```
+
+### Bearer authentication
+
+All other requests carry the registered token in an
+`Authorization: Bearer <token>` header. A missing header, a non-Bearer
+scheme, a malformed bearer value, or an unregistered token yields
+`401 Unauthorized` with `{"error": "unauthorized"}`.
+
+A valid credential that acts outside its bound organization or role yields
+`403 Forbidden` with `{"error": "forbidden"}` and performs no write. The
+`organizationId` in any request parameter or body field must equal the
+token's registered organization; reading or writing another organization's
+data is forbidden.
+
+- A `read` token may call only the state-free query and decision-computation
+  entry points: the event list, aggregate, region, and replay (including
+  replay comparison) queries, the reservation/alert listings,
+  `POST /decisions/evaluate`, `POST /decisions/allocate`, and the
+  read-only branch entry points.
+- Committing an event or reservation, evaluating an alert, and creating a
+  snapshot or branch are writes; only a `write` token may call them. A
+  `read` token against a write entry point receives `403`. The authorization
+  decision and the ledger/inventory mutation complete under one lock, so a
+  rejected request never changes the ledger or inventory.
+
+Snapshots and branches belong to the organization that created them: a
+snapshot captures only that organization's events, resource capacities, and
+reservations; a branch forks only a snapshot owned by the same organization;
+and branch entry points authenticate with the same rules as the main service.
+Cross-organization access to a snapshot or branch is `403`.
+
 ## Event ledger
 
 Events are held only in the server process: restarting (or starting a new

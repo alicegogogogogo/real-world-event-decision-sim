@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
@@ -38,9 +39,85 @@ RESERVATION_FIELDS = (
     "capacity",
 )
 
+TOKEN_FIELDS = ("token", "organizationId", "role")
+ROLES = ("read", "write")
+
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
 _BODY_ERROR = object()
+
+
+class Subject(NamedTuple):
+    """The identity bound to a registered token: one organization and role."""
+
+    organization_id: str
+    role: str
+
+
+class TokenRegistry:
+    """In-process map of bearer tokens to an organization and a role.
+
+    Credentials live only for the lifetime of this instance: a restart
+    starts with an empty registry and no protected entry point accepts any
+    token. Registration is idempotent for an identical record; a token can
+    never be rebound to a different organization or role. The same lock that
+    guards the map also wraps the decide-and-commit sequence of a write
+    request, so the authorization decision and the ledger/inventory mutation
+    are indivisible.
+    """
+
+    def __init__(self) -> None:
+        self._tokens: dict[str, Subject] = {}
+        self._lock = threading.Lock()
+
+    def register(
+        self, token: str, organization_id: str, role: str
+    ) -> tuple[str, Subject]:
+        """Register a token or reconcile an identical resubmission.
+
+        Returns ``("created", subject)`` for a new token, ``("exists",
+        subject)`` for a resubmission carrying the same organization and
+        role, or ``("conflict", existing)`` when the token is already bound
+        to different credentials. Only ``"created"`` adds a record.
+        """
+        with self._lock:
+            existing = self._tokens.get(token)
+            if existing is None:
+                subject = Subject(organization_id, role)
+                self._tokens[token] = subject
+                return "created", subject
+            if existing.organization_id == organization_id and existing.role == role:
+                return "exists", existing
+            return "conflict", existing
+
+    def lookup(self, token: str) -> Subject | None:
+        with self._lock:
+            return self._tokens.get(token)
+
+    def commit_write(
+        self,
+        token: str,
+        organization_id: str,
+        commit: Callable[[], Any],
+    ) -> tuple[str, Any]:
+        """Authorize a write and run ``commit`` under one lock.
+
+        The token is re-checked against the registry, its organization must
+        match the request's organization, and its role must be ``write``;
+        only then does ``commit`` run, still holding the registry lock. The
+        status is ``"ok"`` with the commit result or ``"forbidden"`` (the
+        commit is never invoked). Reaching the store this way makes a
+        rejected request incapable of changing the ledger or inventory.
+        """
+        with self._lock:
+            subject = self._tokens.get(token)
+            if (
+                subject is None
+                or subject.organization_id != organization_id
+                or subject.role != "write"
+            ):
+                return "forbidden", None
+            return "ok", commit()
 
 
 class EventValidationError(ValueError):
@@ -188,6 +265,17 @@ class EventLedger:
                 event_id: dict(event) for event_id, event in self._events.items()
             }
 
+    def snapshot_for_organization(
+        self, organization_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return a deep, locked copy of one organization's stored events."""
+        with self._lock:
+            return {
+                event_id: dict(event)
+                for event_id, event in self._events.items()
+                if event["organizationId"] == organization_id
+            }
+
     def restore(self, state: dict[str, dict[str, Any]]) -> None:
         """Replace all stored events with a deep copy of ``state``."""
         with self._lock:
@@ -298,6 +386,27 @@ class ReservationInventory:
             }
         return capacities, reservations
 
+    def snapshot_for_organization(
+        self, organization_id: str
+    ) -> tuple[dict[str, int], dict[str, dict[str, Any]]]:
+        """Locked copies of capacities/reservations visible to one org.
+
+        Capacities are included only for resources the organization itself
+        reserves; reservations of other organizations are never captured.
+        """
+        with self._lock:
+            reservations = {
+                reservation_id: dict(record)
+                for reservation_id, record in self._reservations.items()
+                if record["organizationId"] == organization_id
+            }
+            capacities = {
+                resource_id: capacity
+                for resource_id, capacity in self._capacities.items()
+                if resource_id in {r["resourceId"] for r in reservations.values()}
+            }
+        return capacities, reservations
+
     def restore(
         self,
         capacities: dict[str, int],
@@ -321,11 +430,13 @@ class Snapshot:
     def __init__(
         self,
         snapshot_id: str,
+        organization_id: str,
         events: dict[str, dict[str, Any]],
         capacities: dict[str, int],
         reservations: dict[str, dict[str, Any]],
     ) -> None:
         self.snapshot_id = snapshot_id
+        self.organization_id = organization_id
         self._events = {
             event_id: dict(event) for event_id, event in events.items()
         }
@@ -366,10 +477,11 @@ class SnapshotStore:
     def create(
         self,
         snapshot_id: str,
+        organization_id: str,
         ledger: EventLedger,
         reservations: ReservationInventory,
     ) -> tuple[str, Snapshot]:
-        """Capture ``ledger`` and ``reservations`` under ``snapshot_id``.
+        """Capture one organization's state under ``snapshot_id``.
 
         Returns ``("created", snapshot)`` or ``("conflict", snapshot)`` when
         the name already exists; an existing snapshot is never replaced.
@@ -380,8 +492,9 @@ class SnapshotStore:
                 return "conflict", existing
             snapshot = Snapshot(
                 snapshot_id,
-                ledger.snapshot(),
-                *reservations.snapshot(),
+                organization_id,
+                ledger.snapshot_for_organization(organization_id),
+                *reservations.snapshot_for_organization(organization_id),
             )
             self._snapshots[snapshot_id] = snapshot
             return "created", snapshot
@@ -390,9 +503,16 @@ class SnapshotStore:
         with self._lock:
             return self._snapshots.get(snapshot_id)
 
-    def summaries(self) -> list[dict[str, Any]]:
+    def summaries_for_organization(
+        self, organization_id: str
+    ) -> list[dict[str, Any]]:
+        """List one organization's snapshots, sorted by snapshotId."""
         with self._lock:
-            snapshots = list(self._snapshots.values())
+            snapshots = [
+                snapshot
+                for snapshot in self._snapshots.values()
+                if snapshot.organization_id == organization_id
+            ]
         snapshots.sort(key=lambda snapshot: snapshot.snapshot_id)
         return [
             {
@@ -412,9 +532,10 @@ class Branch:
     in the branch and never touch the main service or any other branch.
     """
 
-    def __init__(self, branch_id: str, snapshot_id: str, snapshot: Snapshot) -> None:
+    def __init__(self, branch_id: str, snapshot: Snapshot) -> None:
         self.branch_id = branch_id
-        self.snapshot_id = snapshot_id
+        self.organization_id = snapshot.organization_id
+        self.snapshot_id = snapshot.snapshot_id
         self.ledger, self.reservations = snapshot.materialize()
 
     def summary(self) -> dict[str, Any]:
@@ -444,7 +565,7 @@ class BranchStore:
             existing = self._branches.get(branch_id)
             if existing is not None:
                 return "conflict", existing
-            branch = Branch(branch_id, snapshot.snapshot_id, snapshot)
+            branch = Branch(branch_id, snapshot)
             self._branches[branch_id] = branch
             return "created", branch
 
@@ -1156,6 +1277,40 @@ def validate_snapshot_request(data: Any) -> str:
     )
 
 
+def validate_token_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /auth/tokens.
+
+    Exactly the ``token``, ``organizationId`` and ``role`` fields may be
+    present; the first two must be non-empty strings and role must be
+    ``read`` or ``write``. A blank (whitespace-only) string is rejected just
+    like an empty one.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("token body must be a JSON object")
+
+    keys = set(data)
+    expected = set(TOKEN_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("token", "organizationId"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    if data["role"] not in ROLES:
+        raise EventValidationError("role must be read or write")
+
+    return {field: data[field] for field in TOKEN_FIELDS}
+
+
 def validate_branch_request(data: Any) -> tuple[str, str]:
     """Validate a decoded JSON body for POST /branches."""
     if not isinstance(data, dict):
@@ -1262,6 +1417,9 @@ def _windows_from_occurred(
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
+    # Set by _require_subject for every authenticated request.
+    token: str = ""
+
     # ------------------------------------------------------------------ GET
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
@@ -1283,8 +1441,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
+            subject = self._require_subject(newline=True)
+            if subject is None:
+                return
             if len(segments) == 1 and segments[0]:
-                self._get_branch(unquote(segments[0]))
+                self._get_branch(unquote(segments[0]), subject)
                 return
             if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
@@ -1293,6 +1454,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if branch is None:
                     self._branch_not_found()
+                    return
+                # The branch belongs to one organization; a credential for
+                # any other organization is rejected before the query is even
+                # parsed.
+                if not self._allow_branch(subject, branch, newline=True):
                     return
                 if len(segments) == 2:
                     if segments[1] == "events":
@@ -1371,6 +1537,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
 
+        if path == "/auth/tokens":
+            self._register_token()
+            return
+
         if path == "/snapshots":
             self._create_snapshot()
             return
@@ -1381,6 +1551,9 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
+            subject = self._require_subject(newline=True)
+            if subject is None:
+                return
             if len(segments) >= 2 and segments[0]:
                 branch_id = unquote(segments[0])
                 branch = self.server.branches.get(  # type: ignore[attr-defined]
@@ -1388,6 +1561,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if branch is None:
                     self._branch_not_found()
+                    return
+                if not self._allow_branch(subject, branch, newline=True):
                     return
                 if len(segments) == 2:
                     if segments[1] == "events":
@@ -1433,9 +1608,51 @@ class Handler(BaseHTTPRequestHandler):
             {"error": "not_found", "path": self.path},
         )
 
+    # ------------------------------------------------------------ registration
+
+    def _register_token(self) -> None:
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            credentials = validate_token_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        status, _subject = self.server.tokens.register(  # type: ignore[attr-defined]
+            credentials["token"],
+            credentials["organizationId"],
+            credentials["role"],
+        )
+        if status == "created":
+            self._write_json(HTTPStatus.CREATED, credentials, newline=True)
+        elif status == "exists":
+            # Idempotent resubmission: the record is not added a second time
+            # and the same three fields are echoed back.
+            self._write_json(HTTPStatus.OK, credentials, newline=True)
+        else:
+            self._write_json(
+                HTTPStatus.CONFLICT,
+                {"error": "auth_conflict"},
+                newline=True,
+            )
+
     # ------------------------------------------------------------- snapshots
 
     def _create_snapshot(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=False)
+            return
+
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1449,12 +1666,26 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, snapshot = self.server.snapshots.create(  # type: ignore[attr-defined]
-            snapshot_id,
-            self.server.ledger,  # type: ignore[attr-defined]
-            self.server.reservations,  # type: ignore[attr-defined]
+        # The snapshot belongs to the creator's organization and captures only
+        # that organization's state. The role check, the capture, and the
+        # insert run under the registry lock, so a read-only credential can
+        # never slip a snapshot in and a rejected request stores nothing.
+        def capture() -> tuple[str, Snapshot]:
+            return self.server.snapshots.create(  # type: ignore[attr-defined]
+                snapshot_id,
+                subject.organization_id,
+                self.server.ledger,  # type: ignore[attr-defined]
+                self.server.reservations,  # type: ignore[attr-defined]
+            )
+
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, subject.organization_id, capture
         )
-        if status == "created":
+        if status == "forbidden":
+            self._forbidden(newline=False)
+            return
+        create_status, snapshot = result
+        if create_status == "created":
             self._write_json(
                 HTTPStatus.CREATED,
                 {
@@ -1471,14 +1702,28 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _list_snapshots(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
         self._write_json(
             HTTPStatus.OK,
-            {"snapshots": self.server.snapshots.summaries()},  # type: ignore[attr-defined]
+            {
+                "snapshots": self.server.snapshots.summaries_for_organization(  # type: ignore[attr-defined]
+                    subject.organization_id
+                )
+            },
         )
 
     # --------------------------------------------------------------- branches
 
     def _create_branch(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=False)
+            return
+
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1499,11 +1744,24 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "snapshot_not_found"},
             )
             return
+        # A snapshot created by another organization is never a fork source.
+        if snapshot.organization_id != subject.organization_id:
+            self._forbidden(newline=False)
+            return
 
-        status, branch = self.server.branches.create(  # type: ignore[attr-defined]
-            branch_id, snapshot
+        def fork() -> tuple[str, Branch]:
+            return self.server.branches.create(  # type: ignore[attr-defined]
+                branch_id, snapshot
+            )
+
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, snapshot.organization_id, fork
         )
-        if status == "created":
+        if status == "forbidden":
+            self._forbidden(newline=False)
+            return
+        create_status, branch = result
+        if create_status == "created":
             self._write_json(HTTPStatus.CREATED, branch.summary())
         else:
             self._write_json(
@@ -1511,11 +1769,15 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "branch_conflict"},
             )
 
-    def _get_branch(self, branch_id: str) -> None:
+    def _get_branch(self, branch_id: str, subject: Subject) -> None:
         branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
         if branch is None:
             self._branch_not_found()
             return
+        if not self._allow_branch(subject, branch, newline=True):
+            return
+        # The branch summary success body keeps its original byte contract:
+        # compact JSON with no trailing newline (the 404/403 errors do use one).
         self._write_json(HTTPStatus.OK, branch.summary())
 
     def _branch_not_found(self) -> None:
@@ -1528,6 +1790,15 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------------- events
 
     def _create_event(self, ledger: EventLedger, *, newline: bool = False) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
+        # A write entry point is out of scope for a read credential even
+        # before the body is read; the locked commit below re-checks it.
+        if subject.role != "write":
+            self._forbidden(newline=newline)
+            return
+
         data = self._json_request_body(newline=newline)
         if data is _BODY_ERROR:
             return
@@ -1542,10 +1813,23 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, stored = ledger.add(event)
-        if status == "created":
+        organization_id = event["organizationId"]
+
+        def commit() -> tuple[str, dict[str, Any]]:
+            return ledger.add(event)
+
+        # The organization/role decision and the ledger mutation are one
+        # indivisible step: a forbidden request can never reach the ledger.
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=newline)
+            return
+        add_status, stored = result
+        if add_status == "created":
             self._write_json(HTTPStatus.CREATED, stored, newline=newline)
-        elif status == "exists":
+        elif add_status == "exists":
             self._write_json(HTTPStatus.OK, stored, newline=newline)
         else:
             self._write_json(
@@ -1557,6 +1841,9 @@ class Handler(BaseHTTPRequestHandler):
     def _list_events(
         self, ledger: EventLedger, query: str, *, newline: bool = False
     ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -1566,6 +1853,10 @@ class Handler(BaseHTTPRequestHandler):
                 newline=newline,
             )
             return
+        if not self._authorize_organization(
+            subject, organization_id, newline=newline
+        ):
+            return
         events = ledger.list_for_organization(organization_id)
         self._write_json(
             HTTPStatus.OK,
@@ -1574,6 +1865,9 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _replay_events(self, ledger: EventLedger, query: str) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
         try:
             params = _replay_params_from_query(query)
         except EventValidationError as exc:
@@ -1582,6 +1876,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
             return
         # Read-only: the replay is a single locked snapshot of the ledger.
         events = ledger.list_for_organization_as_of(
@@ -1594,6 +1892,9 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _compare_replays(self, ledger: EventLedger, query: str) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
         try:
             params = _replay_compare_params_from_query(query)
         except EventValidationError as exc:
@@ -1602,6 +1903,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
             return
         # Read-only: both replays read the same current ledger and nothing
         # is written back, so identical requests return identical bytes.
@@ -1629,6 +1934,9 @@ class Handler(BaseHTTPRequestHandler):
     def _aggregate_events(
         self, ledger: EventLedger, query: str, *, newline: bool = False
     ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
         try:
             params = _aggregate_params_from_query(query)
         except EventValidationError as exc:
@@ -1637,6 +1945,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=newline,
             )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=newline
+        ):
             return
 
         window_size = params["windowSize"]
@@ -1664,6 +1976,9 @@ class Handler(BaseHTTPRequestHandler):
     def _list_events_by_region(
         self, ledger: EventLedger, query: str
     ) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
         try:
             params = _region_list_params_from_query(query)
         except EventValidationError as exc:
@@ -1672,6 +1987,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
             return
         events = ledger.list_for_organization_region(
             params["organizationId"], params["region"]
@@ -1689,6 +2008,9 @@ class Handler(BaseHTTPRequestHandler):
     def _aggregate_events_by_region(
         self, ledger: EventLedger, query: str
     ) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
         try:
             params = _region_aggregate_params_from_query(query)
         except EventValidationError as exc:
@@ -1697,6 +2019,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
             return
 
         window_size = params["windowSize"]
@@ -1728,6 +2054,10 @@ class Handler(BaseHTTPRequestHandler):
     def _evaluate_decision(
         self, ledger: EventLedger, *, newline: bool = False
     ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
+
         data = self._json_request_body(newline=newline)
         if data is _BODY_ERROR:
             return
@@ -1742,6 +2072,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=newline
+        ):
+            return
+
         # Read-only: the ledger is never mutated by a decision request, and
         # the snapshot is taken in a single locked copy for consistency.
         occurred = ledger.occurred_at_values(
@@ -1751,6 +2086,10 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.OK, result, newline=newline)
 
     def _allocate_decision(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
+
         data = self._json_request_body()
         if data is _BODY_ERROR:
             return
@@ -1764,6 +2103,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=False
+        ):
+            return
+
         # Read-only and stateless: the plan is computed from the request body
         # alone, so identical submissions and concurrent requests never
         # interfere with each other or with the ledger.
@@ -1773,6 +2117,13 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ alerts
 
     def _evaluate_alert(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=True)
+            return
+
         data = self._json_request_body(newline=True)
         if data is _BODY_ERROR:
             return
@@ -1787,49 +2138,63 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        # The ledger is never mutated by an alert request; the peak is read
-        # from a single locked snapshot of the matching events.
-        occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
-            params["organizationId"], params["type"]
-        )
-        peak = evaluate_decision(occurred, params)
-        peak_start = peak["peakStart"]
-        peak_count = peak["peakCount"]
+        organization_id = params["organizationId"]
 
-        if peak_count < params["threshold"]:
-            alert_id = None
-            suppressed_count = None
-            action = "observe"
-        else:
-            # The suppression decision and the create/commit run in one lock,
-            # so concurrent threshold hits cannot both open an alert.
-            action, alert = self.server.alerts.record(  # type: ignore[attr-defined]
-                params["organizationId"],
-                params["type"],
-                peak_start,
-                params["threshold"],
-                params["suppressionWindow"],
+        def commit() -> dict[str, Any]:
+            # The ledger is never modified; the peak is a single locked
+            # snapshot of the matching events. The role/org decision and the
+            # alert record share the registry lock, so a read-only credential
+            # is rejected before any record call and concurrent threshold
+            # hits cannot both open an alert.
+            occurred = self.server.ledger.occurred_at_values(  # type: ignore[attr-defined]
+                organization_id, params["type"]
             )
-            alert_id = alert["alertId"]
-            suppressed_count = alert["suppressedCount"]
+            peak = evaluate_decision(occurred, params)
+            peak_start = peak["peakStart"]
+            peak_count = peak["peakCount"]
 
-        result = {
-            "organizationId": params["organizationId"],
-            "type": params["type"],
-            "windowSize": params["windowSize"],
-            "threshold": params["threshold"],
-            "suppressionWindow": params["suppressionWindow"],
-            "from": params["from"],
-            "to": params["to"],
-            "peakStart": peak_start,
-            "peakCount": peak_count,
-            "action": action,
-            "alertId": alert_id,
-            "suppressedCount": suppressed_count,
-        }
+            if peak_count < params["threshold"]:
+                action = "observe"
+                alert_id = None
+                suppressed_count = None
+            else:
+                action, alert = self.server.alerts.record(  # type: ignore[attr-defined]
+                    organization_id,
+                    params["type"],
+                    peak_start,
+                    params["threshold"],
+                    params["suppressionWindow"],
+                )
+                alert_id = alert["alertId"]
+                suppressed_count = alert["suppressedCount"]
+
+            return {
+                "organizationId": organization_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "suppressionWindow": params["suppressionWindow"],
+                "from": params["from"],
+                "to": params["to"],
+                "peakStart": peak_start,
+                "peakCount": peak_count,
+                "action": action,
+                "alertId": alert_id,
+                "suppressedCount": suppressed_count,
+            }
+
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=True)
+            return
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _list_alerts(self, query: str) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -1838,6 +2203,8 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "validation_error", "message": str(exc)},
                 newline=True,
             )
+            return
+        if not self._authorize_organization(subject, organization_id, newline=True):
             return
         alerts = self.server.alerts.list_for_organization(  # type: ignore[attr-defined]
             organization_id
@@ -1866,6 +2233,13 @@ class Handler(BaseHTTPRequestHandler):
         *,
         newline: bool = False,
     ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=newline)
+            return
+
         data = self._json_request_body(newline=newline)
         if data is _BODY_ERROR:
             return
@@ -1880,13 +2254,30 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        status, view = reservations.reserve(reservation)
-        if status == "created":
+        organization_id = reservation["organizationId"]
+
+        def commit() -> tuple[str, dict[str, Any] | None]:
+            return reservations.reserve(reservation)
+
+        # The balance check/deduction stays in the inventory lock; the
+        # organization/role decision is wrapped in the same outer registry
+        # lock, so a forbidden request never reaches the inventory and cannot
+        # race its way past a read-only credential.
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=newline)
+            return
+        reserve_status, view = result
+        if reserve_status == "created":
             self._write_json(HTTPStatus.CREATED, view, newline=newline)
-        elif status == "exists":
+        elif reserve_status == "exists":
             self._write_json(HTTPStatus.OK, view, newline=newline)
         else:
-            self._write_json(HTTPStatus.CONFLICT, {"error": status}, newline=newline)
+            self._write_json(
+                HTTPStatus.CONFLICT, {"error": reserve_status}, newline=newline
+            )
 
     def _list_reservations(
         self,
@@ -1895,6 +2286,9 @@ class Handler(BaseHTTPRequestHandler):
         *,
         newline: bool = False,
     ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
         try:
             organization_id = _organization_id_from_query(query)
         except EventValidationError as exc:
@@ -1904,6 +2298,10 @@ class Handler(BaseHTTPRequestHandler):
                 newline=newline,
             )
             return
+        if not self._authorize_organization(
+            subject, organization_id, newline=newline
+        ):
+            return
         views = reservations.list_for_organization(organization_id)
         self._write_json(
             HTTPStatus.OK,
@@ -1912,6 +2310,62 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     # ------------------------------------------------------------------ wiring
+
+    def _require_subject(self, *, newline: bool = True) -> Subject | None:
+        """Authenticate the ``Authorization: Bearer ...`` credential.
+
+        Returns the registered :class:`Subject` and remembers the presented
+        token on ``self.token``; on any failure writes the 401 response and
+        returns ``None``. A missing header, a non-Bearer scheme, an empty or
+        malformed token, or an unregistered token are all equally
+        unauthenticated.
+        """
+        header = self.headers.get("Authorization")
+        token: str | None = None
+        if isinstance(header, str):
+            parts = header.split(" ")
+            if len(parts) == 2 and parts[0] == "Bearer" and parts[1]:
+                token = parts[1]
+        if token is None:
+            self._unauthorized(newline=newline)
+            return None
+        subject = self.server.tokens.lookup(token)  # type: ignore[attr-defined]
+        if subject is None:
+            self._unauthorized(newline=newline)
+            return None
+        self.token = token
+        return subject
+
+    def _authorize_organization(
+        self, subject: Subject, organization_id: str, *, newline: bool = True
+    ) -> bool:
+        """Return True when the subject's organization matches the request."""
+        if subject.organization_id != organization_id:
+            self._forbidden(newline=newline)
+            return False
+        return True
+
+    def _allow_branch(
+        self, subject: Subject, branch: Branch, *, newline: bool = True
+    ) -> bool:
+        """Return True when the branch belongs to the subject's organization."""
+        return self._authorize_organization(
+            subject, branch.organization_id, newline=newline
+        )
+
+    def _unauthorized(self, *, newline: bool = True) -> None:
+        self._write_json(
+            HTTPStatus.UNAUTHORIZED,
+            {"error": "unauthorized"},
+            newline=newline,
+        )
+
+    def _forbidden(self, *, newline: bool = True) -> None:
+        self._write_json(
+            HTTPStatus.FORBIDDEN,
+            {"error": "forbidden"},
+            newline=newline,
+        )
 
     def _json_request_body(self, *, newline: bool = False) -> Any:
         """Validate the media type and decode the request body as JSON.
@@ -1962,6 +2416,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def create_server(host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), Handler)
+    server.tokens = TokenRegistry()  # type: ignore[attr-defined]
     server.ledger = EventLedger()  # type: ignore[attr-defined]
     server.reservations = ReservationInventory()  # type: ignore[attr-defined]
     server.snapshots = SnapshotStore()  # type: ignore[attr-defined]
