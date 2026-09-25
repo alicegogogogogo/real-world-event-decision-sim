@@ -56,6 +56,16 @@ BRANCH_COMPARE_FIELDS = (
 )
 
 BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
+BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
+
+# The four reservation fields two same-id records are compared on; the
+# identifier itself aligns the pair and never appears in a diff entry.
+RESERVATION_COMPARE_FIELDS = (
+    "organizationId",
+    "resourceId",
+    "quantity",
+    "capacity",
+)
 
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
@@ -1455,6 +1465,37 @@ def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in BRANCH_EVENT_COMPARE_FIELDS}
 
 
+def validate_branch_reservation_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /branches/compare/reservations.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are branch names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "branch reservation comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(BRANCH_RESERVATION_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in BRANCH_RESERVATION_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in BRANCH_RESERVATION_COMPARE_FIELDS}
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1685,6 +1726,54 @@ def compare_branch_events(
     }
 
 
+def compare_branch_reservations(
+    left_reservations: list[dict[str, Any]],
+    right_reservations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Diff two branches' reservations aligned by reservationId.
+
+    Each reservation list is a single locked snapshot of one branch's
+    inventory, so the four groups derive from consistent reads and nothing
+    is written. Identifiers only on the left land in ``leftOnly``, only on
+    the right in ``rightOnly``. An identifier on both sides counts toward
+    ``same`` when the four compared fields (organizationId, resourceId,
+    quantity, capacity) all match and lands in ``diff`` otherwise, as
+    ``{"reservationId", "fields"}`` naming the mismatched fields. Identifiers
+    and field names are sorted in Unicode code-point order; each group also
+    gets a ``<group>Count`` key.
+    """
+    left_by_id = {r["reservationId"]: r for r in left_reservations}
+    right_by_id = {r["reservationId"]: r for r in right_reservations}
+
+    left_only = sorted(set(left_by_id) - set(right_by_id))
+    right_only = sorted(set(right_by_id) - set(left_by_id))
+    same: list[str] = []
+    diff: list[dict[str, Any]] = []
+    for reservation_id in sorted(set(left_by_id) & set(right_by_id)):
+        left = left_by_id[reservation_id]
+        right = right_by_id[reservation_id]
+        fields = sorted(
+            field
+            for field in RESERVATION_COMPARE_FIELDS
+            if left[field] != right[field]
+        )
+        if fields:
+            diff.append({"reservationId": reservation_id, "fields": fields})
+        else:
+            same.append(reservation_id)
+
+    return {
+        "leftOnly": left_only,
+        "leftOnlyCount": len(left_only),
+        "rightOnly": right_only,
+        "rightOnlyCount": len(right_only),
+        "same": same,
+        "sameCount": len(same),
+        "diff": diff,
+        "diffCount": len(diff),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EventSim/0.1"
 
@@ -1823,6 +1912,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/events":
             self._compare_branch_events()
+            return
+        if path == "/branches/compare/reservations":
+            self._compare_branch_reservations()
             return
 
         if path.startswith("/branches/"):
@@ -2194,6 +2286,68 @@ class Handler(BaseHTTPRequestHandler):
             right_branch.ledger.snapshot_for_organization(organization_id).values()
         )
         result = compare_branch_events(left_events, right_events)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_branch_reservations(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_reservation_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the other branch comparisons: the organization decision happens
+        # before either branch name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; a comparison never implicitly
+        # creates a branch.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side reads its own inventory in one locked snapshot, then the
+        # diff is computed purely from those copies; nothing is written, so
+        # identical submissions return byte-identical JSON.
+        _, left_records = left_branch.reservations.snapshot_for_organization(
+            organization_id
+        )
+        _, right_records = right_branch.reservations.snapshot_for_organization(
+            organization_id
+        )
+        result = compare_branch_reservations(
+            list(left_records.values()), list(right_records.values())
+        )
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
