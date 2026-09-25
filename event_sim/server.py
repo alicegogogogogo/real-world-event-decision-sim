@@ -59,6 +59,8 @@ BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
+SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
+
 # Reservations align by reservationId; only these four fields participate in
 # the same/diff decision for an identifier present on both sides.
 RESERVATION_COMPARE_FIELDS = (
@@ -502,6 +504,19 @@ class Snapshot:
         reservations = ReservationInventory()
         reservations.restore(self._capacities, self._reservations)
         return ledger, reservations
+
+    def reservations_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return a deep copy of the captured reservations, keyed by id.
+
+        A snapshot holds only its owning organization's reservations, so the
+        copy needs no further organization filtering. It is immutable after
+        capture; the copy keeps a read-only comparison from sharing mutable
+        references with the snapshot.
+        """
+        return {
+            reservation_id: dict(record)
+            for reservation_id, record in self._reservations.items()
+        }
 
 
 class SnapshotStore:
@@ -1497,6 +1512,37 @@ def validate_branch_reservation_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in BRANCH_RESERVATION_COMPARE_FIELDS}
 
 
+def validate_snapshot_reservation_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /snapshots/compare/reservations.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are snapshot names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "snapshot reservation comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(SNAPSHOT_RESERVATION_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS}
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1727,13 +1773,13 @@ def compare_branch_events(
     }
 
 
-def compare_branch_reservations(
+def _compare_reservations(
     left_reservations: dict[str, dict[str, Any]],
     right_reservations: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Diff two branches' reservations aligned by reservationId.
+    """Diff two reservation mappings aligned by reservationId.
 
-    Each mapping is a single locked snapshot of one branch's reservations for
+    Each mapping is a single locked snapshot of one side's reservations for
     one organization, keyed by reservationId, so the four groups derive from
     consistent reads and nothing is written. Identifiers only on the left
     land in ``leftOnly``, only on the right in ``rightOnly``. An identifier
@@ -1771,6 +1817,31 @@ def compare_branch_reservations(
         "diff": diff,
         "diffCount": len(diff),
     }
+
+
+def compare_branch_reservations(
+    left_reservations: dict[str, dict[str, Any]],
+    right_reservations: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Diff two branches' reservations aligned by reservationId.
+
+    Delegates to the shared :func:`_compare_reservations`; each mapping is a
+    locked snapshot of one branch's reservations for one organization.
+    """
+    return _compare_reservations(left_reservations, right_reservations)
+
+
+def compare_snapshot_reservations(
+    left_reservations: dict[str, dict[str, Any]],
+    right_reservations: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Diff two snapshots' reservations aligned by reservationId.
+
+    Delegates to the shared :func:`_compare_reservations`; each mapping is a
+    deep copy of one snapshot's captured reservations (already scoped to one
+    organization at capture time).
+    """
+    return _compare_reservations(left_reservations, right_reservations)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1914,6 +1985,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/reservations":
             self._compare_branch_reservations()
+            return
+        if path == "/snapshots/compare/reservations":
+            self._compare_snapshot_reservations()
             return
 
         if path.startswith("/branches/"):
@@ -2166,6 +2240,13 @@ class Handler(BaseHTTPRequestHandler):
             newline=True,
         )
 
+    def _snapshot_not_found(self) -> None:
+        self._write_json(
+            HTTPStatus.NOT_FOUND,
+            {"error": "snapshot_not_found"},
+            newline=True,
+        )
+
     def _compare_branches(self) -> None:
         subject = self._require_subject(newline=True)
         if subject is None:
@@ -2347,6 +2428,70 @@ class Handler(BaseHTTPRequestHandler):
             right_branch.reservations.snapshot_for_organization(organization_id)
         )
         result = compare_branch_reservations(left_reservations, right_reservations)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_reservations(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_reservation_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the branch comparisons: the organization decision happens before
+        # either snapshot name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; a comparison never implicitly
+        # creates one. The fixed left-then-right order makes the verdict
+        # deterministic: a missing left outranks any problem on the right,
+        # and a foreign snapshot is forbidden before the other name is even
+        # looked up.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's reservations were already scoped to the owning
+        # organization at capture time; deep copies keep the comparison from
+        # sharing mutable snapshot state. Nothing is written, so identical
+        # submissions return byte-identical JSON.
+        left_reservations = left_snapshot.reservations_snapshot()
+        right_reservations = right_snapshot.reservations_snapshot()
+        result = compare_snapshot_reservations(
+            left_reservations, right_reservations
+        )
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
