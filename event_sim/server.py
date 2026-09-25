@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from copy import deepcopy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, NamedTuple
@@ -60,6 +61,8 @@ BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
+
+SNAPSHOT_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 # Reservations align by reservationId; only these four fields participate in
 # the same/diff decision for an identifier present on both sides.
@@ -516,6 +519,19 @@ class Snapshot:
         return {
             reservation_id: dict(record)
             for reservation_id, record in self._reservations.items()
+        }
+
+    def events_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return a deep copy of the captured events, keyed by eventId.
+
+        A snapshot holds only its owning organization's events, so the copy
+        needs no further organization filtering. It is immutable after
+        capture; the deep copy (events carry a nested payload object) keeps a
+        read-only comparison from sharing any mutable reference with the
+        snapshot.
+        """
+        return {
+            event_id: deepcopy(event) for event_id, event in self._events.items()
         }
 
 
@@ -1543,6 +1559,37 @@ def validate_snapshot_reservation_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS}
 
 
+def validate_snapshot_event_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /snapshots/compare/events.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are snapshot names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "snapshot event comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(SNAPSHOT_EVENT_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in SNAPSHOT_EVENT_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in SNAPSHOT_EVENT_COMPARE_FIELDS}
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1727,30 +1774,30 @@ def compare_branches(
     }
 
 
-def compare_branch_events(
-    left_events: list[dict[str, Any]], right_events: list[dict[str, Any]]
+def _compare_events(
+    left_events: dict[str, dict[str, Any]],
+    right_events: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Diff two branches' events aligned by eventId.
+    """Diff two event mappings aligned by eventId.
 
-    Each event list is a single locked snapshot of one branch's ledger, so
-    the four groups derive from consistent reads and nothing is written.
-    Identifiers only on the left land in ``leftOnly``, only on the right in
-    ``rightOnly``. An identifier on both sides counts toward ``same`` when
-    every field except eventId matches (payloads compare by content) and
-    lands in ``diff`` otherwise, as ``{"eventId", "fields"}`` naming the
-    mismatched fields. Identifiers and field names are sorted in Unicode
-    code-point order; each group also gets a ``<group>Count`` key.
+    Each mapping is a single locked snapshot of one side's events for one
+    organization, keyed by eventId, so the four groups derive from
+    consistent reads and nothing is written. Identifiers only on the left
+    land in ``leftOnly``, only on the right in ``rightOnly``. An identifier
+    on both sides counts toward ``same`` when its organization, type,
+    occurredAt and payload all match (payloads compare by content, so key
+    order never matters), and lands in ``diff`` otherwise, as
+    ``{"eventId", "fields"}`` naming the mismatched fields. Identifiers and
+    field names are sorted in Unicode code-point order; each group also gets
+    a ``<group>Count`` key.
     """
-    left_by_id = {event["eventId"]: event for event in left_events}
-    right_by_id = {event["eventId"]: event for event in right_events}
-
-    left_only = sorted(set(left_by_id) - set(right_by_id))
-    right_only = sorted(set(right_by_id) - set(left_by_id))
+    left_only = sorted(set(left_events) - set(right_events))
+    right_only = sorted(set(right_events) - set(left_events))
     same: list[str] = []
     diff: list[dict[str, Any]] = []
-    for event_id in sorted(set(left_by_id) & set(right_by_id)):
-        left = left_by_id[event_id]
-        right = right_by_id[event_id]
+    for event_id in sorted(set(left_events) & set(right_events)):
+        left = left_events[event_id]
+        right = right_events[event_id]
         fields = sorted(
             field
             for field in EVENT_FIELDS
@@ -1771,6 +1818,34 @@ def compare_branch_events(
         "diff": diff,
         "diffCount": len(diff),
     }
+
+
+def compare_branch_events(
+    left_events: list[dict[str, Any]], right_events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Diff two branches' events aligned by eventId.
+
+    Each event list is a single locked snapshot of one branch's ledger; the
+    lists are keyed by eventId and delegated to the shared
+    :func:`_compare_events`.
+    """
+    return _compare_events(
+        {event["eventId"]: event for event in left_events},
+        {event["eventId"]: event for event in right_events},
+    )
+
+
+def compare_snapshot_events(
+    left_events: dict[str, dict[str, Any]],
+    right_events: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Diff two snapshots' events aligned by eventId.
+
+    Delegates to the shared :func:`_compare_events`; each mapping is a deep
+    copy of one snapshot's captured events (already scoped to one
+    organization at capture time), keyed by eventId.
+    """
+    return _compare_events(left_events, right_events)
 
 
 def _compare_reservations(
@@ -1988,6 +2063,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/snapshots/compare/reservations":
             self._compare_snapshot_reservations()
+            return
+        if path == "/snapshots/compare/events":
+            self._compare_snapshot_events()
             return
 
         if path.startswith("/branches/"):
@@ -2492,6 +2570,70 @@ class Handler(BaseHTTPRequestHandler):
         result = compare_snapshot_reservations(
             left_reservations, right_reservations
         )
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_events(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_event_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the snapshot reservation comparison: the organization decision
+        # happens before either snapshot name is inspected, then left before
+        # right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; a comparison never implicitly
+        # creates one. The fixed left-then-right order makes the verdict
+        # deterministic: a missing left outranks any problem on the right,
+        # and a foreign snapshot is forbidden before the other name is even
+        # looked up.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's events were already scoped to the owning organization
+        # at capture time; deep copies keep the comparison from sharing
+        # mutable snapshot state. Nothing is written — neither snapshot, the
+        # main ledger, reservation inventory, nor alert state — so identical
+        # submissions return byte-identical JSON.
+        left_events = left_snapshot.events_snapshot()
+        right_events = right_snapshot.events_snapshot()
+        result = compare_snapshot_events(left_events, right_events)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
