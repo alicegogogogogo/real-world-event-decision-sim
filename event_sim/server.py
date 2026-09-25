@@ -63,6 +63,13 @@ SNAPSHOT_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
+# The snapshot window comparison reuses the branch window comparison's
+# request contract verbatim; only the meaning of ``left`` and ``right``
+# changes (snapshot names instead of branch names).
+SNAPSHOT_COMPARE_REQUIRED_FIELDS = BRANCH_COMPARE_REQUIRED_FIELDS
+SNAPSHOT_COMPARE_OPTIONAL_FIELDS = BRANCH_COMPARE_OPTIONAL_FIELDS
+SNAPSHOT_COMPARE_FIELDS = BRANCH_COMPARE_FIELDS
+
 # Reservations align by reservationId; only these four fields participate in
 # the same/diff decision for an identifier present on both sides.
 RESERVATION_COMPARE_FIELDS = (
@@ -529,6 +536,21 @@ class Snapshot:
             reservation_id: dict(record)
             for reservation_id, record in self._reservations.items()
         }
+
+    def occurred_at_values(self, event_type: str) -> list[int]:
+        """Sorted occurredAt values of this snapshot's events of one type.
+
+        A snapshot holds only its owning organization's events, so no further
+        organization filtering is needed. The snapshot is immutable after
+        capture, so the values can be read without a lock.
+        """
+        values = [
+            event["occurredAt"]
+            for event in self._events.values()
+            if event["type"] == event_type
+        ]
+        values.sort()
+        return values
 
 
 class SnapshotStore:
@@ -1462,6 +1484,68 @@ def validate_branch_compare_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_snapshot_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /snapshots/compare.
+
+    The request fields mirror :func:`validate_branch_compare_request`
+    exactly; ``left`` and ``right`` are snapshot names and the same name on
+    both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("snapshot comparison body must be a JSON object")
+
+    keys = set(data)
+    required = set(SNAPSHOT_COMPARE_REQUIRED_FIELDS)
+    allowed = set(SNAPSHOT_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -1665,7 +1749,7 @@ def _windows_from_occurred(
     ]
 
 
-def _branch_window_counts(
+def _window_counts(
     occurred: list[int], params: dict[str, Any]
 ) -> dict[int, int]:
     """Count one side's matching events per window start, with range filter.
@@ -1685,7 +1769,7 @@ def _branch_window_counts(
     return counts
 
 
-def _branch_window_starts(params: dict[str, Any]) -> list[int]:
+def _window_starts(params: dict[str, Any]) -> list[int]:
     """Window starts a comparison must align, using the aggregate contract.
 
     Without a range there is no fixed grid; the caller unions the two sides'
@@ -1700,26 +1784,26 @@ def _branch_window_starts(params: dict[str, Any]) -> list[int]:
     return list(range(first, last + 1, window_size))
 
 
-def compare_branches(
+def _compare_window_sides(
     left_occurred: list[int],
     right_occurred: list[int],
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Diff two branches' window counts and peaks from timestamp snapshots.
+    """Diff two sides' window counts and peaks from timestamp snapshots.
 
-    Each ``occurred`` list is a single locked snapshot of one branch's
-    matching events, so the window rows and the peak for a side derive from
-    the same read; nothing is written. Without a range, rows cover the union
-    of the two sides' hit windows; with a range, rows cover every window
-    intersecting ``[from, to]``, empty windows kept. Rows align by start
-    ascending and carry each side's count plus an ``equal`` marker. The
-    ``decision`` block holds each side's peak and action and a marker saying
-    whether the two peak results agree.
+    Each ``occurred`` list is a single locked snapshot (or immutable capture)
+    of one side's matching events, so the window rows and the peak for a side
+    derive from the same read; nothing is written. Without a range, rows
+    cover the union of the two sides' hit windows; with a range, rows cover
+    every window intersecting ``[from, to]``, empty windows kept. Rows align
+    by start ascending and carry each side's count plus an ``equal`` marker.
+    The ``decision`` block holds each side's peak and action and a marker
+    saying whether the two peak results agree.
     """
-    left_counts = _branch_window_counts(left_occurred, params)
-    right_counts = _branch_window_counts(right_occurred, params)
+    left_counts = _window_counts(left_occurred, params)
+    right_counts = _window_counts(right_occurred, params)
 
-    range_starts = _branch_window_starts(params)
+    range_starts = _window_starts(params)
     if range_starts:
         starts = range_starts
     else:
@@ -1768,6 +1852,36 @@ def compare_branches(
         "decision": decision,
         "windows": windows,
     }
+
+
+def compare_branches(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two branches' window counts and peaks from timestamp snapshots.
+
+    Delegates to the shared :func:`_compare_window_sides`; each ``occurred``
+    list is a single locked snapshot of one branch's matching events, so the
+    window rows and the peak for a side derive from the same read and nothing
+    is written.
+    """
+    return _compare_window_sides(left_occurred, right_occurred, params)
+
+
+def compare_snapshots(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two snapshots' window counts and peaks from captured timestamps.
+
+    Delegates to the shared :func:`_compare_window_sides`; each ``occurred``
+    list is read from one immutable snapshot capture (already scoped to one
+    organization), so the result is byte-stable across repeated submissions
+    and nothing is written.
+    """
+    return _compare_window_sides(left_occurred, right_occurred, params)
 
 
 def _compare_events(
@@ -2054,6 +2168,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/reservations":
             self._compare_branch_reservations()
+            return
+        if path == "/snapshots/compare":
+            self._compare_snapshots()
             return
         if path == "/snapshots/compare/events":
             self._compare_snapshot_events()
@@ -2626,6 +2743,69 @@ class Handler(BaseHTTPRequestHandler):
         result = compare_snapshot_reservations(
             left_reservations, right_reservations
         )
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshots(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the other snapshot comparisons: the organization decision happens
+        # before either snapshot name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; a comparison never implicitly
+        # creates one. The fixed left-then-right order makes the verdict
+        # deterministic: a missing left outranks any problem on the right,
+        # and a foreign snapshot is forbidden before the other name is even
+        # looked up.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's matching timestamps come from that immutable capture
+        # (already scoped to the owning organization at capture time); both
+        # sides are then recomputed purely from those values. No snapshot,
+        # the main ledger, the reservation inventory, or alert state is ever
+        # written, so identical submissions return byte-identical JSON.
+        left_occurred = left_snapshot.occurred_at_values(params["type"])
+        right_occurred = right_snapshot.occurred_at_values(params["type"])
+        result = compare_snapshots(left_occurred, right_occurred, params)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events

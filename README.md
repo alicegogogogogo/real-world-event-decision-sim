@@ -84,7 +84,8 @@ data is forbidden.
   replay comparison) queries, the reservation/alert listings,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
-  `POST /branches/compare/reservations`, `POST /snapshots/compare/events`,
+  `POST /branches/compare/reservations`, `POST /snapshots/compare`,
+  `POST /snapshots/compare/events`,
   `POST /snapshots/compare/reservations`, and the other
   read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
@@ -914,6 +915,91 @@ curl -X POST http://127.0.0.1:8000/branches/compare/reservations \
 
 Every non-`200` result is read-only as well: a failed comparison creates no
 branch and changes no event, reservation, alert, or main-service state.
+
+### `POST /snapshots/compare`
+
+A read-only comparison of two existing snapshots' window counts and peak
+decisions. Where `POST /branches/compare` recomputes from two branches' live
+events, this entry point recomputes from the events the two snapshots
+captured at their own creation times. Nothing in either snapshot, in any
+branch, or in the main service is read for mutation or written — snapshots
+are immutable, the main-service event ledger, reservation inventory, and
+alert state are untouched, and identical submissions return byte-for-byte
+identical JSON. Both `read` and `write` credentials may call it. Requires
+`Content-Type: application/json` and a Bearer credential bound to the
+request's `organizationId`. The request fields mirror `POST
+/branches/compare` exactly; the body must be a JSON object containing
+exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both snapshots must belong to it |
+| `left`           | required, non-empty snapshot name (the left-hand side)       |
+| `right`          | required, non-empty snapshot name (the right-hand side)      |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+Using the same snapshot name for `left` and `right` is legal; the two sides
+are then the same capture and equal by construction. Window division matches
+the aggregate, decision, and branch-comparison entry points exactly: windows
+start at `0` and cover `[start, start + windowSize)`, and an event counts
+toward the window of `floor(occurredAt / windowSize) * windowSize`.
+
+- Without `from`/`to`, the `windows` rows cover the **union** of the windows
+  hit by matching captured events on either side, aligned row-by-row by
+  `start` ascending. A window hit by only one side shows the other side's
+  count as `0`. When neither side has a matching captured event, `windows`
+  is `[]`.
+- With `from`/`to`, only captured events in the closed interval
+  `from <= occurredAt <= to` count, and **every** window intersecting that
+  interval gets a row, including windows empty on both sides.
+- Each row is `{"start", "leftCount", "rightCount", "equal"}`, with
+  `equal` true exactly when the two counts agree.
+- `decision.left` and `decision.right` each carry `peakStart`,
+  `peakCount`, and `action`: the peak is the largest window count, ties
+  resolve to the earliest window start, and `action` is `"escalate"` when
+  the peak reaches `threshold` and `"observe"` otherwise. `decision.equal`
+  is true exactly when the two sides' peak results agree. A side with no
+  matching events has `peakStart: null`, `peakCount: 0`, and
+  `action: "observe"`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+values kept as integers, booleans kept as booleans, and one trailing
+newline:
+
+```json
+{"decision":{"equal":false,"left":{"action":"observe","peakCount":2,"peakStart":0},"right":{"action":"escalate","peakCount":3,"peakStart":60}},"from":null,"left":"snap-a","organizationId":"org-1","right":"snap-b","threshold":3,"to":null,"type":"incident.created","windowSize":60,"windows":[{"equal":false,"leftCount":2,"rightCount":1,"start":0},{"equal":false,"leftCount":0,"rightCount":3,"start":60}]}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/snapshots/compare \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"snap-a","right":"snap-b","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named snapshots belongs to another
+  organization. The organization decision happens before snapshot names are
+  inspected, and snapshots are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — either `left` or
+  `right` has never existed as a snapshot. Both participating snapshots
+  must already exist; a comparison never implicitly creates a snapshot.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, a blank or non-string `organizationId`/`left`/
+  `right`/`type`, non-positive-integer `windowSize`/`threshold`, unpaired or
+  non-integer `from`/`to`, or `from > to`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+snapshot and changes no event, reservation, alert, or main-service state.
 
 ### `POST /snapshots/compare/events`
 
