@@ -59,6 +59,8 @@ BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
+SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
+
 # Reservations align by reservationId; only these four fields participate in
 # the same/diff decision for an identifier present on both sides.
 RESERVATION_COMPARE_FIELDS = (
@@ -502,6 +504,21 @@ class Snapshot:
         reservations = ReservationInventory()
         reservations.restore(self._capacities, self._reservations)
         return ledger, reservations
+
+    def reservations_for_organization(
+        self, organization_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Deep copy of this snapshot's reservations for one organization.
+
+        A snapshot only ever holds its creator organization's records, so
+        this is normally the whole capture; the filter keeps the read scoped
+        exactly like the inventory copies used by the branch comparison.
+        """
+        return {
+            reservation_id: dict(record)
+            for reservation_id, record in self._reservations.items()
+            if record["organizationId"] == organization_id
+        }
 
 
 class SnapshotStore:
@@ -1497,6 +1514,37 @@ def validate_branch_reservation_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in BRANCH_RESERVATION_COMPARE_FIELDS}
 
 
+def validate_snapshot_reservation_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /snapshots/compare/reservations.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are snapshot names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "snapshot reservation comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(SNAPSHOT_RESERVATION_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in SNAPSHOT_RESERVATION_COMPARE_FIELDS}
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1727,22 +1775,22 @@ def compare_branch_events(
     }
 
 
-def compare_branch_reservations(
+def compare_reservation_sets(
     left_reservations: dict[str, dict[str, Any]],
     right_reservations: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Diff two branches' reservations aligned by reservationId.
+    """Diff two reservation mappings aligned by reservationId.
 
-    Each mapping is a single locked snapshot of one branch's reservations for
-    one organization, keyed by reservationId, so the four groups derive from
-    consistent reads and nothing is written. Identifiers only on the left
-    land in ``leftOnly``, only on the right in ``rightOnly``. An identifier
-    on both sides counts toward ``same`` when its organization, resource,
-    quantity and capacity all match, and lands in ``diff`` otherwise, as
-    ``{"reservationId", "fields"}`` naming the mismatched fields. No other
-    content participates in the comparison. Identifiers and field names are
-    sorted in Unicode code-point order; each group also gets a
-    ``<group>Count`` key.
+    Each mapping is a single locked snapshot of one side's reservations for
+    one organization (a branch inventory or a captured snapshot), keyed by
+    reservationId, so the four groups derive from consistent reads and
+    nothing is written. Identifiers only on the left land in ``leftOnly``,
+    only on the right in ``rightOnly``. An identifier on both sides counts
+    toward ``same`` when its organization, resource, quantity and capacity
+    all match, and lands in ``diff`` otherwise, as ``{"reservationId",
+    "fields"}`` naming the mismatched fields. No other content participates
+    in the comparison. Identifiers and field names are sorted in Unicode
+    code-point order; each group also gets a ``<group>Count`` key.
     """
     left_only = sorted(set(left_reservations) - set(right_reservations))
     right_only = sorted(set(right_reservations) - set(left_reservations))
@@ -1914,6 +1962,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/reservations":
             self._compare_branch_reservations()
+            return
+        if path == "/snapshots/compare/reservations":
+            self._compare_snapshot_reservations()
             return
 
         if path.startswith("/branches/"):
@@ -2346,8 +2397,77 @@ class Handler(BaseHTTPRequestHandler):
         _right_capacities, right_reservations = (
             right_branch.reservations.snapshot_for_organization(organization_id)
         )
-        result = compare_branch_reservations(left_reservations, right_reservations)
+        result = compare_reservation_sets(left_reservations, right_reservations)
         self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_reservations(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_reservation_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the branch comparisons: the organization decision happens before
+        # either snapshot name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; a comparison never implicitly
+        # creates a snapshot.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if not self._allow_snapshot(subject, left_snapshot, newline=True):
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if not self._allow_snapshot(subject, right_snapshot, newline=True):
+            return
+
+        # Each side reads its own captured reservations in one locked copy
+        # (only the requested organization's records), then the diff is
+        # computed purely from those copies; neither snapshot, the main
+        # service, nor any alert state is written, so identical submissions
+        # return byte-identical JSON.
+        left_reservations = left_snapshot.reservations_for_organization(
+            organization_id
+        )
+        right_reservations = right_snapshot.reservations_for_organization(
+            organization_id
+        )
+        result = compare_reservation_sets(left_reservations, right_reservations)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _snapshot_not_found(self) -> None:
+        self._write_json(
+            HTTPStatus.NOT_FOUND,
+            {"error": "snapshot_not_found"},
+            newline=True,
+        )
 
     # ----------------------------------------------------------------- events
 
@@ -2913,6 +3033,14 @@ class Handler(BaseHTTPRequestHandler):
         """Return True when the branch belongs to the subject's organization."""
         return self._authorize_organization(
             subject, branch.organization_id, newline=newline
+        )
+
+    def _allow_snapshot(
+        self, subject: Subject, snapshot: Snapshot, *, newline: bool = True
+    ) -> bool:
+        """Return True when the snapshot belongs to the subject's organization."""
+        return self._authorize_organization(
+            subject, snapshot.organization_id, newline=newline
         )
 
     def _unauthorized(self, *, newline: bool = True) -> None:
