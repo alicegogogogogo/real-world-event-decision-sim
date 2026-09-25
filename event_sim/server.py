@@ -1737,30 +1737,40 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
-        if snapshot is None:
-            self._write_json(
-                HTTPStatus.NOT_FOUND,
-                {"error": "snapshot_not_found"},
+        # The snapshot lookup, the ownership decision, and the duplicate-name
+        # insert are one indivisible step under the registry lock: a snapshot
+        # owned by another organization is forbidden before the branch name is
+        # ever compared, a missing snapshot is reported as not found, and a
+        # rejected request can neither create a branch nor race its way past
+        # the ownership check.
+        def fork() -> tuple[str, Branch | None]:
+            snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+                snapshot_id
             )
-            return
-        # A snapshot created by another organization is never a fork source.
-        if snapshot.organization_id != subject.organization_id:
-            self._forbidden(newline=False)
-            return
-
-        def fork() -> tuple[str, Branch]:
+            if snapshot is None:
+                return "snapshot_missing", None
+            if snapshot.organization_id != subject.organization_id:
+                return "forbidden", None
             return self.server.branches.create(  # type: ignore[attr-defined]
                 branch_id, snapshot
             )
 
         status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
-            self.token, snapshot.organization_id, fork
+            self.token, subject.organization_id, fork
         )
         if status == "forbidden":
             self._forbidden(newline=False)
             return
         create_status, branch = result
+        if create_status == "forbidden":
+            self._forbidden(newline=False)
+            return
+        if create_status == "snapshot_missing":
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "snapshot_not_found"},
+            )
+            return
         if create_status == "created":
             self._write_json(HTTPStatus.CREATED, branch.summary())
         else:
