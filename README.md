@@ -83,7 +83,8 @@ data is forbidden.
   entry points: the event list, aggregate, region, and replay (including
   replay comparison) queries, the reservation/alert listings,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
-  `POST /branches/compare`, and the other read-only branch entry points.
+  `POST /branches/compare`, `POST /branches/compare/events`, and the other
+  read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
   `read` token against a write entry point receives `403`. The authorization
@@ -766,4 +767,73 @@ curl -X POST http://127.0.0.1:8000/branches/compare \
 
 Every non-`200` result is read-only as well: a failed comparison creates no
 branch and changes no event, reservation, or decision state.
+
+### `POST /branches/compare/events`
+
+A read-only, event-level comparison of two existing branches. Each side's
+events are aligned by `eventId` and sorted into four deterministic groups;
+nothing in either branch, in any other branch, or in the main service is
+read for mutation or written, and identical submissions return
+byte-for-byte identical JSON. Both `read` and `write` credentials may call
+it. Requires `Content-Type: application/json` and a Bearer credential bound
+to the request's `organizationId`. The body must be a JSON object
+containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both branches must belong to it |
+| `left`           | required, non-empty branch name (the left-hand side)         |
+| `right`          | required, non-empty branch name (the right-hand side)        |
+
+Using the same branch name for `left` and `right` is legal; every event is
+then in `same` and the other three groups are empty. The four groups:
+
+- `leftOnly` — identifiers that appear only in the left branch.
+- `rightOnly` — identifiers that appear only in the right branch.
+- `same` — identifiers present in both branches whose events agree on
+  every field except `eventId`; `payload` is compared by content, so key
+  order inside a payload object never matters.
+- `diff` — identifiers present in both branches whose events disagree.
+  Each entry is `{"eventId", "fields"}`, where `fields` lists the names of
+  the inconsistent fields (any of `organizationId`, `type`, `occurredAt`,
+  `payload`).
+
+Every identifier group and every `fields` list is sorted in Unicode
+code-point order, and each group is paired with a count key named after
+the group plus `Count` (`leftOnlyCount`, `rightOnlyCount`, `sameCount`,
+`diffCount`). When neither branch has events, all four groups are empty
+arrays and all four counts are `0`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+counts kept as integers, and one trailing newline:
+
+```json
+{"diff":[{"eventId":"evt-2","fields":["occurredAt"]}],"diffCount":1,"leftOnly":["evt-1"],"leftOnlyCount":1,"rightOnly":["evt-4"],"rightOnlyCount":1,"same":["evt-3"],"sameCount":1}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/branches/compare/events \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"br-a","right":"br-b"}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named branches belongs to another
+  organization. The organization decision happens before branch names are
+  inspected, and branches are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "branch_not_found"}`) — either `left` or
+  `right` has never existed as a branch. Both participating branches must
+  already exist; a comparison never implicitly creates a branch.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, or a blank or non-string
+  `organizationId`/`left`/`right`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+branch and changes no event, reservation, alert, or decision state.
 

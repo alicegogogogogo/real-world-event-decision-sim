@@ -55,6 +55,8 @@ BRANCH_COMPARE_FIELDS = (
     BRANCH_COMPARE_REQUIRED_FIELDS + BRANCH_COMPARE_OPTIONAL_FIELDS
 )
 
+BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
+
 # Sentinel returned by Handler._json_request_body after it has already
 # written the 415/400 error response.
 _BODY_ERROR = object()
@@ -1422,6 +1424,83 @@ def validate_branch_compare_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /branches/compare/events.
+
+    Exactly the ``organizationId``, ``left`` and ``right`` fields may be
+    present, each a non-empty string. ``left`` and ``right`` are branch
+    names; the same name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "branch event comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(BRANCH_EVENT_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in BRANCH_EVENT_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in BRANCH_EVENT_COMPARE_FIELDS}
+
+
+def compare_branch_events(
+    left_events: list[dict[str, Any]], right_events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Diff two branches' events aligned by eventId.
+
+    Each event list is a single locked snapshot of one branch's ledger, so
+    the four groups derive from consistent reads; nothing is written.
+    Identifiers only on the left land in ``leftOnly``, only on the right in
+    ``rightOnly``. A shared identifier counts toward ``same`` when every
+    field except eventId matches (payload compared by content), and lands in
+    ``diff`` otherwise, carrying the sorted names of the differing fields.
+    Every identifier group and field list is sorted in Unicode code-point
+    order, and each group is paired with a ``<group>Count`` key.
+    """
+    left_by_id = {event["eventId"]: event for event in left_events}
+    right_by_id = {event["eventId"]: event for event in right_events}
+
+    left_only = sorted(set(left_by_id) - set(right_by_id))
+    right_only = sorted(set(right_by_id) - set(left_by_id))
+    same: list[str] = []
+    diff: list[dict[str, Any]] = []
+    for event_id in sorted(set(left_by_id) & set(right_by_id)):
+        left = left_by_id[event_id]
+        right = right_by_id[event_id]
+        fields = sorted(
+            field
+            for field in EVENT_FIELDS
+            if field != "eventId" and left[field] != right[field]
+        )
+        if fields:
+            diff.append({"eventId": event_id, "fields": fields})
+        else:
+            same.append(event_id)
+
+    return {
+        "leftOnly": left_only,
+        "leftOnlyCount": len(left_only),
+        "rightOnly": right_only,
+        "rightOnlyCount": len(right_only),
+        "same": same,
+        "sameCount": len(same),
+        "diff": diff,
+        "diffCount": len(diff),
+    }
+
+
 def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
     """Allocate whole demands to resources by deterministic rules.
 
@@ -1742,6 +1821,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/branches/compare":
             self._compare_branches()
             return
+        if path == "/branches/compare/events":
+            self._compare_branch_events()
+            return
 
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
@@ -2052,6 +2134,66 @@ class Handler(BaseHTTPRequestHandler):
             organization_id, params["type"]
         )
         result = compare_branches(left_occurred, right_occurred, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_branch_events(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_event_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict ordering
+        # as the window-level comparison: the organization decision happens
+        # before either branch name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; a missing name is reported as
+        # branch_not_found and a comparison never implicitly creates one.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side reads its own ledger in one locked snapshot, then the
+        # alignment is computed purely from those copies; nothing is
+        # written, so identical submissions return byte-identical JSON.
+        left_events = list(
+            left_branch.ledger.snapshot_for_organization(organization_id).values()
+        )
+        right_events = list(
+            right_branch.ledger.snapshot_for_organization(organization_id).values()
+        )
+        result = compare_branch_events(left_events, right_events)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     # ----------------------------------------------------------------- events
