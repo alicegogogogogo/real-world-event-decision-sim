@@ -94,6 +94,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/events/replay/decisions`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
+  `POST /branches/compare/events/replay/decisions`,
   `POST /branches/compare/reservations`,
   `POST /branches/compare/resources`, `POST /snapshots/compare`,
   `POST /snapshots/compare/events`,
@@ -1583,6 +1584,118 @@ curl -X POST http://127.0.0.1:8000/branches/compare \
 
 Every non-`200` result is read-only as well: a failed comparison creates no
 branch and changes no event, reservation, or decision state.
+
+### `POST /branches/compare/events/replay/decisions`
+
+A read-only, step-by-step aligned replay comparison of two existing
+branches. Where `POST /branches/compare` aligns the two branches' final
+window counts, this entry point replays each branch independently — one
+matching event at a time, exactly like
+`GET /branches/{branchId}/events/replay/decisions` — and aligns the two
+sides' steps by `eventId`. Nothing in either branch, in any other branch,
+or in the main service is read for mutation or written: the main-service
+event ledger, reservation inventory, and alert state are untouched, failed
+requests leave no trace, and identical submissions return byte-for-byte
+identical JSON. Both `read` and `write` credentials may call it. Requires
+`Content-Type: application/json` and a Bearer credential bound to the
+request's `organizationId`. The body must be a JSON object containing
+exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both branches must belong to it |
+| `left`           | required, non-empty branch name (the left-hand side)         |
+| `right`          | required, non-empty branch name (the right-hand side)        |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Using the same branch name for `left` and `right` is
+legal; the two sides then replay the same stream and every step is equal
+by construction.
+
+Each side accumulates only that branch's events of the caller's
+organization and the requested `type`, ordered by `occurredAt` ascending
+and then `eventId` in Unicode code-point order — the exact replay order
+and window division of the single-branch replay-decision query. The two
+sides' steps are aligned by `eventId`:
+
+- An identifier reached by both sides opens one aligned step carrying the
+  window rows and peak decision of each side's prefix accumulated through
+  that identifier.
+- An identifier reached by only one side opens its own step; the other
+  side is the missing side, so every window row of that step carries a
+  zero count for it and its decision is the empty prefix (`peakCount: 0`,
+  `peakStart: null`, `"observe"`).
+- Steps are ordered by replay key: `occurredAt` ascending (the earliest
+  occurrence for an identifier on both sides), then `eventId` in Unicode
+  code-point order. When neither side has a matching event there are no
+  steps at all.
+
+Each step reports the identifier and occurrence time, the aligned window
+rows, and both sides' peak decisions:
+
+- `windows` rows align by `start` ascending using the exact window
+  comparison contract: without `from`/`to`, the union of the two sides'
+  hit windows at that step; with `from`/`to`, every window intersecting
+  the closed interval `[from, to]`, including empty intersecting windows
+  counted as zero (events outside the range still arrive as steps but
+  count nowhere). Each row is
+  `{"start", "leftCount", "rightCount", "equal"}`, with `equal` true
+  exactly when the two counts agree; a side whose prefix has not reached
+  a window — or which is absent from the step — is counted zero.
+- `decision.left` and `decision.right` each carry `peakStart`,
+  `peakCount`, and `action`: the peak is the largest window count of that
+  side's prefix at the step, ties resolve to the earliest window start,
+  and `action` is `"escalate"` when the peak reaches `threshold` and
+  `"observe"` otherwise. `decision.equal` is true exactly when the two
+  sides' peak results agree.
+
+The `200` response echoes the organization, both branch names, type,
+window width, threshold, and the (possibly null) range, and carries the
+aligned `steps` array. It is compact JSON with keys sorted by code point,
+integer values kept as integers, booleans kept as booleans, and one
+trailing newline:
+
+```json
+{"from":null,"left":"br-a","organizationId":"org-1","right":"br-b","steps":[{"decision":{"equal":true,"left":{"action":"observe","peakCount":1,"peakStart":0},"right":{"action":"observe","peakCount":1,"peakStart":0}},"eventId":"evt-1","occurredAt":0,"windows":[{"equal":true,"leftCount":1,"rightCount":1,"start":0}]},{"decision":{"equal":false,"left":{"action":"observe","peakCount":0,"peakStart":null},"right":{"action":"observe","peakCount":1,"peakStart":60}},"eventId":"evt-2","occurredAt":60,"windows":[{"equal":false,"leftCount":0,"rightCount":1,"start":60}]}],"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/branches/compare/events/replay/decisions \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"br-a","right":"br-b","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+media type and body shape, then the organization, and only then the
+branch names (left before right).
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, a blank or non-string `organizationId`/`left`/
+  `right`/`type`, non-positive-integer `windowSize`/`threshold`, unpaired
+  or non-integer `from`/`to`, or `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to
+  a different organization, or one of the named branches belongs to
+  another organization. The organization decision happens before branch
+  names are inspected, and branches are checked in the fixed order `left`
+  then `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "branch_not_found"}`) — either `left` or
+  `right` has never existed as a branch. Both participating branches must
+  already exist; a comparison never implicitly creates a branch.
+
+Every non-`200` result is read-only as well: a failed comparison creates
+no branch and changes no event, reservation, alert, or main-service
+state.
 
 ### `POST /branches/compare/events`
 

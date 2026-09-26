@@ -55,6 +55,20 @@ BRANCH_COMPARE_FIELDS = (
     BRANCH_COMPARE_REQUIRED_FIELDS + BRANCH_COMPARE_OPTIONAL_FIELDS
 )
 
+BRANCH_REPLAY_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "type",
+    "windowSize",
+    "threshold",
+)
+BRANCH_REPLAY_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+BRANCH_REPLAY_COMPARE_FIELDS = (
+    BRANCH_REPLAY_COMPARE_REQUIRED_FIELDS
+    + BRANCH_REPLAY_COMPARE_OPTIONAL_FIELDS
+)
+
 SNAPSHOT_COMPARE_REQUIRED_FIELDS = (
     "organizationId",
     "left",
@@ -1657,6 +1671,24 @@ def validate_branch_compare_request(data: Any) -> dict[str, Any]:
     )
 
 
+def validate_branch_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /branches/compare/events/replay/decisions.
+
+    The contract is identical to the window comparison
+    (``POST /branches/compare``): required fields organizationId, left,
+    right, type, windowSize, threshold; optional fields from and to, which
+    must appear together. ``left`` and ``right`` are branch names; the same
+    name on both sides is legal. The body shape is validated before either
+    branch name is ever inspected.
+    """
+    return _validate_window_compare_request(
+        data,
+        body_kind="branch replay comparison",
+        required_fields=BRANCH_REPLAY_COMPARE_REQUIRED_FIELDS,
+        allowed_fields=BRANCH_REPLAY_COMPARE_FIELDS,
+    )
+
+
 def validate_snapshot_compare_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /snapshots/compare.
 
@@ -2001,6 +2033,148 @@ def replay_decision_steps(
             }
         )
     return steps
+
+
+def compare_branch_replays(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay two branches step by step and align the steps by eventId.
+
+    Each ``events`` list is a single locked snapshot of one branch's events
+    for one organization, sorted by ``occurredAt`` then ``eventId``. Each
+    side independently replays its own matching events through
+    :func:`replay_decision_steps` — the same replay the single-branch
+    replay-decision query runs — so a side's prefix at a step agrees item
+    by item with that query. The two sides' steps are then aligned by
+    ``eventId``:
+
+    - an identifier reached by both sides opens one aligned step carrying
+      the window rows and peak decision of each side's prefix accumulated
+      through that identifier (the same branch name on both sides replays
+      the same stream twice, so every step is equal by construction);
+    - an identifier reached by only one side opens its own step; the other
+      side is the missing side, so every window row carries a zero count
+      for it and its decision is the empty prefix (peak count zero, start
+      null, ``observe``).
+
+    Window rows align by start ascending using the exact window comparison
+    contract: without a range the union of the two sides' hit windows at
+    that step, with a range every window intersecting ``[from, to]``
+    (empty intersecting windows kept), and a side whose prefix has not
+    reached a window — or which is absent from the step altogether —
+    counted zero. Steps are ordered by replay key: ``occurredAt``
+    ascending (the earliest occurrence for an identifier on both sides),
+    then ``eventId`` in Unicode code-point order. When neither side has a
+    matching event there are no steps at all. Nothing is written, so
+    identical submissions return byte-identical JSON.
+    """
+    left_prefixes = replay_decision_steps(left_events, params)
+    right_prefixes = replay_decision_steps(right_events, params)
+    left_by_id = {step["eventId"]: step for step in left_prefixes}
+    right_by_id = {step["eventId"]: step for step in right_prefixes}
+
+    ordering: dict[str, int] = {}
+    for step in (*left_prefixes, *right_prefixes):
+        event_id = step["eventId"]
+        occurred_at = step["occurredAt"]
+        if event_id not in ordering or occurred_at < ordering[event_id]:
+            ordering[event_id] = occurred_at
+    aligned_ids = sorted(
+        set(left_by_id) | set(right_by_id),
+        key=lambda event_id: (ordering[event_id], event_id),
+    )
+
+    empty_decision = {"peakStart": None, "peakCount": 0, "action": "observe"}
+    range_starts = _branch_window_starts(params)
+
+    steps: list[dict[str, Any]] = []
+
+    def count_at(windows: list[dict[str, int]] | None, start: int) -> int:
+        # Replay rows are aggregate-style rows sorted by start ascending, so
+        # a side that has not reached this window (or which is absent from
+        # the step) carries a zero count.
+        if windows is None:
+            return 0
+        for window in windows:
+            if window["start"] == start:
+                return window["count"]
+        return 0
+
+    for event_id in aligned_ids:
+        left_step = left_by_id.get(event_id)
+        right_step = right_by_id.get(event_id)
+        left_windows = None if left_step is None else left_step["windows"]
+        right_windows = None if right_step is None else right_step["windows"]
+
+        if range_starts:
+            starts = range_starts
+        else:
+            left_starts = (
+                [] if left_windows is None else [row["start"] for row in left_windows]
+            )
+            right_starts = (
+                []
+                if right_windows is None
+                else [row["start"] for row in right_windows]
+            )
+            starts = sorted(set(left_starts) | set(right_starts))
+        windows = []
+        for start in starts:
+            left_count = count_at(left_windows, start)
+            right_count = count_at(right_windows, start)
+            windows.append(
+                {
+                    "start": start,
+                    "leftCount": left_count,
+                    "rightCount": right_count,
+                    "equal": left_count == right_count,
+                }
+            )
+
+        left_decision = (
+            dict(empty_decision)
+            if left_step is None
+            else {
+                "peakStart": left_step["peakStart"],
+                "peakCount": left_step["peakCount"],
+                "action": left_step["action"],
+            }
+        )
+        right_decision = (
+            dict(empty_decision)
+            if right_step is None
+            else {
+                "peakStart": right_step["peakStart"],
+                "peakCount": right_step["peakCount"],
+                "action": right_step["action"],
+            }
+        )
+        steps.append(
+            {
+                "eventId": event_id,
+                "occurredAt": ordering[event_id],
+                "windows": windows,
+                "decision": {
+                    "left": left_decision,
+                    "right": right_decision,
+                    "equal": left_decision == right_decision,
+                },
+            }
+        )
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "type": params["type"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "steps": steps,
+    }
 
 
 def _branch_window_counts(
@@ -2677,6 +2851,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare":
             self._compare_branches()
+            return
+        if path == "/branches/compare/events/replay/decisions":
+            self._compare_branch_replay_decisions()
             return
         if path == "/branches/compare/events":
             self._compare_branch_events()
@@ -3631,6 +3808,78 @@ class Handler(BaseHTTPRequestHandler):
             organization_id, params["type"]
         )
         result = compare_branches(left_occurred, right_occurred, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_branch_replay_decisions(self) -> None:
+        """Serve POST /branches/compare/events/replay/decisions.
+
+        Read-only, step-by-step aligned replay comparison of two existing
+        branches — the two-branch counterpart of
+        ``GET /branches/{branchId}/events/replay/decisions``, merging the
+        single-branch replay contract with the window alignment of
+        ``POST /branches/compare``. The verdict order is fixed: the
+        credential is authenticated first, then the media type and body
+        shape are validated, then the requested organization is compared
+        with the credential's, and only then are the branch names resolved
+        (left before right; missing branch, then foreign branch). Both
+        ``read`` and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped. The organization decision
+        # happens before either branch name is inspected, so a foreign
+        # organization cannot probe which branch names exist.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; the fixed left-then-right order
+        # makes the verdict deterministic, and a missing name is reported as
+        # branch_not_found without ever creating a branch.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side reads its own ledger in one locked snapshot, then both
+        # replays and the aligned merge are computed purely from those
+        # copies; neither branch, the main service ledger/inventory, nor any
+        # alert state is written, so identical submissions return
+        # byte-identical JSON.
+        left_events = left_branch.ledger.list_for_organization(organization_id)
+        right_events = right_branch.ledger.list_for_organization(organization_id)
+        result = compare_branch_replays(left_events, right_events, params)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_branch_events(self) -> None:
