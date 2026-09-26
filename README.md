@@ -84,6 +84,7 @@ data is forbidden.
   replay comparison) queries, the reservation/alert listings,
   `GET /branches/{branchId}/resources`,
   `GET /snapshots/{snapshotId}/resources`,
+  `GET /snapshots/{snapshotId}/reservations`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -650,6 +651,59 @@ values kept as integers, and one trailing newline:
 
 ```bash
 curl 'http://127.0.0.1:8000/snapshots/snap-1/resources?organizationId=org-1' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+query shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  parameter is missing, duplicated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot
+  belongs to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; a listing never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/reservations?organizationId=...`
+
+A read-only listing of one snapshot's captured reservations for the
+caller's organization — the single-snapshot counterpart of
+`POST /snapshots/compare/reservations`, computed from the exact same
+captured-reservation contract. Snapshots are immutable, so nothing in the
+snapshot, in any branch, or in the main service is read for mutation or
+written: the main-service event ledger, reservation inventory, and alert
+state are untouched, failed requests leave no trace, and identical
+requests return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. The `organizationId` query parameter must appear
+exactly once and be non-empty.
+
+The `200` response echoes the organization and snapshot identifiers and
+carries one row per reservation captured in the snapshot, sorted by
+`resourceId` then `reservationId` in Unicode code-point order. Each row
+reports exactly the five reservation fields the reservation comparison
+aligns on: `organizationId`, `reservationId`, `resourceId`, `quantity`,
+and `capacity`. Reservations of other organizations never contribute
+(they are never captured), and a snapshot with no reservations returns an
+empty `reservations` array. Because the rows share the comparison's
+contract, comparing a snapshot with itself via
+`POST /snapshots/compare/reservations` lists every reservation in `same`
+with zero diffs, item by item.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"organizationId":"org-1","reservations":[{"capacity":10,"organizationId":"org-1","quantity":3,"reservationId":"res-1","resourceId":"res-a"}],"snapshotId":"snap-1"}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/reservations?organizationId=org-1' \
   -H 'Authorization: Bearer tok-1'
 ```
 

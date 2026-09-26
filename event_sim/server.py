@@ -2222,6 +2222,28 @@ def resource_balance_rows(
     ]
 
 
+def reservation_rows(
+    reservations: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the sorted reservation rows for one snapshot's listing.
+
+    ``reservations`` is a deep copy of one snapshot's captured reservations
+    for one organization (the same mapping the reservation comparison
+    aligns on), so the rows derive from a consistent read and nothing is
+    written. Each captured reservation maps to one row carrying exactly the
+    five reservation fields (``organizationId``, ``reservationId``,
+    ``resourceId``, ``quantity``, ``capacity``); rows are sorted by
+    ``resourceId`` then ``reservationId`` in Unicode code-point order, and
+    an empty mapping yields an empty row array.
+    """
+    rows = [
+        {field: record[field] for field in RESERVATION_FIELDS}
+        for record in reservations.values()
+    ]
+    rows.sort(key=lambda row: (row["resourceId"], row["reservationId"]))
+    return rows
+
+
 def compare_branch_resources(
     left_balances: dict[str, dict[str, int]],
     right_balances: dict[str, dict[str, int]],
@@ -2288,6 +2310,15 @@ class Handler(BaseHTTPRequestHandler):
                 # snapshot), so it is routed directly; every other unknown
                 # /snapshots/... sub-path keeps the generic 404.
                 self._list_snapshot_resources(unquote(segments[0]), query)
+                return
+            if (
+                len(segments) == 2
+                and segments[0]
+                and segments[1] == "reservations"
+            ):
+                # The reservation listing shares the resource listing's
+                # verdict order, so it is routed directly too.
+                self._list_snapshot_reservations(unquote(segments[0]), query)
                 return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
@@ -2655,6 +2686,58 @@ class Handler(BaseHTTPRequestHandler):
                 "organizationId": organization_id,
                 "snapshotId": snapshot.snapshot_id,
                 "resources": resource_balance_rows(balances),
+            },
+            newline=True,
+        )
+
+    def _list_snapshot_reservations(self, snapshot_id: str, query: str) -> None:
+        """Serve GET /snapshots/{snapshotId}/reservations.
+
+        Read-only reservation listing for one immutable snapshot. The
+        verdict order is fixed: the credential is authenticated first,
+        then the query shape is validated, then the requested organization
+        is compared with the credential's, and only then is the snapshot
+        name resolved (missing snapshot, then foreign snapshot). Both
+        ``read`` and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+        # The snapshot must already exist; a listing never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured reservations to the
+        # owning organization at capture time; the rows are built from a
+        # deep copy — the same mapping the snapshot reservation comparison
+        # aligns on, so a snapshot compared with itself agrees item by
+        # item. Nothing is written, so identical requests return
+        # byte-identical JSON.
+        reservations = snapshot.reservations_snapshot()
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "snapshotId": snapshot.snapshot_id,
+                "reservations": reservation_rows(reservations),
             },
             newline=True,
         )
