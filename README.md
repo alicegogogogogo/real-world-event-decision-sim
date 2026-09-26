@@ -86,6 +86,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/resources`,
   `GET /snapshots/{snapshotId}/reservations`,
   `GET /snapshots/{snapshotId}/events`,
+  `GET /snapshots/{snapshotId}/events/aggregate`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -589,7 +590,8 @@ must be a JSON object containing exactly one field:
 
 The snapshot is owned by the caller's organization and captures only that
 organization's state. A successful response is `201` with compact integer
-JSON:
+JSON ending in one trailing newline, matching the event and reservation
+write entries:
 
 ```json
 {"events":2,"reservations":1,"resources":1,"snapshotId":"snap-1"}
@@ -775,6 +777,74 @@ shape, then the organization, and only then the snapshot name.
 
 Every non-`200` result is read-only as well: a failed request creates no
 snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/events/aggregate?organizationId=...&type=...&windowSize=...`
+
+A read-only window aggregate over one snapshot's captured events — the
+single-snapshot counterpart of `GET /events/aggregate`, applying the event
+aggregate's window discipline to the events the snapshot captured. Only
+events captured into that snapshot for the named organization and matching
+`type` are counted; other organizations' data is never captured and never
+enters the result. The query parameters follow the exact same rules as
+`GET /events/aggregate`:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Windows start at `0` with fixed width and each covers
+the half-open interval `[start, end)` where `end = start + windowSize`; the
+boundaries are identical to `GET /events/aggregate`. The `200` response
+echoes the organization, snapshot, type, width, and time range:
+
+```json
+{"from":null,"organizationId":"org-1","snapshotId":"snap-1","to":null,"type":"incident.created","windowSize":60,"windows":[{"count":2,"end":60,"start":0}]}
+```
+
+- Without `from`/`to` (`from` and `to` echo back as `null`), only windows
+  actually covered by matching captured events are returned; with no matching
+  events `windows` is `[]`.
+- With `from`/`to`, only captured events with `from <= occurredAt <= to` are
+  counted, and every window intersecting the closed interval `[from, to]` is
+  returned, including empty windows with `count: 0`.
+- `windows` is sorted by `start` ascending. The response is compact JSON with
+  keys sorted by code point, integer values kept as integers, and one
+  trailing newline; identical requests return byte-for-byte identical JSON,
+  and reads never perturb the snapshot, other reads, branches, or the main
+  service. Because the rows share the snapshot window comparison's contract,
+  comparing a snapshot with itself via `POST /snapshots/compare` reports
+  every window row with equal counts, item by item.
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/events/aggregate?organizationId=org-1&type=incident.created&windowSize=60&from=0&to=180' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the query
+shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, blank, or otherwise invalid (a non-positive-integer
+  `windowSize`, unpaired or non-integer `from`/`to`, or `from > to`).
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's organization
+  differs from the credential's, or the named snapshot belongs to another
+  organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; the query never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+Like every other entry point here, this query is read-only for both `read`
+and `write` credentials; snapshots and events live only in the server
+process and are cleared on restart.
 
 ### `POST /branches`
 

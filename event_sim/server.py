@@ -2349,6 +2349,16 @@ class Handler(BaseHTTPRequestHandler):
                 # resource and reservation listings.
                 self._list_snapshot_events(unquote(segments[0]), query)
                 return
+            if (
+                len(segments) == 3
+                and segments[0]
+                and segments[1] == "events"
+                and segments[2] == "aggregate"
+            ):
+                # The single-snapshot event aggregate shares the listing's
+                # verdict order and the main aggregate's window contract.
+                self._aggregate_snapshot_events(unquote(segments[0]), query)
+                return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "not_found", "path": self.path},
@@ -2639,6 +2649,8 @@ class Handler(BaseHTTPRequestHandler):
             capture
         )
         if create_status == "created":
+            # The creation success body ends with one trailing newline, like
+            # the other write entry points (event and reservation commits).
             self._write_json(
                 HTTPStatus.CREATED,
                 {
@@ -2647,6 +2659,7 @@ class Handler(BaseHTTPRequestHandler):
                     "resources": snapshot.capacity_count,
                     "reservations": snapshot.reservation_count,
                 },
+                newline=True,
             )
         else:
             self._write_json(
@@ -2821,6 +2834,75 @@ class Handler(BaseHTTPRequestHandler):
                 "organizationId": organization_id,
                 "snapshotId": snapshot.snapshot_id,
                 "events": event_rows(events),
+            },
+            newline=True,
+        )
+
+    def _aggregate_snapshot_events(
+        self, snapshot_id: str, query: str
+    ) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/aggregate.
+
+        Read-only window aggregate over one immutable snapshot's captured
+        events — the single-snapshot counterpart of ``GET /events/aggregate``,
+        using its exact parameter rules, window division, range semantics,
+        ordering, and response shape (plus ``snapshotId``). The verdict order
+        is fixed: the credential is authenticated first, then the query shape
+        is validated, then the requested organization is compared with the
+        credential's, and only then is the snapshot name resolved (missing
+        snapshot, then foreign snapshot). Both ``read`` and ``write``
+        credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _aggregate_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        organization_id = params["organizationId"]
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+        # The snapshot must already exist; an aggregate never implicitly
+        # creates one, and a foreign snapshot is forbidden rather than not
+        # found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        # Windows are recomputed from the snapshot's immutable captured events
+        # (already scoped to the owning organization at capture time) with the
+        # exact same helper the main aggregate and the snapshot window
+        # comparison use, so a snapshot compared with itself agrees row by
+        # row. Nothing is written, so identical requests return
+        # byte-identical JSON.
+        window_size = params["windowSize"]
+        from_value = params["from"]
+        to_value = params["to"]
+        occurred = snapshot.occurred_at_values(params["type"])
+        windows = _windows_from_occurred(
+            occurred, window_size, from_value, to_value
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "snapshotId": snapshot.snapshot_id,
+                "type": params["type"],
+                "windowSize": window_size,
+                "from": from_value,
+                "to": to_value,
+                "windows": windows,
             },
             newline=True,
         )

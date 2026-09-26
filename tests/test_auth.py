@@ -735,7 +735,7 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(view["occupied"], 2)
         self.assertEqual(view["remaining"], 3)
 
-    def test_snapshot_creation_success_body_has_no_newline(self) -> None:
+    def test_snapshot_creation_success_body_is_newline_terminated(self) -> None:
         self.register("w1", ORG1, "write")
         status, raw = self.raw(
             "/snapshots",
@@ -744,9 +744,11 @@ class AuthTest(unittest.TestCase):
             authorization="Bearer w1",
         )
         self.assertEqual(status, 201)
-        self.assertFalse(raw.endswith(b"\n"))
+        self.assertEqual(raw[-1:], b"\n")
+        self.assertEqual(raw.count(b"\n"), 1)
         self.assertEqual(
-            raw, b'{"events":0,"reservations":0,"resources":0,"snapshotId":"s1"}'
+            raw,
+            b'{"events":0,"reservations":0,"resources":0,"snapshotId":"s1"}\n',
         )
 
     def test_branch_creation_success_body_has_no_newline(self) -> None:
