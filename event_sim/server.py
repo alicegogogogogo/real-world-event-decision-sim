@@ -2198,6 +2198,34 @@ def _compare_resources(
     }
 
 
+def branch_resource_rows(
+    balances: dict[str, dict[str, int]],
+) -> list[dict[str, Any]]:
+    """Build one branch's ordered resource-balance rows.
+
+    ``balances`` is a single locked snapshot of one organization's
+    per-resource balances in one branch (see
+    :meth:`ReservationInventory.resource_balances_for_organization`). Each
+    row carries the ``resourceId`` and the three balances ``capacity``,
+    ``occupied`` and ``remaining`` in that fixed order; rows are sorted by
+    resourceId in Unicode code-point order. The rows are fresh dicts, so a
+    read-only query never shares mutable inventory state and nothing is
+    written. This is the single-branch counterpart of
+    :func:`compare_branch_resources`: the balances come from the same
+    per-organization snapshot, so comparing a branch with itself reports
+    exactly these rows on both sides with every ``equal`` marker true.
+    """
+    return [
+        {
+            "resourceId": resource_id,
+            "capacity": balances[resource_id]["capacity"],
+            "occupied": balances[resource_id]["occupied"],
+            "remaining": balances[resource_id]["remaining"],
+        }
+        for resource_id in sorted(balances)
+    ]
+
+
 def compare_branch_resources(
     left_balances: dict[str, dict[str, int]],
     right_balances: dict[str, dict[str, int]],
@@ -2261,6 +2289,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._get_branch(unquote(segments[0]), subject)
                 return
             if len(segments) >= 2 and segments[0]:
+                # The single-branch resource query fixes its verdict order as
+                # credential, parameter shape, organization, then branch; the
+                # branch is therefore looked up inside the handler rather
+                # than resolved up front like the other branch sub-paths.
+                if len(segments) == 2 and segments[1] == "resources":
+                    self._list_branch_resources(
+                        unquote(segments[0]), query, subject
+                    )
+                    return
                 branch_id = unquote(segments[0])
                 branch = self.server.branches.get(  # type: ignore[attr-defined]
                     branch_id
@@ -3661,6 +3698,56 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {"organizationId": organization_id, "reservations": views},
             newline=newline,
+        )
+
+    def _list_branch_resources(
+        self, branch_id: str, query: str, subject: Subject
+    ) -> None:
+        # Credential was established in do_GET before dispatch. Next comes
+        # the parameter shape (422), then the organization match (403), and
+        # only then the branch lookup (404): a missing or foreign
+        # organizationId is decided before the branch name can reveal
+        # anything, and a foreign org cannot distinguish a missing branch
+        # from an existing one.
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        branch = self.server.branches.get(  # type: ignore[attr-defined]
+            branch_id
+        )
+        if branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, branch, newline=True):
+            return
+
+        # Read-only: one locked snapshot of the branch inventory for this
+        # organization, then rows built purely from that copy, so repeated
+        # calls return byte-identical JSON and a concurrent branch write can
+        # never show a torn read. Nothing in the branch, the main service, or
+        # the alert store is written.
+        balances = branch.reservations.resource_balances_for_organization(
+            organization_id
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "branchId": branch.branch_id,
+                "organizationId": organization_id,
+                "resources": branch_resource_rows(balances),
+            },
+            newline=True,
         )
 
     # ------------------------------------------------------------------ wiring

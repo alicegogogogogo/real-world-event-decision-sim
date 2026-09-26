@@ -85,7 +85,8 @@ data is forbidden.
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
-  `POST /branches/compare/resources`, `POST /snapshots/compare`,
+  `POST /branches/compare/resources`,
+  `GET /branches/{branchId}/resources`, `POST /snapshots/compare`,
   `POST /snapshots/compare/events`,
   `POST /snapshots/compare/reservations`,
   `POST /snapshots/compare/resources`, and the other
@@ -667,6 +668,7 @@ validation, ordering, and window semantics:
 | POST   | `/branches/{branchId}/events`             | commit an event into the branch only      |
 | POST   | `/branches/{branchId}/decisions/evaluate` | evaluate against the branch's events only |
 | GET    | `/branches/{branchId}/reservations`       | list the branch's reservations            |
+| GET    | `/branches/{branchId}/resources`          | list the branch's resource balances        |
 | POST   | `/branches/{branchId}/reservations`       | reserve against branch balances only      |
 
 - Branch event commits honor `415`, `400`, `422`, identical-replay (`200`),
@@ -1002,6 +1004,63 @@ curl -X POST http://127.0.0.1:8000/branches/compare/resources \
 
 Every non-`200` result is read-only as well: a failed comparison creates no
 branch and changes no event, reservation, alert, or main-service state.
+
+### `GET /branches/{branchId}/resources?organizationId=...`
+
+A read-only, single-branch view of the resource balances that the two-branch
+comparison (`POST /branches/compare/resources`) aligns. It lists only the
+resources the caller's organization has reservations against inside that one
+branch; the branch contents, the main-service ledger and reservation
+inventory, other branches, and the alert store are never written, and
+repeating the same request returns byte-for-byte identical JSON. Both `read`
+and `write` credentials may call it. The request carries a Bearer credential
+bound to the `organizationId` query parameter, which must appear exactly once
+and be non-empty.
+
+Each row carries the `resourceId` and the three balances `capacity`,
+`occupied`, and `remaining`: `occupied` is the sum of the quantities of
+**every** one of the organization's reservations against the resource in the
+branch (multiple reservations against the same resource all count), and
+`remaining` is `capacity - occupied`. Rows list only resources the
+organization reserves in the branch and are sorted by `resourceId` in Unicode
+code-point order. A branch in which the organization has no reservations
+returns `"resources": []`.
+
+The `200` response echoes the organization and branch identifiers alongside
+the ordered rows. It is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"branchId":"br-1","organizationId":"org-1","resources":[{"capacity":10,"occupied":5,"remaining":5,"resourceId":"res-a"}]}
+```
+
+The balances use the exact same per-organization snapshot as
+`POST /branches/compare/resources`: comparing a branch with itself
+(`left` and `right` both naming that branch) reports, for every resource, the
+same `capacity`, `occupied`, and `remaining` as this endpoint, with every
+row's `equal` marker true. The read takes one consistent locked snapshot, so
+concurrent branch reservation writes interleaved with repeated reads can
+never produce a torn balance.
+
+```bash
+curl 'http://127.0.0.1:8000/branches/br-1/resources?organizationId=org-1' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed as credential first, then parameter shape, then
+organization, and finally the branch:
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  parameter is missing, repeated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter is well-formed
+  but names an organization other than the credential's, even when the branch
+  name does not exist anywhere; or the branch exists but belongs to another
+  organization.
+- `404 Not Found` (`{"error": "branch_not_found"}`) — only a branch name that
+  has never existed returns this; the query never implicitly creates a
+  branch.
 
 ### `POST /snapshots/compare`
 
