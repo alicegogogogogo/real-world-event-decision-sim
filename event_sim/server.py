@@ -2551,6 +2551,19 @@ class Handler(BaseHTTPRequestHandler):
                 # which resolves the branch name first.
                 self._list_branch_resources(unquote(segments[0]), query)
                 return
+            if (
+                len(segments) == 4
+                and segments[0]
+                and segments[1] == "events"
+                and segments[2] == "replay"
+                and segments[3] == "decisions"
+            ):
+                # The step-by-step replay decision shares the resource
+                # listing's verdict order (credential, then query shape,
+                # then organization, then branch), so it is routed before
+                # the generic branch block too.
+                self._replay_branch_decisions(unquote(segments[0]), query)
+                return
             subject = self._require_subject(newline=True)
             if subject is None:
                 return
@@ -3480,13 +3493,77 @@ class Handler(BaseHTTPRequestHandler):
             newline=True,
         )
 
+    def _replay_branch_decisions(self, branch_id: str, query: str) -> None:
+        """Serve GET /branches/{branchId}/events/replay/decisions.
+
+        Read-only, step-by-step replay of one branch's own events — the
+        single-branch counterpart of ``GET /events/replay/decisions``,
+        lowering the exact window and peak contract of the main
+        replay-decision query onto the events the branch holds (the
+        captured fork plus its own commits). The verdict order is fixed:
+        the credential is authenticated first, then the query shape is
+        validated, then the requested organization is compared with the
+        credential's, and only then is the branch name resolved (missing
+        branch, then foreign branch). Both ``read`` and ``write``
+        credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The branch must already exist; a replay never implicitly creates
+        # one, and a foreign branch is forbidden rather than not found.
+        branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
+        if branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, branch, newline=True):
+            return
+        # A single locked snapshot of the branch ledger's events for this
+        # organization, sorted by occurredAt then eventId — the replay
+        # order the main replay-decision query uses. Only the branch's own
+        # events are read: other organizations' data, other branches, and
+        # the main service never enter the replay. Each step recomputes
+        # the window rows and peak through the same helpers as the
+        # aggregate and decision entry points, so every step agrees item
+        # by item with what those endpoints return on the same accumulated
+        # prefix. Nothing is written, so identical requests return
+        # byte-identical JSON.
+        events = branch.ledger.list_for_organization(params["organizationId"])
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "branchId": branch.branch_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
+            },
+            newline=True,
+        )
+
     def _branch_not_found(self) -> None:
         self._write_json(
             HTTPStatus.NOT_FOUND,
             {"error": "branch_not_found"},
             newline=True,
         )
-
     def _snapshot_not_found(self) -> None:
         self._write_json(
             HTTPStatus.NOT_FOUND,
