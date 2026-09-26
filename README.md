@@ -81,7 +81,7 @@ data is forbidden.
 
 - A `read` token may call only the state-free query and decision-computation
   entry points: the event list, aggregate, region, and replay (including
-  replay comparison) queries, the reservation/alert listings,
+  replay comparison and replay decision) queries, the reservation/alert listings,
   `GET /branches/{branchId}/resources`,
   `GET /snapshots/{snapshotId}/resources`,
   `GET /snapshots/{snapshotId}/reservations`,
@@ -261,6 +261,74 @@ problem — missing, duplicated, or blank values, a non-positive-integer
 ```bash
 curl 'http://127.0.0.1:8000/events/region/aggregate?organizationId=org-1&region=north&type=incident.created&windowSize=60&from=0&to=180'
 ```
+
+### `GET /events/replay/decisions?organizationId=...&type=...&windowSize=...&threshold=...`
+
+A read-only, step-by-step decision replay over one organization's events of
+one type. The ledger is never written to or changed by a replay decision
+request, identical requests return byte-for-byte identical bodies, and both
+`read` and `write` credentials may call it. Only events matching both
+`organizationId` and `type` enter the replay; other organizations' data is
+never included.
+
+Query parameters:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `threshold`      | required exactly once, positive integer text (e.g. `3`)              |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. A missing, duplicated, blank, or invalid parameter —
+including a non-positive-integer `windowSize`/`threshold`, unpaired or
+non-integer `from`/`to`, or `from > to` — yields `422` with
+`{"error": "validation_error", ...}`.
+
+The matching events are replayed in `occurredAt` ascending order, with ties
+broken by `eventId` in Unicode code-point order, accumulating one event per
+step. Each step reports the event's `eventId` and `occurredAt`, the window
+count rows accumulated up to and including that event, and the peak decision
+at that point — both computed with the exact contract of
+`GET /events/aggregate` and `POST /decisions/evaluate` over the same
+accumulated state, so the rows and the peak match those endpoints item by
+item. Windows start at `0` and cover `[start, start + windowSize)`; without
+`from`/`to` only windows actually covered by the accumulated events are
+listed, and with a range every window intersecting the closed interval
+`[from, to]` is kept, empty ones counted as zero. The peak is the largest
+window count with ties resolving to the earliest start; `action` is
+`"escalate"` when the peak reaches `threshold` and `"observe"` otherwise,
+and an empty state has `peakCount: 0`, `peakStart: null`, and
+`action: "observe"`. An unknown organization or type replays zero events and
+returns `"steps": []`.
+
+The `200` response echoes the organization, type, window width, threshold,
+and the (possibly null) time range, and carries the steps in replay order
+(compact JSON, keys sorted by code point, integer values kept as integers,
+one trailing newline):
+
+```json
+{"from":null,"organizationId":"org-1","steps":[{"decision":{"action":"observe","peakCount":1,"peakStart":60},"eventId":"evt-1","occurredAt":100,"windows":[{"count":1,"end":120,"start":60}]}],"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/events/replay/decisions?organizationId=org-1&type=incident.created&windowSize=60&threshold=3' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the query
+shape, then the organization.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, blank, or invalid.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's organization
+  differs from the credential's; a failed request leaves no trace.
 
 ### `POST /decisions/evaluate`
 

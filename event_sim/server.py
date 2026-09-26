@@ -1011,6 +1011,58 @@ def _replay_compare_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _replay_decision_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/replay/decisions query string.
+
+    organizationId, type, windowSize and threshold are each required exactly
+    once and non-empty; windowSize and threshold must be positive integer
+    text. from and to must be both absent or both present exactly once as
+    non-negative integer text with from <= to.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size = _integer_text(_single_non_empty_text(params, "windowSize"))
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+
+    threshold = _integer_text(_single_non_empty_text(params, "threshold"))
+    if threshold is None or threshold <= 0:
+        raise EventValidationError("threshold must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "type": event_type,
+        "windowSize": window_size,
+        "threshold": threshold,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def compare_replays(
     from_events: list[dict[str, Any]], to_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1908,6 +1960,45 @@ def _windows_from_occurred(
     ]
 
 
+def replay_decision_steps(
+    events: list[dict[str, Any]], params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Replay matching events one by one, emitting cumulative steps.
+
+    ``events`` is a consistent locked snapshot of one organization's events
+    of one type, already sorted by occurredAt then eventId in Unicode
+    code-point order. Each step accumulates one more event and recomputes
+    the window rows and the peak decision with the exact contract of the
+    aggregate and decision entry points applied to that prefix, so a step's
+    ``windows`` and ``decision`` match those endpoints item by item for the
+    same state. Nothing is written.
+    """
+    window_size = params["windowSize"]
+    from_value = params["from"]
+    to_value = params["to"]
+    occurred: list[int] = []
+    steps: list[dict[str, Any]] = []
+    for event in events:
+        occurred.append(event["occurredAt"])
+        windows = _windows_from_occurred(
+            occurred, window_size, from_value, to_value
+        )
+        peak = evaluate_decision(occurred, params)
+        steps.append(
+            {
+                "eventId": event["eventId"],
+                "occurredAt": event["occurredAt"],
+                "windows": windows,
+                "decision": {
+                    "peakStart": peak["peakStart"],
+                    "peakCount": peak["peakCount"],
+                    "action": peak["action"],
+                },
+            }
+        )
+    return steps
+
+
 def _branch_window_counts(
     occurred: list[int], params: dict[str, Any]
 ) -> dict[int, int]:
@@ -2498,6 +2589,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/replay/compare":
             self._compare_replays(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/replay/decisions":
+            self._replay_decisions(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
             )
@@ -3955,6 +4052,46 @@ class Handler(BaseHTTPRequestHandler):
                 "removed": result["removed"],
                 "changed": result["changed"],
                 "unchangedCount": result["unchangedCount"],
+            },
+            newline=True,
+        )
+
+    def _replay_decisions(self, ledger: EventLedger, query: str) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # Read-only: a single locked snapshot of the organization's events,
+        # filtered to the requested type; the ledger is never mutated, so
+        # identical requests return byte-for-byte identical bodies.
+        events = [
+            event
+            for event in ledger.list_for_organization(params["organizationId"])
+            if event["type"] == params["type"]
+        ]
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
             },
             newline=True,
         )
