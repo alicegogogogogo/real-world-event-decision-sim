@@ -2275,6 +2275,21 @@ class Handler(BaseHTTPRequestHandler):
             self._list_snapshots()
             return
 
+        if path.startswith("/snapshots/"):
+            remainder = path[len("/snapshots/"):]
+            segments = remainder.split("/")
+            if (
+                len(segments) == 2
+                and segments[0]
+                and segments[1] == "resources"
+            ):
+                # The resource-balance listing has its own verdict order
+                # (credential, then query shape, then organization, then
+                # snapshot), so it is routed before the generic fall-through
+                # 404, which never resolves the snapshot name.
+                self._list_snapshot_resources(unquote(segments[0]), query)
+                return
+
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
@@ -2585,6 +2600,58 @@ class Handler(BaseHTTPRequestHandler):
                     subject.organization_id
                 )
             },
+        )
+
+    def _list_snapshot_resources(self, snapshot_id: str, query: str) -> None:
+        """Serve GET /snapshots/{snapshotId}/resources.
+
+        Read-only per-resource balance listing captured in one snapshot. The
+        verdict order is fixed: the credential is authenticated first, then
+        the query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot name
+        resolved (missing snapshot, then foreign snapshot). Both ``read`` and
+        ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+        # The snapshot must already exist; a listing never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        # The balances are recomputed from deep copies of the snapshot's own
+        # captured capacities and reservations (only the owning organization's
+        # resources are held) — the same mapping the snapshot resource
+        # comparison aligns on, so a snapshot compared with itself agrees row
+        # by row. Nothing is written, so identical requests return
+        # byte-identical JSON.
+        balances = snapshot.resource_balances()
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "snapshotId": snapshot.snapshot_id,
+                "resources": resource_balance_rows(balances),
+            },
+            newline=True,
         )
 
     # --------------------------------------------------------------- branches
