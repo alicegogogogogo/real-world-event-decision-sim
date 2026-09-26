@@ -86,6 +86,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/resources`,
   `GET /snapshots/{snapshotId}/reservations`,
   `GET /snapshots/{snapshotId}/events`,
+  `GET /snapshots/{snapshotId}/events/region`,
   `GET /snapshots/{snapshotId}/events/aggregate`,
   `GET /snapshots/{snapshotId}/events/region/aggregate`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
@@ -774,6 +775,72 @@ shape, then the organization, and only then the snapshot name.
 - `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
   organization differs from the credential's, or the named snapshot belongs
   to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; a listing never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/events/region?organizationId=...&region=...`
+
+A read-only listing of one snapshot's captured events attributed to one
+region for the caller's organization — the single-snapshot counterpart of
+`GET /events/region`, lowering the exact region attribution rule of the
+main region list onto the events the snapshot captured at its creation
+time. Snapshots are immutable, so nothing in the snapshot, in any branch,
+or in the main service is read for mutation or written: the main-service
+event ledger, reservation inventory, and alert state are untouched, failed
+requests leave no trace, and identical requests return byte-for-byte
+identical JSON. Both `read` and `write` credentials may call it.
+
+Query parameters follow the exact same rules as `GET /events/region`:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `region`         | required exactly once, non-empty string, matched verbatim            |
+
+Only the snapshot's captured events of the caller's organization
+attributed to the region are listed; region attribution follows the main
+rule (only a non-empty string payload `region` attributes an event,
+matched verbatim with no normalization), an unknown region simply matches
+zero events and is never implicitly created, and other organizations' data
+— including another organization's events under the same region name — and
+events committed after capture never enter the result.
+
+The `200` response echoes the organization, snapshot, and region
+identifiers and carries one row per matching captured event. Each row
+reports exactly the five event fields (`eventId`, `organizationId`,
+`type`, `occurredAt`, and `payload`), exactly like `GET /events`. Rows are
+sorted by `occurredAt` ascending and then `eventId` in Unicode code-point
+order; with no matching events `events` is `[]`. Because the rows share
+the region aggregate's attribution rule, the listed events are exactly the
+captured events `GET /snapshots/{snapshotId}/events/region/aggregate`
+counts for the same snapshot and region.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"events":[{"eventId":"evt-1","occurredAt":100,"organizationId":"org-1","payload":{"region":"north"},"type":"incident.created"}],"organizationId":"org-1","region":"north","snapshotId":"snap-1"}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/events/region?organizationId=org-1&region=north' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+query shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  or `region` parameter is missing, duplicated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot
+  belongs to another organization.
 - `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
   has never existed; a listing never implicitly creates a snapshot.
 
