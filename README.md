@@ -90,6 +90,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/events/region`,
   `GET /snapshots/{snapshotId}/events/aggregate`,
   `GET /snapshots/{snapshotId}/events/region/aggregate`,
+  `GET /snapshots/{snapshotId}/events/replay/decisions`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -1095,6 +1096,92 @@ shape, then the organization, and only then the snapshot name.
   to another organization.
 - `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
   has never existed; an aggregate never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/events/replay/decisions?organizationId=...&type=...&windowSize=...&threshold=...`
+
+A read-only, step-by-step recomputation of the window counts and peak
+decision over one snapshot's captured events for the caller's organization —
+the single-snapshot counterpart of `GET /events/replay/decisions`, lowering
+the exact window and peak contract of the main replay-decision query onto
+the events the snapshot captured at its creation time. Snapshots are
+immutable, so nothing in the snapshot, in any branch, or in the main service
+is read for mutation or written: the main-service event ledger, reservation
+inventory, and alert state are untouched, failed requests leave no trace,
+and identical requests return byte-for-byte identical JSON. Both `read` and
+`write` credentials may call it.
+
+Query parameters follow the exact same rules as
+`GET /events/replay/decisions`:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `threshold`      | required exactly once, positive integer text (e.g. `3`)              |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Only the snapshot's captured events matching both the
+caller's organization and `type` are replayed; other organizations' data and
+events committed after the capture never enter the result. The matching
+captured events are ordered by `occurredAt` ascending and then `eventId` in
+Unicode code-point order, and accumulated into the replay in that order.
+Each replay step reports the event's `eventId` and `occurredAt`, the
+window-count rows for every event accumulated up to and including that one,
+and the peak decision at that point. Windows start at `0` and each covers
+`[start, start + windowSize)` — boundaries identical to the main aggregate
+and replay-decision queries:
+
+- Without `from`/`to`, only windows actually covered by the accumulated
+  events appear.
+- With `from`/`to`, events outside the closed interval `[from, to]` still
+  arrive as replay steps in order, but every window intersecting the
+  interval is returned at every step, including empty windows with
+  `count: 0`, exactly like the ranged aggregate.
+- The peak is the largest window count; ties resolve to the earliest
+  start. `action` is `"escalate"` when the peak reaches `threshold` and
+  `"observe"` otherwise. With no matching events there are no steps at
+  all; a step whose accumulated prefix has no counted window carries
+  `peakCount: 0`, `peakStart: null`, and `"observe"`.
+
+At each step the window rows are exactly what
+`GET /snapshots/{snapshotId}/events/aggregate` returns on the accumulated
+prefix and the peak fields are exactly what
+`POST /snapshots/{snapshotId}/decisions/evaluate` returns on it. The `200`
+response echoes the organization, snapshot, type, window width, threshold,
+and the (possibly null) range, and carries the ordered `steps` array. It is
+compact JSON with keys sorted by code point, integer values kept as
+integers, and one trailing newline:
+
+```json
+{"from":null,"organizationId":"org-1","snapshotId":"snap-1","steps":[{"action":"observe","eventId":"evt-d","occurredAt":0,"peakCount":1,"peakStart":0,"windows":[{"count":1,"end":60,"start":0}]}],"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/events/replay/decisions?organizationId=org-1&type=incident.created&windowSize=60&threshold=3&from=0&to=180' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the query
+shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, blank, or invalid: a non-positive-integer
+  `windowSize`/`threshold`, unpaired or non-integer `from`/`to`, or
+  `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot
+  belongs to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; a replay never implicitly creates a snapshot.
 
 Every non-`200` result is read-only as well: a failed request creates no
 snapshot and changes no event, reservation, alert, or main-service state.
