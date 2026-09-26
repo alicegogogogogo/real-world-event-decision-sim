@@ -595,6 +595,24 @@ class Snapshot:
         values.sort()
         return values
 
+    def events_snapshot_for_type(self, event_type: str) -> list[dict[str, Any]]:
+        """Return copies of the captured events of one type, in replay order.
+
+        Each row carries every captured event field, sorted by
+        ``occurredAt`` ascending and then ``eventId`` in Unicode code-point
+        order — the exact order the step replay consumes events in. A
+        snapshot holds only its owning organization's events and is
+        immutable after capture, so the filtered copy needs neither a lock
+        nor an organization filter.
+        """
+        events = [
+            dict(event)
+            for event in self._events.values()
+            if event["type"] == event_type
+        ]
+        events.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
+        return events
+
     def events_snapshot_for_region(
         self, region: str
     ) -> dict[str, dict[str, Any]]:
@@ -2511,6 +2529,20 @@ class Handler(BaseHTTPRequestHandler):
                 len(segments) == 4
                 and segments[0]
                 and segments[1] == "events"
+                and segments[2] == "replay"
+                and segments[3] == "decisions"
+            ):
+                # The single-snapshot step replay shares the other
+                # snapshot-prefixed queries' verdict order (credential,
+                # query shape, organization, then snapshot ownership).
+                self._replay_snapshot_decisions(
+                    unquote(segments[0]), query
+                )
+                return
+            if (
+                len(segments) == 4
+                and segments[0]
+                and segments[1] == "events"
                 and segments[2] == "region"
                 and segments[3] == "aggregate"
             ):
@@ -3210,6 +3242,70 @@ class Handler(BaseHTTPRequestHandler):
                 "from": params["from"],
                 "to": params["to"],
                 "windows": windows,
+            },
+            newline=True,
+        )
+
+    def _replay_snapshot_decisions(self, snapshot_id: str, query: str) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/replay/decisions.
+
+        Read-only, step-by-step replay over one immutable snapshot's
+        captured events — the single-snapshot counterpart of the main
+        ``GET /events/replay/decisions``, lowering the exact replay, window,
+        and peak contract of that entry point onto the events the snapshot
+        captured at its creation time. The verdict order is fixed: the
+        credential is authenticated first, then the query shape is
+        validated, then the requested organization is compared with the
+        credential's, and only then is the snapshot name resolved (missing
+        snapshot, then foreign snapshot). Both ``read`` and ``write``
+        credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The snapshot must already exist; a replay never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time and holds no post-capture writes;
+        # replay_decision_steps narrows the ordered copy to the requested
+        # type and recomputes every step through the same helpers as the
+        # main replay, aggregate, and decision entry points. Nothing is
+        # written — neither the snapshot, nor the main-service ledger,
+        # inventory, or alert state — so identical requests return
+        # byte-identical JSON.
+        events = snapshot.events_snapshot_for_type(params["type"])
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "snapshotId": snapshot.snapshot_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
             },
             newline=True,
         )
