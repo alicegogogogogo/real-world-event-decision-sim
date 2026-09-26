@@ -155,7 +155,7 @@ class SnapshotBranchTest(unittest.TestCase):
             },
         )
 
-    def test_snapshot_response_is_compact_integer_json_without_newline(self) -> None:
+    def test_snapshot_response_is_compact_integer_json_with_newline(self) -> None:
         self.seed_main()
         status, raw, body = self.request_raw(
             "/snapshots",
@@ -164,7 +164,8 @@ class SnapshotBranchTest(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.assertEqual(body["events"], 2)
-        self.assertFalse(raw.endswith(b"\n"))
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(raw.count(b"\n"), 1)
         self.assertNotIn(b", ", raw)
         self.assertNotIn(b": ", raw)
 
