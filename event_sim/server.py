@@ -72,6 +72,8 @@ BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
 
+BRANCH_RESOURCE_COMPARE_FIELDS = ("organizationId", "left", "right")
+
 SNAPSHOT_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 SNAPSHOT_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
@@ -466,6 +468,48 @@ class ReservationInventory:
                 if resource_id in {r["resourceId"] for r in reservations.values()}
             }
         return capacities, reservations
+
+    def resource_balances_for_organization(
+        self, organization_id: str
+    ) -> dict[str, dict[str, int]]:
+        """Locked copy of one organization's per-resource balances.
+
+        Each resource the organization itself reserves maps to its
+        ``capacity``, ``occupied`` (the total quantity reserved against it by
+        that organization's records) and ``remaining`` (``capacity -
+        occupied``). The balances are recomputed from deep copies taken under
+        one lock, so a read-only comparison sees a consistent snapshot and
+        shares no mutable inventory state. Reservations of other
+        organizations never contribute.
+        """
+        with self._lock:
+            capacities = {
+                resource_id: capacity
+                for resource_id, capacity in self._capacities.items()
+                if any(
+                    record["resourceId"] == resource_id
+                    and record["organizationId"] == organization_id
+                    for record in self._reservations.values()
+                )
+            }
+            reservations = {
+                reservation_id: dict(record)
+                for reservation_id, record in self._reservations.items()
+                if record["organizationId"] == organization_id
+            }
+        balances: dict[str, dict[str, int]] = {}
+        for resource_id, capacity in capacities.items():
+            occupied = sum(
+                record["quantity"]
+                for record in reservations.values()
+                if record["resourceId"] == resource_id
+            )
+            balances[resource_id] = {
+                "capacity": capacity,
+                "occupied": occupied,
+                "remaining": capacity - occupied,
+            }
+        return balances
 
     def restore(
         self,
@@ -1621,6 +1665,37 @@ def validate_branch_reservation_compare_request(data: Any) -> dict[str, str]:
     return {field: data[field] for field in BRANCH_RESERVATION_COMPARE_FIELDS}
 
 
+def validate_branch_resource_compare_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /branches/compare/resources.
+
+    Exactly ``organizationId``, ``left`` and ``right`` may be present, each
+    a non-empty string. ``left`` and ``right`` are branch names; the same
+    name on both sides is legal.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "branch resource comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(BRANCH_RESOURCE_COMPARE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in BRANCH_RESOURCE_COMPARE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return {field: data[field] for field in BRANCH_RESOURCE_COMPARE_FIELDS}
+
+
 def validate_snapshot_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /snapshots/compare/events.
 
@@ -2056,21 +2131,20 @@ def compare_snapshot_reservations(
     return _compare_reservations(left_reservations, right_reservations)
 
 
-def compare_snapshot_resources(
+def _compare_resources(
     left_balances: dict[str, dict[str, int]],
     right_balances: dict[str, dict[str, int]],
 ) -> dict[str, Any]:
-    """Compare two snapshots' resource balances aligned by resourceId.
+    """Compare two resource-balance mappings aligned by resourceId.
 
-    Each mapping is a deep copy of one snapshot's captured per-resource
-    ``capacity``/``occupied``/``remaining`` balances (already scoped to one
-    organization at capture time), so the rows and four groups derive from
-    immutable copies and nothing is written. The union of the two sides'
-    resource ids produces one ``resources`` row each, sorted by resourceId in
-    Unicode code-point order; a resource missing on a side is treated as
-    absent and that side carries all three balances as zero. A row's
-    ``equal`` marker is true exactly when the two sides' three balances all
-    agree.
+    Each mapping is a consistent, locked or deep-copied snapshot of one side's
+    per-resource ``capacity``/``occupied``/``remaining`` balances for one
+    organization, so the rows and four groups derive from consistent reads
+    and nothing is written. The union of the two sides' resource ids
+    produces one ``resources`` row each, sorted by resourceId in Unicode
+    code-point order; a resource missing on a side is treated as absent and
+    that side carries all three balances as zero. A row's ``equal`` marker
+    is true exactly when the two sides' three balances all agree.
 
     Identifiers only on the left land in ``leftOnly``, only on the right in
     ``rightOnly``. An identifier on both sides counts toward ``same`` when
@@ -2078,7 +2152,7 @@ def compare_snapshot_resources(
     ``{"resourceId", "fields"}`` naming the mismatched balances, drawn only
     from ``capacity``, ``occupied`` and ``remaining``. Identifiers and field
     names are sorted in Unicode code-point order; each group also gets a
-    ``<group>Count`` key. When neither snapshot holds a resource, every group
+    ``<group>Count`` key. When neither side holds a resource, every group
     (and the row array) is empty and every count is zero.
     """
     zero_balances = {"capacity": 0, "occupied": 0, "remaining": 0}
@@ -2122,6 +2196,35 @@ def compare_snapshot_resources(
         "diff": diff,
         "diffCount": len(diff),
     }
+
+
+def compare_branch_resources(
+    left_balances: dict[str, dict[str, int]],
+    right_balances: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Compare two branches' resource balances aligned by resourceId.
+
+    Delegates to the shared :func:`_compare_resources`; each mapping is a
+    locked snapshot of one branch's per-resource balances for one
+    organization.
+    """
+    return _compare_resources(left_balances, right_balances)
+
+
+def compare_snapshot_resources(
+    left_balances: dict[str, dict[str, int]],
+    right_balances: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Compare two snapshots' resource balances aligned by resourceId.
+
+    Delegates to the shared :func:`_compare_resources`; each mapping is a
+    deep copy of one snapshot's captured per-resource
+    ``capacity``/``occupied``/``remaining`` balances (already scoped to one
+    organization at capture time), so the rows and four groups derive from
+    immutable copies and nothing is written. See :func:`_compare_resources`
+    for the row and group contract.
+    """
+    return _compare_resources(left_balances, right_balances)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2265,6 +2368,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/reservations":
             self._compare_branch_reservations()
+            return
+        if path == "/branches/compare/resources":
+            self._compare_branch_resources()
             return
         if path == "/snapshots/compare":
             self._compare_snapshots()
@@ -2717,6 +2823,71 @@ class Handler(BaseHTTPRequestHandler):
             right_branch.reservations.snapshot_for_organization(organization_id)
         )
         result = compare_branch_reservations(left_reservations, right_reservations)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_branch_resources(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_resource_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # Read-only and organization-scoped, with the same verdict order as
+        # the other branch comparisons: the organization decision happens
+        # before either branch name is inspected, then left before right.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; a comparison never implicitly
+        # creates a branch.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side recomputes its per-resource balances from one locked
+        # snapshot of its own inventory (only the requested organization's
+        # resources contribute), then the rows and groups are computed purely
+        # from those copies; neither branch, the main service, nor any alert
+        # state is written, so identical submissions return byte-identical
+        # JSON.
+        left_balances = left_branch.reservations.resource_balances_for_organization(
+            organization_id
+        )
+        right_balances = (
+            right_branch.reservations.resource_balances_for_organization(
+                organization_id
+            )
+        )
+        result = compare_branch_resources(left_balances, right_balances)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshots(self) -> None:

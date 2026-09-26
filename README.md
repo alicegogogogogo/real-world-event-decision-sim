@@ -84,7 +84,8 @@ data is forbidden.
   replay comparison) queries, the reservation/alert listings,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
-  `POST /branches/compare/reservations`, `POST /snapshots/compare`,
+  `POST /branches/compare/reservations`,
+  `POST /branches/compare/resources`, `POST /snapshots/compare`,
   `POST /snapshots/compare/events`,
   `POST /snapshots/compare/reservations`,
   `POST /snapshots/compare/resources`, and the other
@@ -893,6 +894,91 @@ values kept as integers, and one trailing newline:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/branches/compare/reservations \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"br-a","right":"br-b"}'
+```
+
+- `401 Unauthorized` — the Bearer credential is missing, malformed, or not
+  registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named branches belongs to another
+  organization. The organization decision happens before branch names are
+  inspected, and branches are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "branch_not_found"}`) — either `left` or
+  `right` has never existed as a branch. Both participating branches must
+  already exist; a comparison never implicitly creates a branch.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, or a blank or non-string
+  `organizationId`/`left`/`right`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+branch and changes no event, reservation, alert, or main-service state.
+
+### `POST /branches/compare/resources`
+
+A read-only, resource-balance comparison of two existing branches. Where
+`POST /branches/compare/reservations` aligns reservations by
+`reservationId`, this entry point aligns the two branches' resources by
+`resourceId` and compares each resource's three balances — `capacity`,
+`occupied`, and `remaining` — as they currently stand in the branches.
+Nothing in either branch, in any other branch, or in the main service is
+read for mutation or written, alert state is untouched, and identical
+submissions return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. Requires `Content-Type: application/json` and a
+Bearer credential bound to the request's `organizationId`. The body must be
+a JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both branches must belong to it |
+| `left`           | required, non-empty branch name (the left-hand side)         |
+| `right`          | required, non-empty branch name (the right-hand side)        |
+
+Using the same branch name for `left` and `right` is legal; the two sides
+are then the same branch and every row's `equal` marker is true.
+
+Resources are aligned by `resourceId`. The `resources` array carries one row
+per resource in the union of the two sides, sorted by `resourceId` in
+Unicode code-point order. Each row is
+`{"resourceId", "left", "right", "equal"}`, where `left` and `right` each
+hold the three balances `capacity`, `occupied`, and `remaining`. A resource
+missing on one side is treated as absent and that side's three balances are
+all `0`. `equal` is true exactly when the two sides' three balances all
+agree, and false when any one of them differs.
+
+In addition to the rows, four grouping arrays partition the resources:
+
+- `leftOnly` — identifiers that appear only in the left branch.
+- `rightOnly` — identifiers that appear only in the right branch.
+- `same` — identifiers present on both sides whose `capacity`, `occupied`,
+  and `remaining` all match.
+- `diff` — identifiers present on both sides that disagree in at least one
+  of those three balances. Each entry is `{"resourceId", "fields"}`, where
+  `fields` names the mismatched balances, drawn only from `capacity`,
+  `occupied`, and `remaining`.
+
+A resource present on only one side is never placed in `same` or `diff`; it
+appears only in `leftOnly`/`rightOnly` (its row still carries a zeroed
+opposite side). Identifiers and field names are sorted in Unicode code-point
+order. Each group array is accompanied by a count key named after the group
+plus `Count` (`leftOnlyCount`, `rightOnlyCount`, `sameCount`, `diffCount`).
+When neither branch holds any resource for the organization, the `resources`
+array and all four groups are empty and all four counts are `0`.
+
+The `200` response is compact JSON with keys sorted by code point, integer
+values kept as integers, booleans kept as booleans, and one trailing
+newline:
+
+```json
+{"diff":[{"fields":["occupied","remaining"],"resourceId":"res-2"}],"diffCount":1,"leftOnly":["res-1"],"leftOnlyCount":1,"resources":[{"equal":false,"left":{"capacity":5,"occupied":2,"remaining":3},"resourceId":"res-1","right":{"capacity":0,"occupied":0,"remaining":0}},{"equal":false,"left":{"capacity":10,"occupied":4,"remaining":6},"resourceId":"res-2","right":{"capacity":10,"occupied":7,"remaining":3}},{"equal":true,"left":{"capacity":8,"occupied":2,"remaining":6},"resourceId":"res-3","right":{"capacity":8,"occupied":2,"remaining":6}}],"rightOnly":[],"rightOnlyCount":0,"same":["res-3"],"sameCount":1}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/branches/compare/resources \
   -H 'Authorization: Bearer tok-1' \
   -H 'Content-Type: application/json' \
   -d '{"organizationId":"org-1","left":"br-a","right":"br-b"}'
