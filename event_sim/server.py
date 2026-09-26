@@ -2222,6 +2222,25 @@ def resource_balance_rows(
     ]
 
 
+def event_rows(events: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the sorted event rows for one snapshot's event listing.
+
+    ``events`` is a deep copy of one snapshot's captured events for one
+    organization (the same mapping the event comparison aligns on), so the
+    rows derive from a consistent read and nothing is written. Each captured
+    event maps to one row carrying exactly the five event fields
+    (``eventId``, ``organizationId``, ``type``, ``occurredAt``, ``payload``);
+    rows are sorted by ``occurredAt`` ascending, then ``eventId`` in Unicode
+    code-point order, and an empty mapping yields an empty row array.
+    """
+    rows = [
+        {field: event[field] for field in EVENT_FIELDS}
+        for event in events.values()
+    ]
+    rows.sort(key=lambda row: (row["occurredAt"], row["eventId"]))
+    return rows
+
+
 def reservation_rows(
     reservations: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -2300,6 +2319,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/snapshots/"):
             remainder = path[len("/snapshots/"):]
             segments = remainder.split("/")
+            if (
+                len(segments) == 2
+                and segments[0]
+                and segments[1] == "events"
+            ):
+                # The event listing has its own verdict order (credential,
+                # then query shape, then organization, then snapshot), so it
+                # is routed directly, like the resource and reservation
+                # listings below.
+                self._list_snapshot_events(unquote(segments[0]), query)
+                return
             if (
                 len(segments) == 2
                 and segments[0]
@@ -2636,6 +2666,57 @@ class Handler(BaseHTTPRequestHandler):
                     subject.organization_id
                 )
             },
+        )
+
+    def _list_snapshot_events(self, snapshot_id: str, query: str) -> None:
+        """Serve GET /snapshots/{snapshotId}/events.
+
+        Read-only event listing for one immutable snapshot. The verdict
+        order is fixed: the credential is authenticated first, then the
+        query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot name
+        resolved (missing snapshot, then foreign snapshot). Both ``read``
+        and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+        # The snapshot must already exist; a listing never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time; the rows are built from a deep copy —
+        # the same mapping the snapshot event comparison aligns on, so a
+        # snapshot compared with itself agrees item by item. Nothing is
+        # written, so identical requests return byte-identical JSON.
+        events = snapshot.events_snapshot()
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "snapshotId": snapshot.snapshot_id,
+                "events": event_rows(events),
+            },
+            newline=True,
         )
 
     def _list_snapshot_resources(self, snapshot_id: str, query: str) -> None:
