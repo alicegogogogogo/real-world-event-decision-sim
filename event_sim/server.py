@@ -1011,6 +1011,58 @@ def _replay_compare_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _replay_decision_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/replay/decisions query string.
+
+    organizationId, type, windowSize and threshold are each required
+    exactly once and non-empty; windowSize and threshold must be positive
+    integer text. from and to must be both absent or both present exactly
+    once, each a non-negative integer, with from <= to. The rules mirror
+    /events/aggregate plus a threshold parameter, expressed as query text.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size = _integer_text(_single_non_empty_text(params, "windowSize"))
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+    threshold = _integer_text(_single_non_empty_text(params, "threshold"))
+    if threshold is None or threshold <= 0:
+        raise EventValidationError("threshold must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "type": event_type,
+        "windowSize": window_size,
+        "threshold": threshold,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def compare_replays(
     from_events: list[dict[str, Any]], to_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1189,48 +1241,26 @@ def evaluate_decision(occurred: list[int], params: dict[str, Any]) -> dict[str, 
 
     ``occurred`` is a consistent snapshot (already filtered by organization
     and type). Window boundaries are left-closed/right-open and start at
-    zero. Ties on the peak count resolve to the earliest window start.
+    zero; the rows come from the same helper as the aggregate entry point
+    and the peak from the shared tie-breaking helper, so the aggregate,
+    decision, and replay-step views agree item by item on the same state.
     """
     window_size = params["windowSize"]
     threshold = params["threshold"]
     from_value = params["from"]
     to_value = params["to"]
 
-    counts: dict[int, int] = {}
-    for timestamp in occurred:
-        if from_value is not None and not (from_value <= timestamp <= to_value):
-            continue
-        start = (timestamp // window_size) * window_size
-        counts[start] = counts.get(start, 0) + 1
-
-    if from_value is None:
-        # Only windows actually covered by matching events.
-        starts = sorted(counts)
-    else:
-        # Every window intersecting the closed interval [from, to], kept
-        # (including empty ones) so the audit can reconcile the result.
-        first = (from_value // window_size) * window_size
-        last = (to_value // window_size) * window_size
-        starts = list(range(first, last + 1, window_size))
-
-    peak_start = None
-    peak_count = 0
-    for start in starts:
-        count = counts.get(start, 0)
-        if count > peak_count:
-            peak_count = count
-            peak_start = start
-
-    action = "escalate" if peak_count >= threshold else "observe"
+    windows = _windows_from_occurred(occurred, window_size, from_value, to_value)
+    peak = _peak_from_windows(windows, threshold)
     return {
         "organizationId": params["organizationId"],
         "type": params["type"],
         "windowSize": window_size,
         "from": from_value,
         "to": to_value,
-        "peakStart": peak_start,
-        "peakCount": peak_count,
-        "action": action,
+        "peakStart": peak["peakStart"],
+        "peakCount": peak["peakCount"],
+        "action": peak["action"],
     }
 
 
@@ -1908,6 +1938,71 @@ def _windows_from_occurred(
     ]
 
 
+def _peak_from_windows(
+    windows: list[dict[str, int]], threshold: int
+) -> dict[str, Any]:
+    """Pick the peak from aggregate-style window rows.
+
+    The peak is the largest count; ties resolve to the earliest start,
+    which is the first row to reach that count because window rows are
+    sorted by start ascending. With no rows (or only zero counts) the
+    peak count is zero, the start is null, and the action is ``observe``.
+    """
+    peak_start: int | None = None
+    peak_count = 0
+    for window in windows:
+        if window["count"] > peak_count:
+            peak_count = window["count"]
+            peak_start = window["start"]
+    action = "escalate" if peak_count >= threshold else "observe"
+    return {
+        "peakStart": peak_start,
+        "peakCount": peak_count,
+        "action": action,
+    }
+
+
+def replay_decision_steps(
+    events: list[dict[str, Any]], params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Replay matching events one at a time, recomputing counts and the peak.
+
+    ``events`` is a consistent locked snapshot already filtered to one
+    organization, sorted by ``occurredAt`` then ``eventId``. Events of
+    other types are skipped without opening a step; each remaining event
+    is added in replay order and the window rows and peak decision are
+    recomputed from the accumulated prefix through the same helpers as
+    the aggregate and decision entry points, so every step agrees item
+    by item with what those endpoints return on the same state.
+    """
+    window_size = params["windowSize"]
+    threshold = params["threshold"]
+    from_value = params["from"]
+    to_value = params["to"]
+
+    steps: list[dict[str, Any]] = []
+    accumulated: list[int] = []
+    for event in events:
+        if event["type"] != params["type"]:
+            continue
+        accumulated.append(event["occurredAt"])
+        windows = _windows_from_occurred(
+            accumulated, window_size, from_value, to_value
+        )
+        peak = _peak_from_windows(windows, threshold)
+        steps.append(
+            {
+                "eventId": event["eventId"],
+                "occurredAt": event["occurredAt"],
+                "windows": windows,
+                "peakStart": peak["peakStart"],
+                "peakCount": peak["peakCount"],
+                "action": peak["action"],
+            }
+        )
+    return steps
+
+
 def _branch_window_counts(
     occurred: list[int], params: dict[str, Any]
 ) -> dict[int, int]:
@@ -2498,6 +2593,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/replay/compare":
             self._compare_replays(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/replay/decisions":
+            self._replay_decisions(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
             )
@@ -3955,6 +4056,48 @@ class Handler(BaseHTTPRequestHandler):
                 "removed": result["removed"],
                 "changed": result["changed"],
                 "unchangedCount": result["unchangedCount"],
+            },
+            newline=True,
+        )
+
+    def _replay_decisions(self, ledger: EventLedger, query: str) -> None:
+        # Verdict order matches the other replay queries: the credential is
+        # checked first, then the query shape, then the organization. Both
+        # read and write credentials may call it; the read is one locked
+        # snapshot and nothing is written, so repeated calls return the
+        # same bytes and never disturb the ledger, inventory, or alerts.
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+
+        # A single locked snapshot of the organization's events, already
+        # scoped by the ledger to this organization and sorted by occurredAt
+        # then eventId; replay_decision_steps narrows to the requested type.
+        events = ledger.list_for_organization(params["organizationId"])
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
             },
             newline=True,
         )

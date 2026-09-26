@@ -81,7 +81,8 @@ data is forbidden.
 
 - A `read` token may call only the state-free query and decision-computation
   entry points: the event list, aggregate, region, and replay (including
-  replay comparison) queries, the reservation/alert listings,
+  replay comparison and replay decision) queries, the reservation/alert
+  listings,
   `GET /branches/{branchId}/resources`,
   `GET /snapshots/{snapshotId}/resources`,
   `GET /snapshots/{snapshotId}/reservations`,
@@ -261,6 +262,76 @@ problem — missing, duplicated, or blank values, a non-positive-integer
 ```bash
 curl 'http://127.0.0.1:8000/events/region/aggregate?organizationId=org-1&region=north&type=incident.created&windowSize=60&from=0&to=180'
 ```
+
+### `GET /events/replay/decisions?organizationId=...&type=...&windowSize=...&threshold=...`
+
+A read-only, step-by-step recomputation of the window counts and peak
+decision as matching events enter a replay one at a time. The ledger,
+reservation inventory, and alerts are never written; identical requests
+return byte-for-byte identical JSON. Both `read` and `write` credentials
+may call it. The query parameters are:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `threshold`      | required exactly once, positive integer text (e.g. `3`)              |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. A missing, duplicated, blank, or invalid parameter
+yields `422` with `validation_error`.
+
+Only events matching both `organizationId` and `type` are replayed; other
+organizations' data never enters the result. The matching events are
+ordered by `occurredAt` ascending and then `eventId` in Unicode code-point
+order, and accumulated into the replay in that order. Each replay step
+reports the event's `eventId` and `occurredAt`, the window-count rows for
+every event accumulated up to and including that one, and the peak decision
+at that point. Windows start at `0` and each covers
+`[start, start + windowSize)`:
+
+- Without `from`/`to`, only windows actually covered by the accumulated
+  events appear.
+- With `from`/`to`, events outside the closed interval `[from, to]` still
+  arrive as replay steps in order, but every window intersecting the
+  interval is returned at every step, including empty windows with
+  `count: 0`, exactly like the ranged aggregate.
+- The peak is the largest window count; ties resolve to the earliest
+  start. `action` is `"escalate"` when the peak reaches `threshold` and
+  `"observe"` otherwise. With no matching events there are no steps at
+  all; a step whose accumulated prefix has no counted window carries
+  `peakCount: 0`, `peakStart: null`, and `"observe"`.
+
+At each step the window rows are exactly what `GET /events/aggregate`
+returns on the accumulated prefix and the peak fields are exactly what
+`POST /decisions/evaluate` returns on it. The `200` response echoes the
+organization, type, window width, threshold, and the (possibly null)
+range, and carries the ordered `steps` array. It is compact JSON with
+keys sorted by code point, integer values kept as integers, and one
+trailing newline:
+
+```json
+{"from":null,"organizationId":"org-1","steps":[{"action":"observe","eventId":"evt-d","occurredAt":0,"peakCount":1,"peakStart":0,"windows":[{"count":1,"end":60,"start":0}]},{"action":"observe","eventId":"evt-c","occurredAt":100,"peakCount":1,"peakStart":0,"windows":[{"count":1,"end":60,"start":0},{"count":1,"end":120,"start":60}]}],"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/events/replay/decisions?organizationId=org-1&type=incident.created&windowSize=60&threshold=3&from=0&to=180' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, or blank, `windowSize`/`threshold` is not a positive integer,
+  `from`/`to` are unpaired or non-integer, or `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's. An unknown organization
+  registered to the caller computes as zero events and returns normally;
+  a failed request leaves no trace.
 
 ### `POST /decisions/evaluate`
 
