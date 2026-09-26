@@ -86,6 +86,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/resources`,
   `GET /snapshots/{snapshotId}/reservations`,
   `GET /snapshots/{snapshotId}/events`,
+  `GET /snapshots/{snapshotId}/events/region`,
   `GET /snapshots/{snapshotId}/events/aggregate`,
   `GET /snapshots/{snapshotId}/events/region/aggregate`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
@@ -771,6 +772,66 @@ shape, then the organization, and only then the snapshot name.
   content.
 - `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
   parameter is missing, duplicated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot belongs
+  to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; a listing never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/events/region?organizationId=...&region=...`
+
+A read-only listing of one snapshot's captured events attributed to one
+region for the caller's organization — the single-snapshot counterpart of
+`GET /events/region`, built from the exact same captured-event contract as
+`GET /snapshots/{snapshotId}/events/region/aggregate`. Snapshots are
+immutable, so nothing in the snapshot, in any branch, or in the main
+service is read for mutation or written: the main-service event ledger,
+reservation inventory, and alert state are untouched, failed requests
+leave no trace, and identical requests return byte-for-byte identical
+JSON. Both `read` and `write` credentials may call it. Both
+`organizationId` and `region` must appear exactly once and be non-empty;
+region text is matched verbatim with no trimming or normalization.
+
+The `200` response echoes the organization, snapshot, and region
+identifiers and carries one row per captured event attributed to the
+region. Region attribution follows the main rule: only a non-empty string
+payload `region` equal to the query's `region` attributes an event — a
+missing key, an empty string, or a non-string value means no attribution,
+and an unknown region matches zero events and is never implicitly created.
+Each row reports exactly the five event fields the event comparison
+aligns on: `eventId`, `organizationId`, `type`, `occurredAt`, and
+`payload`. Rows are sorted by `occurredAt` ascending and then `eventId` in
+Unicode code-point order, exactly like `GET /events/region`. Other
+organizations' events never contribute (they are never captured), events
+committed after capture never enter the list, and a snapshot with no
+matching events returns an empty `events` array. The rows hit the exact
+same captured event set the region aggregate counts, so this listing and
+`GET /snapshots/{snapshotId}/events/region/aggregate` reconcile event by
+event.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"events":[{"eventId":"evt-2","occurredAt":50,"organizationId":"org-1","payload":{"region":"north"},"type":"incident.created"},{"eventId":"evt-1","occurredAt":100,"organizationId":"org-1","payload":{"region":"north"},"type":"incident.updated"}],"organizationId":"org-1","region":"north","snapshotId":"snap-1"}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/events/region?organizationId=org-1&region=north' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+query shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  or `region` parameter is missing, duplicated, or blank.
 - `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
   organization differs from the credential's, or the named snapshot belongs
   to another organization.

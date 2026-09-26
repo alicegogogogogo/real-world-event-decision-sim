@@ -615,6 +615,26 @@ class Snapshot:
         values.sort()
         return values
 
+    def events_snapshot_for_region(
+        self, region: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return a deep copy of the captured events attributed to ``region``.
+
+        A snapshot holds only its owning organization's events and is
+        immutable after capture, so the filtered copy needs neither a lock
+        nor an organization filter. Region attribution follows the same
+        verbatim rule as the main ledger: only a non-empty string payload
+        ``region`` equal to ``region`` matches, and an unknown region simply
+        yields an empty mapping and is never created. The copy is the exact
+        event set the region aggregate counts over, so the listing and the
+        aggregate always reconcile, event by event.
+        """
+        return {
+            event_id: dict(event)
+            for event_id, event in self._events.items()
+            if event_region(event) == region
+        }
+
     def reservations_snapshot(self) -> dict[str, dict[str, Any]]:
         """Return a deep copy of the captured reservations, keyed by id.
 
@@ -2373,6 +2393,18 @@ class Handler(BaseHTTPRequestHandler):
                 len(segments) == 3
                 and segments[0]
                 and segments[1] == "events"
+                and segments[2] == "region"
+            ):
+                # The single-snapshot region event listing shares the same
+                # verdict order as the other snapshot-prefixed queries.
+                self._list_snapshot_events_by_region(
+                    unquote(segments[0]), query
+                )
+                return
+            if (
+                len(segments) == 3
+                and segments[0]
+                and segments[1] == "events"
                 and segments[2] == "aggregate"
             ):
                 # The single-snapshot event aggregate shares the event
@@ -2888,6 +2920,66 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "organizationId": organization_id,
                 "snapshotId": snapshot.snapshot_id,
+                "events": event_rows(events),
+            },
+            newline=True,
+        )
+
+    def _list_snapshot_events_by_region(
+        self, snapshot_id: str, query: str
+    ) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/region.
+
+        Read-only listing of one immutable snapshot's captured events
+        attributed to one region for the caller's organization — the
+        single-snapshot counterpart of ``GET /events/region``, built from the
+        exact same captured-event contract as the snapshot region aggregate.
+        The verdict order is fixed: the credential is authenticated first,
+        then the query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot name
+        resolved (missing snapshot, then foreign snapshot). Both ``read`` and
+        ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_list_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The snapshot must already exist; a listing never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time; the rows are built from a fresh deep
+        # copy filtered by the same verbatim region rule the main region
+        # listing and the snapshot region aggregate use, so this listing and
+        # the aggregate hit the exact same captured event set, item by item.
+        # Nothing is written — neither the snapshot, nor the main-service
+        # ledger, inventory, or alert state — so identical requests return
+        # byte-identical JSON.
+        events = snapshot.events_snapshot_for_region(params["region"])
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "snapshotId": snapshot.snapshot_id,
+                "region": params["region"],
                 "events": event_rows(events),
             },
             newline=True,
