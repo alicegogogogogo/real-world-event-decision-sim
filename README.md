@@ -83,6 +83,7 @@ data is forbidden.
   entry points: the event list, aggregate, region, and replay (including
   replay comparison) queries, the reservation/alert listings,
   `GET /branches/{branchId}/resources`,
+  `GET /snapshots/{snapshotId}/resources`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -614,6 +615,59 @@ organization's** snapshots; other organizations' snapshots are never visible.
 Each entry has the same shape as a creation response, and entries are sorted
 by `snapshotId` in Unicode code-point order. With no snapshots the collection
 is an empty array.
+
+### `GET /snapshots/{snapshotId}/resources?organizationId=...`
+
+A read-only listing of one snapshot's captured resource balances for the
+caller's organization — the single-snapshot counterpart of
+`POST /snapshots/compare/resources`, computed from the exact same balance
+contract. Snapshots are immutable, so nothing in the snapshot, in any branch,
+or in the main service is read for mutation or written: the main-service
+event ledger, reservation inventory, and alert state are untouched, failed
+requests leave no trace, and identical requests return byte-for-byte
+identical JSON. Both `read` and `write` credentials may call it. The
+`organizationId` query parameter must appear exactly once and be non-empty.
+
+The `200` response echoes the organization and snapshot identifiers and
+carries one row per resource the organization reserves in the snapshot,
+sorted by `resourceId` in Unicode code-point order. Each row reports the
+three balances: `capacity` (fixed by the first captured reservation naming
+the resource), `occupied` (the sum of every captured reservation the
+organization holds against the resource — multiple reservations all count),
+and `remaining` (`capacity - occupied`). Reservations of other
+organizations never contribute (they are never captured), and a snapshot
+with no resources returns an empty `resources` array. Because the balances
+share the comparison's contract, comparing a snapshot with itself via
+`POST /snapshots/compare/resources` reports every listed row as `equal`,
+item by item.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"organizationId":"org-1","resources":[{"capacity":10,"occupied":3,"remaining":7,"resourceId":"res-a"},{"capacity":4,"occupied":1,"remaining":3,"resourceId":"res-b"}],"snapshotId":"snap-1"}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/resources?organizationId=org-1' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+query shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  parameter is missing, duplicated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot
+  belongs to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; a listing never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
 
 ### `POST /branches`
 
