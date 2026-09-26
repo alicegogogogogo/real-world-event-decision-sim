@@ -595,6 +595,26 @@ class Snapshot:
         values.sort()
         return values
 
+    def occurred_at_values_for_region(
+        self, event_type: str, region: str
+    ) -> list[int]:
+        """Sorted occurredAt values of the captured events of one type in
+        one region.
+
+        Only captured events whose payload ``region`` is a non-empty string
+        equal to ``region`` (compared verbatim) contribute. A snapshot holds
+        only its owning organization's events and is immutable after capture,
+        so the filtered copy needs neither a lock nor an organization filter.
+        """
+        values = [
+            event["occurredAt"]
+            for event in self._events.values()
+            if event["type"] == event_type
+            and event_region(event) == region
+        ]
+        values.sort()
+        return values
+
     def reservations_snapshot(self) -> dict[str, dict[str, Any]]:
         """Return a deep copy of the captured reservations, keyed by id.
 
@@ -2360,6 +2380,19 @@ class Handler(BaseHTTPRequestHandler):
                 # organization, then snapshot ownership).
                 self._aggregate_snapshot_events(unquote(segments[0]), query)
                 return
+            if (
+                len(segments) == 4
+                and segments[0]
+                and segments[1] == "events"
+                and segments[2] == "region"
+                and segments[3] == "aggregate"
+            ):
+                # The single-snapshot region aggregate shares the same
+                # verdict order as the other snapshot sub-paths.
+                self._aggregate_snapshot_events_by_region(
+                    unquote(segments[0]), query
+                )
+                return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "not_found", "path": self.path},
@@ -2893,6 +2926,74 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "organizationId": params["organizationId"],
                 "snapshotId": snapshot.snapshot_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "from": params["from"],
+                "to": params["to"],
+                "windows": windows,
+            },
+            newline=True,
+        )
+
+    def _aggregate_snapshot_events_by_region(
+        self, snapshot_id: str, query: str
+    ) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/region/aggregate.
+
+        Read-only region window aggregation over one immutable snapshot's
+        captured events — the snapshot-dimension counterpart of the main
+        service's ``GET /events/region/aggregate``, with the exact window
+        division the main event aggregate uses. The verdict order is fixed:
+        the credential is authenticated first, then the query shape is
+        validated, then the requested organization is compared with the
+        credential's, and only then is the snapshot name resolved (missing
+        snapshot, then foreign snapshot). Both ``read`` and ``write``
+        credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_aggregate_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The snapshot must already exist; an aggregate never implicitly
+        # creates one, and a foreign snapshot is forbidden rather than not
+        # found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time; the window rows are recomputed from
+        # a fresh filtered copy using the same start grid the main region
+        # aggregate uses, and the region matches verbatim with no
+        # normalization. Nothing is written, so identical requests return
+        # byte-identical JSON.
+        occurred = snapshot.occurred_at_values_for_region(
+            params["type"], params["region"]
+        )
+        windows = _windows_from_occurred(
+            occurred, params["windowSize"], params["from"], params["to"]
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "snapshotId": snapshot.snapshot_id,
+                "region": params["region"],
                 "type": params["type"],
                 "windowSize": params["windowSize"],
                 "from": params["from"],

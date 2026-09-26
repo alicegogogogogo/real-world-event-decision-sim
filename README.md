@@ -87,6 +87,7 @@ data is forbidden.
   `GET /snapshots/{snapshotId}/reservations`,
   `GET /snapshots/{snapshotId}/events`,
   `GET /snapshots/{snapshotId}/events/aggregate`,
+  `GET /snapshots/{snapshotId}/events/region/aggregate`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -846,6 +847,99 @@ kept as integers, and one trailing newline:
 
 ```bash
 curl 'http://127.0.0.1:8000/snapshots/snap-1/events/aggregate?organizationId=org-1&type=incident.created&windowSize=60&from=0&to=180' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the query
+shape, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, blank, or invalid: a non-positive-integer `windowSize`,
+  unpaired or non-integer `from`/`to`, or `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named snapshot belongs
+  to another organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; an aggregate never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `GET /snapshots/{snapshotId}/events/region/aggregate?organizationId=...&region=...&type=...&windowSize=...`
+
+A read-only region window aggregate over one snapshot's captured events for
+the caller's organization — the snapshot-dimension counterpart of
+`GET /events/region/aggregate`, lowering the exact region and window
+contract of the main region aggregate onto the events the snapshot captured
+at its creation time. Snapshots are immutable, so nothing in the snapshot,
+in any branch, or in the main service is read for mutation or written: the
+main-service event ledger, reservation inventory, and alert state are
+untouched, failed requests leave no trace, and identical requests return
+byte-for-byte identical JSON. Both `read` and `write` credentials may call
+it.
+
+Query parameters follow the exact same rules as
+`GET /events/region/aggregate`:
+
+| Parameter        | Rule                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `organizationId` | required exactly once, non-empty string                              |
+| `region`         | required exactly once, non-empty string; matched verbatim            |
+| `type`           | required exactly once, non-empty string                              |
+| `windowSize`     | required exactly once, positive integer text (e.g. `60`)             |
+| `from`           | optional; non-negative integer text, exactly once if present         |
+| `to`             | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Only the snapshot's captured events matching the
+caller's organization, the `region` (a non-empty string payload `region`
+compared verbatim, never normalized), and `type` are counted; events
+without a non-empty string payload `region` never match, other
+organizations' data and events committed after capture never enter the
+result, and an unknown region simply matches zero events without being
+implicitly created.
+
+Windows start at `0` and each covers `[start, end)` with
+`end = start + windowSize`; an event belongs to a window when
+`start <= occurredAt < end` — boundaries identical to the main aggregate
+and the single-snapshot event aggregate. The `200` response echoes the
+organization, snapshot, region, type, window width and the (possibly null)
+time range:
+
+```json
+{
+  "organizationId": "org-1",
+  "snapshotId": "snap-1",
+  "region": "north",
+  "type": "incident.created",
+  "windowSize": 60,
+  "from": null,
+  "to": null,
+  "windows": [{"start": 0, "end": 60, "count": 2}]
+}
+```
+
+- Without `from`/`to` (`from` and `to` echo back as `null`), only windows
+  actually covered by matching captured events are returned; with no
+  matching events `windows` is `[]`.
+- With `from`/`to`, only captured events with `from <= occurredAt <= to`
+  count, and every window intersecting the closed interval `[from, to]` is
+  returned, including empty windows with `count: 0`.
+- `windows` is sorted by `start` ascending; results are deterministic
+  regardless of event insertion order.
+
+The response is compact JSON with keys sorted by code point, integer values
+kept as integers, and one trailing newline:
+
+```json
+{"from":null,"organizationId":"org-1","region":"north","snapshotId":"snap-1","to":null,"type":"incident.created","windowSize":60,"windows":[{"count":2,"end":60,"start":0}]}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/events/region/aggregate?organizationId=org-1&region=north&type=incident.created&windowSize=60&from=0&to=180' \
   -H 'Authorization: Bearer tok-1'
 ```
 
