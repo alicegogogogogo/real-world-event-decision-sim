@@ -98,6 +98,20 @@ RESERVATION_COMPARE_FIELDS = (
 _BODY_ERROR = object()
 
 
+class DuplicateJsonKeyError(ValueError):
+    """A JSON object carried the same key more than once."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that refuses an object with a repeated key."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
 class Subject(NamedTuple):
     """The identity bound to a registered token: one organization and role."""
 
@@ -1657,6 +1671,23 @@ def validate_branch_compare_request(data: Any) -> dict[str, Any]:
     )
 
 
+def validate_branch_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /branches/compare/replay/decisions.
+
+    The request contract is identical to ``POST /branches/compare``:
+    required fields organizationId, left, right, type, windowSize,
+    threshold; optional fields from and to, which must appear together. No
+    other fields are allowed. ``left`` and ``right`` are branch names; the
+    same name on both sides is legal.
+    """
+    return _validate_window_compare_request(
+        data,
+        body_kind="branch replay comparison",
+        required_fields=BRANCH_COMPARE_REQUIRED_FIELDS,
+        allowed_fields=BRANCH_COMPARE_FIELDS,
+    )
+
+
 def validate_snapshot_compare_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /snapshots/compare.
 
@@ -2001,6 +2032,155 @@ def replay_decision_steps(
             }
         )
     return steps
+
+
+def _aligned_replay_window_rows(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Align one replay step's window rows for the two sides.
+
+    Each ``occurred`` list holds one side's timestamps accumulated up to and
+    including the current step. The rows use the same division as the window
+    comparison: without a range they cover the union of the two sides' hit
+    windows; with a range they cover every window intersecting the closed
+    interval ``[from, to]``, intersecting empty windows kept. Rows align by
+    start ascending; a side with no event in a window reports a zero count,
+    and ``equal`` is true exactly when the two counts agree.
+    """
+    left_counts = _branch_window_counts(left_occurred, params)
+    right_counts = _branch_window_counts(right_occurred, params)
+
+    range_starts = _branch_window_starts(params)
+    if range_starts:
+        starts = range_starts
+    else:
+        starts = sorted(set(left_counts) | set(right_counts))
+
+    return [
+        {
+            "start": start,
+            "leftCount": left_counts.get(start, 0),
+            "rightCount": right_counts.get(start, 0),
+            "equal": left_counts.get(start, 0) == right_counts.get(start, 0),
+        }
+        for start in starts
+    ]
+
+
+def _aligned_replay_decision(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one replay step's paired peak decisions and equality marker."""
+    left_peak = evaluate_decision(left_occurred, params)
+    right_peak = evaluate_decision(right_occurred, params)
+    left_decision = {
+        "peakStart": left_peak["peakStart"],
+        "peakCount": left_peak["peakCount"],
+        "action": left_peak["action"],
+    }
+    right_decision = {
+        "peakStart": right_peak["peakStart"],
+        "peakCount": right_peak["peakCount"],
+        "action": right_peak["action"],
+    }
+    return {
+        "left": left_decision,
+        "right": right_decision,
+        "equal": left_decision == right_decision,
+    }
+
+
+def compare_branch_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two branches' step-by-step replay decisions by event id.
+
+    Each ``events`` list is a single locked snapshot of one branch's events
+    for the caller's organization, sorted by ``occurredAt`` then ``eventId``
+    — the replay order the single-branch replay uses. Events of other types
+    never open a step. Each side accumulates its own matching events in that
+    order, and the two replays are aligned by ``eventId``: an identifier
+    reached by both sides is one shared step on which both prefixes extend;
+    an identifier reached by only one side is its own step on which the
+    other side stays put. Aligned steps are ordered by occurred time and
+    then identifier in Unicode code-point order, exactly like one merged
+    replay; when the two sides disagree on a shared identifier's time the
+    earlier one is reported. Every step reports the event id and time, the
+    window rows of the two accumulated prefixes aligned by start (a side
+    with no event in a window counts zero), and each side's peak decision
+    plus an ``equal`` marker. When neither side holds a matching event there
+    are no steps at all; nothing is written.
+    """
+    left_stream = [event for event in left_events if event["type"] == params["type"]]
+    right_stream = [
+        event for event in right_events if event["type"] == params["type"]
+    ]
+
+    left_by_id = {event["eventId"]: event for event in left_stream}
+    right_by_id = {event["eventId"]: event for event in right_stream}
+
+    # One aligned step per identifier in the union; each side's own matching
+    # event supplies that identifier's time on that side, and a shared
+    # identifier's reported time is the earlier of the two sides' times.
+    step_times: dict[str, int] = {}
+    for event in left_stream:
+        step_times[event["eventId"]] = event["occurredAt"]
+    for event in right_stream:
+        event_id = event["eventId"]
+        if event_id in step_times:
+            step_times[event_id] = min(step_times[event_id], event["occurredAt"])
+        else:
+            step_times[event_id] = event["occurredAt"]
+
+    # Walk the aligned identifiers in step order; each side accumulates its
+    # own event when the aligned replay reaches that identifier and stays
+    # put for an identifier only the other side reaches.
+    steps: list[dict[str, Any]] = []
+    left_accumulated: list[int] = []
+    right_accumulated: list[int] = []
+    for event_id in sorted(step_times, key=lambda eid: (step_times[eid], eid)):
+        left_event = left_by_id.get(event_id)
+        right_event = right_by_id.get(event_id)
+        if left_event is not None:
+            left_accumulated.append(left_event["occurredAt"])
+        if right_event is not None:
+            right_accumulated.append(right_event["occurredAt"])
+
+        # The window rows align the two prefixes row by row, and the peak
+        # for each side is exactly what the single-branch replay step shows
+        # on that side's own accumulated prefix.
+        windows = _aligned_replay_window_rows(
+            left_accumulated, right_accumulated, params
+        )
+        decision = _aligned_replay_decision(
+            left_accumulated, right_accumulated, params
+        )
+        steps.append(
+            {
+                "eventId": event_id,
+                "occurredAt": step_times[event_id],
+                "windows": windows,
+                "decision": decision,
+            }
+        )
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "type": params["type"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "steps": steps,
+    }
 
 
 def _branch_window_counts(
@@ -2686,6 +2866,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/branches/compare/resources":
             self._compare_branch_resources()
+            return
+        if path == "/branches/compare/replay/decisions":
+            self._compare_branch_replay_decisions()
             return
         if path == "/snapshots/compare":
             self._compare_snapshots()
@@ -3820,6 +4003,79 @@ class Handler(BaseHTTPRequestHandler):
         result = compare_branch_resources(left_balances, right_balances)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
+    def _compare_branch_replay_decisions(self) -> None:
+        """Serve POST /branches/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two branches' replay decisions.
+        The verdict order matches the other branch comparisons: the
+        credential is authenticated first, then the media type and body
+        shape are validated, then the requested organization is compared
+        with the credential's, and only then are the branch names resolved
+        (left before right; a missing name is branch_not_found, a foreign
+        branch is forbidden). Both ``read`` and ``write`` credentials may
+        call it; a comparison never writes either branch, the main service,
+        inventory, or alerts and never implicitly creates a branch.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_branch_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # The organization decision happens before either branch name is
+        # inspected, so a foreign organization cannot probe branch names.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both branches must already exist; left is resolved before right so
+        # a missing left outranks any problem on the right.
+        left_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, left_branch, newline=True):
+            return
+        right_branch = self.server.branches.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, right_branch, newline=True):
+            return
+
+        # Each side reads its own ledger in one locked snapshot (the rows
+        # are already scoped to the organization and sorted by occurredAt
+        # then eventId — the single-branch replay order), then the aligned
+        # steps are recomputed purely from those copies. Nothing is written,
+        # so identical submissions return byte-identical JSON.
+        left_events = left_branch.ledger.list_for_organization(organization_id)
+        right_events = right_branch.ledger.list_for_organization(organization_id)
+        result = compare_branch_replay_decisions(
+            left_events, right_events, params
+        )
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
     def _compare_snapshots(self) -> None:
         subject = self._require_subject(newline=True)
         if subject is None:
@@ -4693,11 +4949,17 @@ class Handler(BaseHTTPRequestHandler):
             newline=newline,
         )
 
-    def _json_request_body(self, *, newline: bool = False) -> Any:
+    def _json_request_body(
+        self, *, newline: bool = False, reject_duplicate_keys: bool = False
+    ) -> Any:
         """Validate the media type and decode the request body as JSON.
 
         On failure the 415/400 response is written here and the ``_BODY_ERROR``
-        sentinel is returned; callers must return immediately.
+        sentinel is returned; callers must return immediately. A duplicated
+        JSON field is syntactically valid JSON, so when
+        ``reject_duplicate_keys`` is set (an entry point whose contract makes
+        a repeated field a validation failure) it is reported here as the 422
+        validation error rather than the 400 syntax error.
         """
         content_type = self.headers.get("Content-Type", "")
         media_type = content_type.split(";", 1)[0].strip().lower()
@@ -4715,8 +4977,29 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         raw_body = self.rfile.read(length) if length > 0 else b""
         try:
-            return json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = raw_body.decode("utf-8")
+        except UnicodeDecodeError:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_json"},
+                newline=newline,
+            )
+            return _BODY_ERROR
+        try:
+            return json.loads(
+                decoded,
+                object_pairs_hook=(
+                    _reject_duplicate_keys if reject_duplicate_keys else None
+                ),
+            )
+        except DuplicateJsonKeyError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=newline,
+            )
+            return _BODY_ERROR
+        except json.JSONDecodeError:
             self._write_json(
                 HTTPStatus.BAD_REQUEST,
                 {"error": "invalid_json"},
