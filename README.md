@@ -84,6 +84,7 @@ data is forbidden.
   replay comparison) queries, the reservation/alert listings,
   `GET /branches/{branchId}/resources`,
   `GET /snapshots/{snapshotId}/resources`,
+  `GET /snapshots/{snapshotId}/reservations`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -650,6 +651,44 @@ values kept as integers, and one trailing newline:
 
 ```bash
 curl 'http://127.0.0.1:8000/snapshots/snap-1/resources?organizationId=org-1' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+### `GET /snapshots/{snapshotId}/reservations?organizationId=...`
+
+A read-only listing of one snapshot's captured reservations for the
+caller's organization — the single-snapshot counterpart of
+`POST /snapshots/compare/reservations`, drawn from the exact same captured
+mapping the comparison aligns on. Snapshots are immutable, so nothing in
+the snapshot, in any branch, or in the main service is read for mutation
+or written: the main-service event ledger, reservation inventory, and
+alert state are untouched, failed requests leave no trace, and identical
+requests return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. The `organizationId` query parameter must appear
+exactly once and be non-empty.
+
+The `200` response echoes the organization and snapshot identifiers and
+carries one row per reservation the organization held when the snapshot
+was captured, sorted by `resourceId` then `reservationId` in Unicode
+code-point order. Each row reports the five reservation fields —
+`organizationId`, `reservationId`, `resourceId`, `quantity` and
+`capacity` — the same field names the reservation comparison uses.
+Reservations of other organizations never contribute (they are never
+captured), and a snapshot with no reservations returns an empty
+`reservations` array. Because the rows share the comparison's contract,
+comparing a snapshot with itself via
+`POST /snapshots/compare/reservations` reports every listed reservation in
+its `same` group, item by item, with zero diffs.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"organizationId":"org-1","reservations":[{"capacity":10,"organizationId":"org-1","quantity":3,"reservationId":"res-1","resourceId":"res-a"},{"capacity":4,"organizationId":"org-1","quantity":1,"reservationId":"res-2","resourceId":"res-b"}],"snapshotId":"snap-1"}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/snapshots/snap-1/reservations?organizationId=org-1' \
   -H 'Authorization: Bearer tok-1'
 ```
 
