@@ -94,7 +94,8 @@ data is forbidden.
   `POST /branches/compare/resources`, `POST /snapshots/compare`,
   `POST /snapshots/compare/events`,
   `POST /snapshots/compare/reservations`,
-  `POST /snapshots/compare/resources`, and the other
+  `POST /snapshots/compare/resources`,
+  `POST /snapshots/{snapshotId}/decisions/evaluate`, and the other
   read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
@@ -956,6 +957,105 @@ shape, then the organization, and only then the snapshot name.
   to another organization.
 - `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
   has never existed; an aggregate never implicitly creates a snapshot.
+
+Every non-`200` result is read-only as well: a failed request creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `POST /snapshots/{snapshotId}/decisions/evaluate`
+
+A read-only peak decision over one snapshot's captured events for the
+caller's organization — the single-snapshot counterpart of the two-snapshot
+window decision (`POST /snapshots/compare`), lowering the exact window and
+peak contract of `POST /decisions/evaluate` onto the events the snapshot
+captured at its creation time. Snapshots are immutable, so nothing in the
+snapshot, in any branch, or in the main service is read for mutation or
+written: the main-service event ledger, reservation inventory, and alert
+state are untouched, failed requests leave no trace, and identical requests
+return byte-for-byte identical JSON. Both `read` and `write` credentials
+may call it. Requires `Content-Type: application/json`. The body must be a
+JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string                                   |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Only the snapshot's captured events matching both the
+caller's organization and `type` are counted; other organizations' data and
+events committed after capture never enter the result.
+
+Windows start at `0` and cover `[start, start + windowSize)` — boundaries
+identical to the main decision and the snapshot window comparison. Without
+`from`/`to`, only windows actually covered by matching captured events are
+considered; with a range, captured events are filtered by the closed
+interval `from <= occurredAt <= to` and every window intersecting that
+interval is considered, including empty ones counted as zero. The `200`
+response echoes the organization, snapshot, type, window width and the
+(possibly null) time range, and adds the peak result:
+
+```json
+{
+  "organizationId": "org-1",
+  "snapshotId": "snap-1",
+  "type": "incident.created",
+  "windowSize": 60,
+  "from": null,
+  "to": null,
+  "peakStart": 60,
+  "peakCount": 2,
+  "action": "observe"
+}
+```
+
+- `peakCount` is the largest window count and `peakStart` is that window's
+  start; ties resolve to the earliest start, so results are reproducible
+  regardless of event submission order.
+- With no matching events, `peakCount` is `0`, `peakStart` is `null`, and
+  `action` is `"observe"`.
+- `action` is `"escalate"` when `peakCount >= threshold`, otherwise
+  `"observe"`.
+- Because the peak shares the window comparison's contract, comparing a
+  snapshot with itself via `POST /snapshots/compare` reports this exact
+  `peakStart`, `peakCount`, and `action` on both the `left` and `right`
+  decision sides, item by item.
+
+The response is compact JSON with keys sorted by code point, integer values
+kept as integers, and one trailing newline:
+
+```json
+{"action":"observe","from":null,"organizationId":"org-1","peakCount":2,"peakStart":60,"snapshotId":"snap-1","to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/snapshots/snap-1/decisions/evaluate \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+request body, then the organization, and only then the snapshot name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing or extra field, a blank or non-string `organizationId`/`type`,
+  booleans/floats where integers are required, non-positive
+  `windowSize`/`threshold`, unpaired or non-integer `from`/`to`, or
+  `from > to`. No snapshot is created and nothing is written.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the body's organization
+  differs from the credential's, or the named snapshot belongs to another
+  organization.
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — the snapshot name
+  has never existed; an evaluation never implicitly creates a snapshot.
 
 Every non-`200` result is read-only as well: a failed request creates no
 snapshot and changes no event, reservation, alert, or main-service state.

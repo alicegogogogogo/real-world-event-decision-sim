@@ -2544,6 +2544,27 @@ class Handler(BaseHTTPRequestHandler):
             self._compare_snapshot_resources()
             return
 
+        if path.startswith("/snapshots/"):
+            remainder = path[len("/snapshots/"):]
+            segments = remainder.split("/")
+            if (
+                len(segments) == 3
+                and segments[0]
+                and segments[1] == "decisions"
+                and segments[2] == "evaluate"
+            ):
+                # The single-snapshot decision has its own verdict order
+                # (credential, then body validation, then organization, then
+                # snapshot), so it is routed directly; every other unknown
+                # /snapshots/... sub-path keeps the generic 404.
+                self._evaluate_snapshot_decision(unquote(segments[0]))
+                return
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "not_found", "path": self.path},
+            )
+            return
+
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
@@ -3000,6 +3021,66 @@ class Handler(BaseHTTPRequestHandler):
             },
             newline=True,
         )
+
+    def _evaluate_snapshot_decision(self, snapshot_id: str) -> None:
+        """Serve POST /snapshots/{snapshotId}/decisions/evaluate.
+
+        Read-only peak decision over one immutable snapshot's captured
+        events — the single-snapshot counterpart of the two-snapshot
+        window decision (``POST /snapshots/compare``), lowering the exact
+        window and peak contract of ``POST /decisions/evaluate`` onto the
+        events the snapshot captured at its creation time. The verdict
+        order is fixed: the credential is authenticated first, then the
+        request body is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot
+        name resolved (missing snapshot, then foreign snapshot). Both
+        ``read`` and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(newline=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_decision_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+
+        # The snapshot must already exist; an evaluation never implicitly
+        # creates one, and a foreign snapshot is forbidden rather than not
+        # found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time; the peak is recomputed from a fresh
+        # filtered copy using the same window division the main decision and
+        # the snapshot window comparison use, so a snapshot compared with
+        # itself reports this exact peak on both sides. Nothing is written —
+        # neither the snapshot, nor the main-service ledger, inventory, or
+        # alert state — so identical requests return byte-identical JSON.
+        occurred = snapshot.occurred_at_values(params["type"])
+        result = evaluate_decision(occurred, params)
+        result["snapshotId"] = snapshot.snapshot_id
+        self._write_json(HTTPStatus.OK, result, newline=True)
 
     # --------------------------------------------------------------- branches
 
