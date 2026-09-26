@@ -82,6 +82,7 @@ data is forbidden.
 - A `read` token may call only the state-free query and decision-computation
   entry points: the event list, aggregate, region, and replay (including
   replay comparison) queries, the reservation/alert listings,
+  `GET /branches/{branchId}/resources`,
   `POST /decisions/evaluate`, `POST /decisions/allocate`,
   `POST /branches/compare`, `POST /branches/compare/events`,
   `POST /branches/compare/reservations`,
@@ -667,6 +668,7 @@ validation, ordering, and window semantics:
 | POST   | `/branches/{branchId}/events`             | commit an event into the branch only      |
 | POST   | `/branches/{branchId}/decisions/evaluate` | evaluate against the branch's events only |
 | GET    | `/branches/{branchId}/reservations`       | list the branch's reservations            |
+| GET    | `/branches/{branchId}/resources`          | list the branch's resource balances       |
 | POST   | `/branches/{branchId}/reservations`       | reserve against branch balances only      |
 
 - Branch event commits honor `415`, `400`, `422`, identical-replay (`200`),
@@ -693,6 +695,57 @@ validation, ordering, and window semantics:
 - The region queries (`/events/region` and `/events/region/aggregate`) are
   main-only; no branch-prefixed region paths are added.
 - `/decisions/allocate` remains a main-only, stateless endpoint.
+
+### `GET /branches/{branchId}/resources?organizationId=...`
+
+A read-only listing of one branch's current resource balances for the
+caller's organization — the single-branch counterpart of
+`POST /branches/compare/resources`, computed from the exact same balance
+contract. Nothing in the branch, in any other branch, or in the main
+service is read for mutation or written, alert state is untouched, and
+identical requests return byte-for-byte identical JSON. Both `read` and
+`write` credentials may call it. The `organizationId` query parameter
+must appear exactly once and be non-empty.
+
+The `200` response echoes the organization and branch identifiers and
+carries one row per resource the organization reserves in the branch,
+sorted by `resourceId` in Unicode code-point order. Each row reports the
+three balances: `capacity` (fixed by the first reservation naming the
+resource in the branch), `occupied` (the sum of every reservation the
+organization holds against the resource in that branch — multiple
+reservations all count), and `remaining` (`capacity - occupied`).
+Reservations of other organizations never contribute, and a branch with
+no resources returns an empty `resources` array. Because the balances
+share the comparison's contract, comparing a branch with itself via
+`POST /branches/compare/resources` reports every listed row as `equal`.
+
+The response is compact JSON with keys sorted by code point, integer
+values kept as integers, and one trailing newline:
+
+```json
+{"branchId":"br-1","organizationId":"org-1","resources":[{"capacity":10,"occupied":3,"remaining":7,"resourceId":"res-a"},{"capacity":4,"occupied":1,"remaining":3,"resourceId":"res-b"}]}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/branches/br-1/resources?organizationId=org-1' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+query shape, then the organization, and only then the branch name.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered.
+- `422 Unprocessable Entity` (`validation_error`) — the `organizationId`
+  parameter is missing, duplicated, or blank.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's, or the named branch belongs
+  to another organization.
+- `404 Not Found` (`{"error": "branch_not_found"}`) — the branch name has
+  never existed; a listing never implicitly creates a branch.
+
+Every non-`200` result is read-only as well: a failed request creates no
+branch and changes no event, reservation, alert, or main-service state.
 
 ### `POST /branches/compare`
 

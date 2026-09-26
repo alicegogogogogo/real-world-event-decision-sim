@@ -2198,6 +2198,30 @@ def _compare_resources(
     }
 
 
+def resource_balance_rows(
+    balances: dict[str, dict[str, int]],
+) -> list[dict[str, Any]]:
+    """Build the sorted resource rows for one branch's balance listing.
+
+    ``balances`` is a consistent, locked snapshot of one branch's
+    per-resource balances for one organization (the same mapping the
+    resource comparison aligns on), so the rows derive from a consistent
+    read and nothing is written. Each resource maps to one row carrying
+    its ``capacity``, ``occupied`` and ``remaining`` balances; rows are
+    sorted by resourceId in Unicode code-point order, and an empty mapping
+    yields an empty row array.
+    """
+    return [
+        {
+            "resourceId": resource_id,
+            "capacity": balances[resource_id]["capacity"],
+            "occupied": balances[resource_id]["occupied"],
+            "remaining": balances[resource_id]["remaining"],
+        }
+        for resource_id in sorted(balances)
+    ]
+
+
 def compare_branch_resources(
     left_balances: dict[str, dict[str, int]],
     right_balances: dict[str, dict[str, int]],
@@ -2254,6 +2278,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/branches/"):
             remainder = path[len("/branches/"):]
             segments = remainder.split("/")
+            if (
+                len(segments) == 2
+                and segments[0]
+                and segments[1] == "resources"
+            ):
+                # The resource-balance listing has its own verdict order
+                # (credential, then query shape, then organization, then
+                # branch), so it is routed before the generic branch block,
+                # which resolves the branch name first.
+                self._list_branch_resources(unquote(segments[0]), query)
+                return
             subject = self._require_subject(newline=True)
             if subject is None:
                 return
@@ -2627,6 +2662,59 @@ class Handler(BaseHTTPRequestHandler):
         # The branch summary success body keeps its original byte contract:
         # compact JSON with no trailing newline (the 404/403 errors do use one).
         self._write_json(HTTPStatus.OK, branch.summary())
+
+    def _list_branch_resources(self, branch_id: str, query: str) -> None:
+        """Serve GET /branches/{branchId}/resources.
+
+        Read-only per-resource balance listing for one branch. The verdict
+        order is fixed: the credential is authenticated first, then the
+        query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the branch name
+        resolved (missing branch, then foreign branch). Both ``read`` and
+        ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            organization_id = _organization_id_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+        # The branch must already exist; a listing never implicitly creates
+        # one, and a foreign branch is forbidden rather than not found.
+        branch = self.server.branches.get(branch_id)  # type: ignore[attr-defined]
+        if branch is None:
+            self._branch_not_found()
+            return
+        if not self._allow_branch(subject, branch, newline=True):
+            return
+        # The balances are recomputed from one locked snapshot of the
+        # branch's own inventory (only the requested organization's
+        # resources contribute) — the same mapping the resource comparison
+        # aligns on, so a branch compared with itself agrees row by row.
+        # Nothing is written, so identical requests return byte-identical
+        # JSON.
+        balances = branch.reservations.resource_balances_for_organization(
+            organization_id
+        )
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": organization_id,
+                "branchId": branch.branch_id,
+                "resources": resource_balance_rows(balances),
+            },
+            newline=True,
+        )
 
     def _branch_not_found(self) -> None:
         self._write_json(
