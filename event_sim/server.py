@@ -27,6 +27,17 @@ ALERT_REQUIRED_FIELDS = (
 ALERT_OPTIONAL_FIELDS = ("from", "to")
 ALERT_FIELDS = ALERT_REQUIRED_FIELDS + ALERT_OPTIONAL_FIELDS
 
+REGION_ALERT_REQUIRED_FIELDS = (
+    "organizationId",
+    "region",
+    "type",
+    "windowSize",
+    "threshold",
+    "suppressionWindow",
+)
+REGION_ALERT_OPTIONAL_FIELDS = ("from", "to")
+REGION_ALERT_FIELDS = REGION_ALERT_REQUIRED_FIELDS + REGION_ALERT_OPTIONAL_FIELDS
+
 ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
@@ -804,10 +815,18 @@ class AlertStore:
     Suppression checks and creation happen under one lock, so concurrent
     evaluations cannot create or suppress against a stale view. State lives
     only for the lifetime of this instance and is cleared on restart.
+
+    Region-dimension alerts live in a parallel namespace keyed by
+    organization, region, and type: the two alert kinds never suppress each
+    other, but both draw their identifiers from one global counter shared
+    across all organizations, regions, and types.
     """
 
     def __init__(self) -> None:
         self._alerts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._region_alerts: dict[
+            str, dict[str, dict[str, list[dict[str, Any]]]]
+        ] = {}
         self._counter = 0
         self._lock = threading.Lock()
 
@@ -849,6 +868,60 @@ class AlertStore:
     def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
         with self._lock:
             by_type = self._alerts.get(organization_id, {})
+            alerts = [dict(alert) for group in by_type.values() for alert in group]
+        # Peak start ascending, then alertId in Unicode code-point order.
+        alerts.sort(key=lambda alert: (alert["peakStart"], alert["alertId"]))
+        return alerts
+
+    def record_for_region(
+        self,
+        organization_id: str,
+        region: str,
+        event_type: str,
+        peak_start: int,
+        threshold: int,
+        suppression_window: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Raise or suppress a region-dimension alert.
+
+        Mirrors :meth:`record` with the suppression scope narrowed to one
+        organization, region, and type. Region alerts share the single
+        global identifier counter with organization-dimension alerts but
+        never suppress — and are never suppressed by — that other kind.
+        """
+        with self._lock:
+            by_region = self._region_alerts.setdefault(organization_id, {})
+            by_type = by_region.setdefault(region, {})
+            alerts = by_type.setdefault(event_type, [])
+            if alerts:
+                latest = alerts[-1]
+                if peak_start - latest["peakStart"] < suppression_window:
+                    latest["suppressedCount"] += 1
+                    return "suppress", latest
+            self._counter += 1
+            alert = {
+                "alertId": f"alert-{self._counter}",
+                "organizationId": organization_id,
+                "region": region,
+                "type": event_type,
+                "peakStart": peak_start,
+                "threshold": threshold,
+                "suppressedCount": 0,
+            }
+            alerts.append(alert)
+            return "escalate", alert
+
+    def list_for_organization_region(
+        self, organization_id: str, region: str
+    ) -> list[dict[str, Any]]:
+        """List one organization's region-dimension alerts for one region.
+
+        An unknown organization or region simply has no alerts; the region
+        is matched verbatim. Ordering matches :meth:`list_for_organization`.
+        """
+        with self._lock:
+            by_region = self._region_alerts.get(organization_id, {})
+            by_type = by_region.get(region, {})
             alerts = [dict(alert) for group in by_type.values() for alert in group]
         # Peak start ascending, then alertId in Unicode code-point order.
         alerts.sort(key=lambda alert: (alert["peakStart"], alert["alertId"]))
@@ -1385,6 +1458,70 @@ def validate_alert_request(data: Any) -> dict[str, Any]:
 
     return {
         "organizationId": data["organizationId"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "suppressionWindow": data["suppressionWindow"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
+def validate_region_alert_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /alerts/region/evaluate.
+
+    Required fields: organizationId, region, type, windowSize, threshold,
+    and suppressionWindow. Optional fields: from and to, which must appear
+    together. No other fields are allowed. The rules mirror
+    ``POST /alerts/evaluate`` with an added ``region`` field; the region is
+    matched verbatim downstream.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("region alert body must be a JSON object")
+
+    keys = set(data)
+    required = set(REGION_ALERT_REQUIRED_FIELDS)
+    allowed = set(REGION_ALERT_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "region", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold", "suppressionWindow"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "region": data["region"],
         "type": data["type"],
         "windowSize": data["windowSize"],
         "threshold": data["threshold"],
@@ -2943,6 +3080,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/alerts":
             self._list_alerts(query)
             return
+        if path == "/alerts/region":
+            self._list_region_alerts(query)
+            return
         self._write_json(
             HTTPStatus.NOT_FOUND,
             {"error": "not_found", "path": self.path},
@@ -3067,6 +3207,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/alerts/evaluate":
             self._evaluate_alert()
+            return
+        if path == "/alerts/region/evaluate":
+            self._evaluate_region_alert()
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
@@ -5122,6 +5265,138 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(
             HTTPStatus.OK,
             {"organizationId": organization_id, "alerts": entries},
+            newline=True,
+        )
+
+    def _evaluate_region_alert(self) -> None:
+        """Serve POST /alerts/region/evaluate.
+
+        The region-dimension counterpart of ``POST /alerts/evaluate``: the
+        same write-role, media-type, body, and suppression contract, with
+        the peak computed only from the organization's events whose payload
+        ``region`` is a non-empty string equal to the requested region
+        (matched verbatim). An unknown region simply matches zero events.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=True)
+            return
+
+        data = self._json_request_body(newline=True, reject_duplicate_keys=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_region_alert_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        def commit() -> dict[str, Any]:
+            # The ledger is never modified; the peak is a single locked
+            # snapshot of the matching region events. The role/org decision
+            # and the alert record share the registry lock, so a read-only
+            # credential is rejected before any record call and concurrent
+            # threshold hits cannot both open an alert.
+            occurred = self.server.ledger.occurred_at_values_for_region(  # type: ignore[attr-defined]
+                organization_id, params["type"], params["region"]
+            )
+            peak = evaluate_decision(occurred, params)
+            peak_start = peak["peakStart"]
+            peak_count = peak["peakCount"]
+
+            if peak_count < params["threshold"]:
+                action = "observe"
+                alert_id = None
+                suppressed_count = None
+            else:
+                action, alert = self.server.alerts.record_for_region(  # type: ignore[attr-defined]
+                    organization_id,
+                    params["region"],
+                    params["type"],
+                    peak_start,
+                    params["threshold"],
+                    params["suppressionWindow"],
+                )
+                alert_id = alert["alertId"]
+                suppressed_count = alert["suppressedCount"]
+
+            return {
+                "organizationId": organization_id,
+                "region": params["region"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "suppressionWindow": params["suppressionWindow"],
+                "from": params["from"],
+                "to": params["to"],
+                "peakStart": peak_start,
+                "peakCount": peak_count,
+                "action": action,
+                "alertId": alert_id,
+                "suppressedCount": suppressed_count,
+            }
+
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=True)
+            return
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _list_region_alerts(self, query: str) -> None:
+        """Serve GET /alerts/region.
+
+        Read-only region-dimension alert listing; both ``read`` and
+        ``write`` credentials may call it. The verdict order matches the
+        other query entry points: the credential is checked first, then the
+        query shape, then the organization. An unknown region returns an
+        empty alert array and is never implicitly created.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_list_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        alerts = self.server.alerts.list_for_organization_region(  # type: ignore[attr-defined]
+            params["organizationId"], params["region"]
+        )
+        entries = [
+            {
+                "type": alert["type"],
+                "peakStart": alert["peakStart"],
+                "threshold": alert["threshold"],
+                "suppressedCount": alert["suppressedCount"],
+            }
+            for alert in alerts
+        ]
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "region": params["region"],
+                "alerts": entries,
+            },
             newline=True,
         )
 
