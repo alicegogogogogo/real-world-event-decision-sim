@@ -1704,6 +1704,23 @@ def validate_snapshot_compare_request(data: Any) -> dict[str, Any]:
     )
 
 
+def validate_snapshot_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /snapshots/compare/replay/decisions.
+
+    The request contract is identical to ``POST /snapshots/compare``:
+    required fields organizationId, left, right, type, windowSize,
+    threshold; optional fields from and to, which must appear together. No
+    other fields are allowed. ``left`` and ``right`` are snapshot names; the
+    same name on both sides is legal.
+    """
+    return _validate_window_compare_request(
+        data,
+        body_kind="snapshot replay comparison",
+        required_fields=SNAPSHOT_COMPARE_REQUIRED_FIELDS,
+        allowed_fields=SNAPSHOT_COMPARE_FIELDS,
+    )
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -2094,28 +2111,29 @@ def _aligned_replay_decision(
     }
 
 
-def compare_branch_replay_decisions(
+def _aligned_replays(
     left_events: list[dict[str, Any]],
     right_events: list[dict[str, Any]],
     params: dict[str, Any],
-) -> dict[str, Any]:
-    """Align two branches' step-by-step replay decisions by event id.
+) -> list[dict[str, Any]]:
+    """Align two sides' step-by-step replay decisions by event id.
 
-    Each ``events`` list is a single locked snapshot of one branch's events
-    for the caller's organization, sorted by ``occurredAt`` then ``eventId``
-    — the replay order the single-branch replay uses. Events of other types
-    never open a step. Each side accumulates its own matching events in that
-    order, and the two replays are aligned by ``eventId``: an identifier
-    reached by both sides is one shared step on which both prefixes extend;
-    an identifier reached by only one side is its own step on which the
-    other side stays put. Aligned steps are ordered by occurred time and
-    then identifier in Unicode code-point order, exactly like one merged
-    replay; when the two sides disagree on a shared identifier's time the
-    earlier one is reported. Every step reports the event id and time, the
-    window rows of the two accumulated prefixes aligned by start (a side
-    with no event in a window counts zero), and each side's peak decision
-    plus an ``equal`` marker. When neither side holds a matching event there
-    are no steps at all; nothing is written.
+    Each ``events`` list is a single consistent read of one side's events
+    for the caller's organization, sorted by ``occurredAt`` then
+    ``eventId`` — the replay order the single-side replay uses. Events of
+    other types never open a step. Each side accumulates its own matching
+    events in that order, and the two replays are aligned by ``eventId``:
+    an identifier reached by both sides is one shared step on which both
+    prefixes extend; an identifier reached by only one side is its own step
+    on which the other side stays put. Aligned steps are ordered by
+    occurred time and then identifier in Unicode code-point order, exactly
+    like one merged replay; when the two sides disagree on a shared
+    identifier's time the earlier one is reported. Every step reports the
+    event id and time, the window rows of the two accumulated prefixes
+    aligned by start (a side with no event in a window counts zero), and
+    each side's peak decision plus an ``equal`` marker. When neither side
+    holds a matching event there are no steps at all; nothing is written.
+    Branches and snapshots both lower their events onto this shared core.
     """
     left_stream = [event for event in left_events if event["type"] == params["type"]]
     right_stream = [
@@ -2153,7 +2171,7 @@ def compare_branch_replay_decisions(
             right_accumulated.append(right_event["occurredAt"])
 
         # The window rows align the two prefixes row by row, and the peak
-        # for each side is exactly what the single-branch replay step shows
+        # for each side is exactly what the single-side replay step shows
         # on that side's own accumulated prefix.
         windows = _aligned_replay_window_rows(
             left_accumulated, right_accumulated, params
@@ -2170,6 +2188,22 @@ def compare_branch_replay_decisions(
             }
         )
 
+    return steps
+
+
+def _replay_compare_result(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the echoed comparison body from two sides' aligned replays.
+
+    Shared by the branch and snapshot two-side replay entry points, whose
+    response contracts differ only in what the named sides are: the body
+    echoes the organization, both side names, type, window width,
+    threshold, and the (possibly null) range, and carries the aligned
+    ``steps`` array.
+    """
     return {
         "organizationId": params["organizationId"],
         "left": params["left"],
@@ -2179,8 +2213,43 @@ def compare_branch_replay_decisions(
         "threshold": params["threshold"],
         "from": params["from"],
         "to": params["to"],
-        "steps": steps,
+        "steps": _aligned_replays(left_events, right_events, params),
     }
+
+
+def compare_branch_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two branches' step-by-step replay decisions by event id.
+
+    Each ``events`` list is a single locked snapshot of one branch's events
+    for the caller's organization, sorted by ``occurredAt`` then ``eventId``
+    — the replay order the single-branch replay uses. The alignment itself
+    is shared with the snapshot replay comparison; see
+    :func:`_aligned_replays` for the step, window-row, and peak contract.
+    """
+    return _replay_compare_result(left_events, right_events, params)
+
+
+def compare_snapshot_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two snapshots' captured-event replay decisions by event id.
+
+    Each ``events`` list is a deep copy of one immutable snapshot's captured
+    events for the caller's organization, sorted by ``occurredAt`` then
+    ``eventId`` — the replay order the single-snapshot replay uses. Other
+    organizations' data and events committed after a capture never enter
+    the lists. The alignment itself is shared with the branch replay
+    comparison; see :func:`_aligned_replays` for the step, window-row, and
+    peak contract. Nothing is written, so identical submissions return
+    byte-for-byte identical JSON.
+    """
+    return _replay_compare_result(left_events, right_events, params)
 
 
 def _branch_window_counts(
@@ -2881,6 +2950,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/snapshots/compare/resources":
             self._compare_snapshot_resources()
+            return
+        if path == "/snapshots/compare/replay/decisions":
+            self._compare_snapshot_replay_decisions()
             return
 
         if path.startswith("/snapshots/"):
@@ -4136,6 +4208,84 @@ class Handler(BaseHTTPRequestHandler):
         left_occurred = left_snapshot.occurred_at_values(params["type"])
         right_occurred = right_snapshot.occurred_at_values(params["type"])
         result = compare_snapshots(left_occurred, right_occurred, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_replay_decisions(self) -> None:
+        """Serve POST /snapshots/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two snapshots' captured-event
+        replay decisions. The verdict order matches the other snapshot
+        comparisons: the credential is authenticated first, then the media
+        type and body shape are validated, then the requested organization
+        is compared with the credential's, and only then are the snapshot
+        names resolved (left before right; a missing name is
+        snapshot_not_found, a foreign snapshot is forbidden). Both ``read``
+        and ``write`` credentials may call it; a comparison never writes
+        either snapshot, any branch, the main service, inventory, or
+        alerts and never implicitly creates a snapshot.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # The organization decision happens before either snapshot name is
+        # inspected, so a foreign organization cannot probe snapshot names.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; left is resolved before right
+        # so a missing left outranks any problem on the right.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's captured events were already scoped to the owning
+        # organization at capture time and are immutable afterwards; deep
+        # copies, sorted by occurredAt then eventId (the single-snapshot
+        # replay order), feed the shared alignment purely from immutable
+        # state. Other organizations' data and events committed after a
+        # capture never enter the result, and nothing is written, so
+        # identical submissions return byte-identical JSON.
+        left_events = event_rows(left_snapshot.events_snapshot())
+        right_events = event_rows(right_snapshot.events_snapshot())
+        result = compare_snapshot_replay_decisions(
+            left_events, right_events, params
+        )
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshot_events(self) -> None:

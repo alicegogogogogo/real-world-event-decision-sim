@@ -100,6 +100,7 @@ data is forbidden.
   `POST /snapshots/compare/events`,
   `POST /snapshots/compare/reservations`,
   `POST /snapshots/compare/resources`,
+  `POST /snapshots/compare/replay/decisions`,
   `POST /snapshots/{snapshotId}/decisions/evaluate`, and the other
   read-only branch entry points.
 - Committing an event or reservation, evaluating an alert, and creating a
@@ -2010,6 +2011,125 @@ curl -X POST http://127.0.0.1:8000/snapshots/compare \
   missing or extra field, a blank or non-string `organizationId`/`left`/
   `right`/`type`, non-positive-integer `windowSize`/`threshold`, unpaired or
   non-integer `from`/`to`, or `from > to`.
+
+Every non-`200` result is read-only as well: a failed comparison creates no
+snapshot and changes no event, reservation, alert, or main-service state.
+
+### `POST /snapshots/compare/replay/decisions`
+
+A read-only, step-by-step alignment of two existing snapshots' replay
+decisions. Where `POST /snapshots/compare` reports the two sides' final
+window counts once, this entry point runs each side's replay the way
+`GET /snapshots/{snapshotId}/events/replay/decisions` does — over the events
+the two snapshots captured at their own creation times — and aligns the two
+replays step by step by `eventId`. Nothing in either snapshot, in any
+branch, or in the main service is read for mutation or written: snapshots
+are immutable, the main-service event ledger, reservation inventory, and
+alert state are untouched, a failed request leaves no trace, and identical
+submissions return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. Requires `Content-Type: application/json` and a
+Bearer credential bound to the request's `organizationId`. The body must be
+a JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both snapshots must belong to it |
+| `left`           | required, non-empty snapshot name (the left-hand side)       |
+| `right`          | required, non-empty snapshot name (the right-hand side)      |
+| `type`           | required, non-empty string                                   |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Using the same snapshot name for `left` and `right` is
+legal; the two sides are then equal by construction.
+
+Each side replays only that snapshot's own captured events matching both the
+organization and `type`: other organizations' data and events committed
+outside the snapshot never enter the result. On each side the matching
+captured events are ordered by `occurredAt` ascending and then `eventId` in
+Unicode code-point order and accumulated one at a time. The two replays are
+then aligned by `eventId`:
+
+- an identifier reached by both sides is one shared step on which both
+  sides accumulate their event;
+- an identifier reached by only one side is its own step on which that
+  side accumulates its event and the other side stays at its previous
+  prefix, its missing count reported as zero;
+- the aligned steps are ordered by occurred time ascending and then
+  `eventId` in Unicode code-point order. When the two sides disagree on a
+  shared identifier's `occurredAt`, the earlier time is reported.
+- when neither side holds a matching event, `steps` is `[]`.
+
+Windows start at `0` and each covers `[start, start + windowSize)`, with
+the exact same division as every other window entry point:
+
+- Without `from`/`to`, a step's window rows cover the **union** of the
+  windows hit by the two accumulated prefixes.
+- With `from`/`to`, events outside the closed interval `[from, to]` still
+  arrive as replay steps in order, but every window intersecting the
+  interval is returned at every step, including intersecting empty windows
+  with count `0`, exactly like the ranged single-snapshot replay.
+
+Each step carries:
+
+- `eventId` and `occurredAt` identifying the aligned step;
+- `windows`, the two prefixes' window-count rows aligned by `start`
+  ascending. Each row is `{"start", "leftCount", "rightCount", "equal"}`;
+  a side with no event in a window reports `0`, and `equal` is true exactly
+  when the two counts agree;
+- `decision.left` and `decision.right`, each with `peakStart`,
+  `peakCount`, and `action`: the peak of that side's accumulated prefix is
+  the largest window count, ties resolve to the earliest start, and
+  `action` is `"escalate"` when the peak reaches `threshold` and
+  `"observe"` otherwise. A side whose prefix has no counted window carries
+  `peakStart: null`, `peakCount: 0`, and `"observe"`. `decision.equal` is
+  true exactly when the two sides' peak results agree.
+
+At each step a side's rows and peak fields are exactly what
+`GET /snapshots/{snapshotId}/events/aggregate` and
+`POST /snapshots/{snapshotId}/decisions/evaluate` return on that side's
+accumulated prefix. The `200` response echoes the organization, the two
+snapshot names, the type, window width, threshold, and the (possibly null)
+range, and carries the aligned `steps` array. It is compact JSON with keys
+sorted by code point, integer values kept as integers, booleans kept as
+booleans, and one trailing newline:
+
+```json
+{"from":null,"left":"snap-a","organizationId":"org-1","right":"snap-b","steps":[{"decision":{"equal":true,"left":{"action":"observe","peakCount":1,"peakStart":0},"right":{"action":"observe","peakCount":1,"peakStart":0}},"eventId":"evt-1","occurredAt":10,"windows":[{"equal":true,"leftCount":1,"rightCount":1,"start":0}]},{"decision":{"equal":false,"left":{"action":"escalate","peakCount":2,"peakStart":0},"right":{"action":"observe","peakCount":1,"peakStart":0}},"eventId":"evt-2","occurredAt":70,"windows":[{"equal":false,"leftCount":2,"rightCount":1,"start":0},{"equal":false,"leftCount":0,"rightCount":1,"start":60}]}],"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/snapshots/compare/replay/decisions \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"snap-a","right":"snap-b","type":"incident.created","windowSize":60,"threshold":3}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+media type and body, then the organization, and only then the snapshot
+names.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body, a
+  missing, extra, duplicated, or blank field, a blank or non-string
+  `organizationId`/`left`/`right`/`type`, a non-positive-integer
+  `windowSize`/`threshold`, unpaired or non-integer `from`/`to`, or
+  `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound to a
+  different organization, or one of the named snapshots belongs to another
+  organization. The organization decision happens before snapshot names are
+  inspected, and snapshots are checked in the fixed order `left` then
+  `right` (a missing left outranks any problem on the right).
+- `404 Not Found` (`{"error": "snapshot_not_found"}`) — either `left` or
+  `right` has never existed as a snapshot. Both participating snapshots
+  must already exist; the comparison never implicitly creates a snapshot.
 
 Every non-`200` result is read-only as well: a failed comparison creates no
 snapshot and changes no event, reservation, alert, or main-service state.
