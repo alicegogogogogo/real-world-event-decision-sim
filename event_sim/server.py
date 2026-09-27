@@ -1704,6 +1704,23 @@ def validate_snapshot_compare_request(data: Any) -> dict[str, Any]:
     )
 
 
+def validate_snapshot_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /snapshots/compare/replay/decisions.
+
+    The request contract is identical to ``POST /snapshots/compare``:
+    required fields organizationId, left, right, type, windowSize,
+    threshold; optional fields from and to, which must appear together. No
+    other fields are allowed. ``left`` and ``right`` are snapshot names; the
+    same name on both sides is legal.
+    """
+    return _validate_window_compare_request(
+        data,
+        body_kind="snapshot replay comparison",
+        required_fields=SNAPSHOT_COMPARE_REQUIRED_FIELDS,
+        allowed_fields=SNAPSHOT_COMPARE_FIELDS,
+    )
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -2303,6 +2320,23 @@ def compare_snapshots(
     return compare_branches(left_occurred, right_occurred, params)
 
 
+def compare_snapshot_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two snapshots' step-by-step replay decisions by event id.
+
+    Delegates to :func:`compare_branch_replay_decisions`; each ``events``
+    list is one immutable snapshot's captured events of the caller's
+    organization (a snapshot holds only its owning organization's events),
+    sorted by ``occurredAt`` then ``eventId`` — the replay order the
+    single-snapshot replay uses. The two replays align exactly like the
+    branch replay comparison, and nothing is written.
+    """
+    return compare_branch_replay_decisions(left_events, right_events, params)
+
+
 def _compare_events(
     left_by_id: dict[str, dict[str, Any]],
     right_by_id: dict[str, dict[str, Any]],
@@ -2881,6 +2915,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/snapshots/compare/resources":
             self._compare_snapshot_resources()
+            return
+        if path == "/snapshots/compare/replay/decisions":
+            self._compare_snapshot_replay_decisions()
             return
 
         if path.startswith("/snapshots/"):
@@ -4136,6 +4173,85 @@ class Handler(BaseHTTPRequestHandler):
         left_occurred = left_snapshot.occurred_at_values(params["type"])
         right_occurred = right_snapshot.occurred_at_values(params["type"])
         result = compare_snapshots(left_occurred, right_occurred, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_snapshot_replay_decisions(self) -> None:
+        """Serve POST /snapshots/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two snapshots' replay
+        decisions. The verdict order matches the other snapshot
+        comparisons: the credential is authenticated first, then the media
+        type and body shape are validated, then the requested organization
+        is compared with the credential's, and only then are the snapshot
+        names resolved (left before right; a missing name is
+        snapshot_not_found, a foreign snapshot is forbidden). Both
+        ``read`` and ``write`` credentials may call it; a comparison never
+        writes either snapshot, any branch, the main service, inventory,
+        or alerts and never implicitly creates a snapshot.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_snapshot_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # The organization decision happens before either snapshot name is
+        # inspected, so a foreign organization cannot probe snapshot names.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Both snapshots must already exist; left is resolved before right
+        # so a missing left outranks any problem on the right, and a foreign
+        # snapshot is forbidden before the other name is even looked up.
+        left_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["left"]
+        )
+        if left_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if left_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+        right_snapshot = self.server.snapshots.get(  # type: ignore[attr-defined]
+            params["right"]
+        )
+        if right_snapshot is None:
+            self._snapshot_not_found()
+            return
+        if right_snapshot.organization_id != organization_id:
+            self._forbidden(newline=True)
+            return
+
+        # Each side's events were already scoped to the owning organization
+        # at capture time; the deep copies are sorted by occurredAt then
+        # eventId — the single-snapshot replay order — and the aligned steps
+        # are recomputed purely from those copies through the same helper as
+        # the branch replay comparison. Snapshots are immutable and events
+        # committed after a capture never enter, so identical submissions
+        # return byte-identical JSON and nothing is written.
+        left_events = event_rows(left_snapshot.events_snapshot())
+        right_events = event_rows(right_snapshot.events_snapshot())
+        result = compare_snapshot_replay_decisions(
+            left_events, right_events, params
+        )
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshot_events(self) -> None:
