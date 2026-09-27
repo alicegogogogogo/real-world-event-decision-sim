@@ -84,6 +84,7 @@ data is forbidden.
   replay comparison and replay decision) queries, the reservation/alert
   listings (including the region alert listing),
   `GET /events/region/replay/decisions`,
+  `GET /alerts/replay/decisions`,
   `GET /alerts/region/replay/decisions`,
   `GET /branches/{branchId}/resources`,
   `GET /branches/{branchId}/events/replay/decisions`,
@@ -786,6 +787,106 @@ curl 'http://127.0.0.1:8000/alerts/region?organizationId=org-1&region=north' \
   content.
 - `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's organization
   differs from the credential's.
+
+### `GET /alerts/replay/decisions?organizationId=...&type=...&windowSize=...&threshold=...&suppressionWindow=...`
+
+A read-only, step-by-step organization **alert** replay: the
+alert-suppression counterpart of `GET /events/replay/decisions` and the
+non-region counterpart of `GET /alerts/region/replay/decisions`. Matching
+events enter the replay one at a time in the same order and with the same
+window and peak contract as every other replay (including the region alert
+replay — parallel identifiers arrive in identical step order), and each
+step additionally reports the action and alert identity that the
+organization alert suppression rule would produce at that point. The
+replay is purely simulated: the alert store is neither read nor written,
+the event ledger and reservation inventory are never modified, and
+identical requests return byte-for-byte identical JSON. Both `read` and
+`write` credentials may call it. The query parameters are:
+
+| Parameter           | Rule                                                                 |
+| ------------------- | -------------------------------------------------------------------- |
+| `organizationId`    | required exactly once, non-empty string                              |
+| `type`              | required exactly once, non-empty string                              |
+| `windowSize`        | required exactly once, positive integer text (e.g. `60`)             |
+| `threshold`         | required exactly once, positive integer text (e.g. `3`)              |
+| `suppressionWindow` | required exactly once, positive integer text (e.g. `120`)            |
+| `from`              | optional; non-negative integer text, exactly once if present         |
+| `to`                | optional; non-negative integer text, exactly once if present         |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. A missing, duplicated, blank, or invalid parameter
+yields `422` with `validation_error`.
+
+Only events matching the organization and type are replayed; other
+organizations' data never enters the result, and an unknown organization
+computes as zero events. The matching events are ordered by `occurredAt`
+ascending and then `eventId` in Unicode code-point order, and accumulated
+into the replay in that order. Windows start at `0` and each covers
+`[start, start + windowSize)`, using boundaries identical to the
+aggregate and the other replays:
+
+- Without `from`/`to`, only windows actually covered by the accumulated
+  events appear.
+- With `from`/`to`, events outside the closed interval `[from, to]` still
+  arrive as replay steps in order, but every window intersecting the
+  interval is returned at every step, including empty windows with
+  `count: 0`, exactly like the ranged replay.
+- The peak is the largest window count; ties resolve to the earliest
+  start. A step below the threshold is `"observe"` with `alertId` and
+  `suppressedCount` both `null`; a step whose accumulated prefix has no
+  counted window carries `peakCount: 0`, `peakStart: null`, and
+  `"observe"`.
+
+Only when the peak reaches `threshold` does the suppression rule run, and
+it compares against the most recent alert produced **earlier in the same
+replay** for the organization and type:
+
+- The first threshold hit, or a peak at least `suppressionWindow` after
+  the prior simulated alert's peak start
+  (`peakStart - priorStart >= suppressionWindow`), opens a new simulated
+  alert: `action` is `"escalate"`, `alertId` is its id, and
+  `suppressedCount` is `0`.
+- A peak less than `suppressionWindow` after the prior simulated alert's
+  peak start is `"suppress"`: `alertId` is the prior alert's id and
+  `suppressedCount` is the new cumulative number of suppressed threshold
+  hits against that alert within the replay.
+
+The simulation keeps its own one-based identifier sequence
+(`alert-1`, `alert-2`, …) for the alerts that occur across the replay
+steps; it is deliberately independent of committed alerts, never advances
+the service-wide alert counter, and resets on every call, which is what
+makes repeated calls byte-for-byte identical. With no matching events
+there are no steps at all.
+
+The `200` response echoes the organization, type, window width,
+threshold, suppression window, and the (possibly null) range, and carries
+the ordered `steps` array. Each step has `eventId`, `occurredAt`,
+`windows`, `peakStart`, `peakCount`, `action`, `alertId`, and
+`suppressedCount`. The body is compact JSON with keys sorted by code
+point, integer values kept as integers, and one trailing newline:
+
+```json
+{"from":null,"organizationId":"org-1","steps":[{"action":"observe","alertId":null,"eventId":"evt-d","occurredAt":0,"peakCount":1,"peakStart":0,"suppressedCount":null,"windows":[{"count":1,"end":60,"start":0}]}],"suppressionWindow":120,"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl 'http://127.0.0.1:8000/alerts/replay/decisions?organizationId=org-1&type=incident.created&windowSize=60&threshold=3&suppressionWindow=120&from=0&to=180' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `422 Unprocessable Entity` (`validation_error`) — a parameter is missing,
+  duplicated, or blank, `windowSize`/`threshold`/`suppressionWindow` is not
+  a positive integer, `from`/`to` are unpaired or non-integer, or
+  `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's; the credential is judged
+  first, then the query shape, then the organization. An unknown
+  organization registered to the caller computes as zero events and
+  returns normally with an empty `steps` array; a failed request leaves no
+  trace.
 
 ### `GET /alerts/region/replay/decisions?organizationId=...&region=...&type=...&windowSize=...&threshold=...&suppressionWindow=...`
 
