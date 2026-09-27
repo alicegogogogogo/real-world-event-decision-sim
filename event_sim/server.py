@@ -1077,6 +1077,61 @@ def _replay_decision_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _region_replay_decision_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/region/replay/decisions query string.
+
+    The region-dimension counterpart of
+    :func:`_replay_decision_params_from_query`: organizationId, region, type,
+    windowSize and threshold are each required exactly once and non-empty;
+    windowSize and threshold must be positive integer text. from and to must
+    be both absent or both present exactly once, each a non-negative integer,
+    with from <= to. The region is matched verbatim downstream.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    region = _single_non_empty_text(params, "region")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size = _integer_text(_single_non_empty_text(params, "windowSize"))
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+    threshold = _integer_text(_single_non_empty_text(params, "threshold"))
+    if threshold is None or threshold <= 0:
+        raise EventValidationError("threshold must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "region": region,
+        "type": event_type,
+        "windowSize": window_size,
+        "threshold": threshold,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def compare_replays(
     from_events: list[dict[str, Any]], to_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -2735,6 +2790,20 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             if (
+                len(segments) == 5
+                and segments[0]
+                and segments[1] == "events"
+                and segments[2] == "region"
+                and segments[3] == "replay"
+                and segments[4] == "decisions"
+            ):
+                # The single-snapshot region replay decision shares the same
+                # verdict order as the other snapshot-prefixed queries.
+                self._replay_snapshot_region_decisions(
+                    unquote(segments[0]), query
+                )
+                return
+            if (
                 len(segments) == 4
                 and segments[0]
                 and segments[1] == "events"
@@ -2848,6 +2917,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/region/aggregate":
             self._aggregate_events_by_region(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/region/replay/decisions":
+            self._replay_region_decisions(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
             )
@@ -3513,6 +3588,77 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "organizationId": params["organizationId"],
                 "snapshotId": snapshot.snapshot_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
+            },
+            newline=True,
+        )
+
+    def _replay_snapshot_region_decisions(
+        self, snapshot_id: str, query: str
+    ) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/region/replay/decisions.
+
+        Read-only, step-by-step region replay of one immutable snapshot's
+        captured events — the single-snapshot counterpart of
+        ``GET /events/region/replay/decisions``, lowering the exact region,
+        window and peak contract of the main region replay-decision query
+        onto the events the snapshot captured at its creation time. The
+        verdict order is fixed: the credential is authenticated first, then
+        the query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot name
+        resolved (missing snapshot, then foreign snapshot). Both ``read``
+        and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The snapshot must already exist; a replay never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time and is immutable afterwards, so other
+        # organizations' data and events committed after the capture never
+        # enter the replay. The region filter uses the same verbatim rule the
+        # main region replay uses (only a non-empty string payload ``region``
+        # matches), and the rows are sorted by occurredAt then eventId — the
+        # replay order the main replay-decision query uses — before each step
+        # recomputes the window rows and peak through the same helpers as the
+        # aggregate and decision entry points. Nothing is written, so
+        # identical requests return byte-identical JSON.
+        events = event_rows(
+            snapshot.events_snapshot_for_region(params["region"])
+        )
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "snapshotId": snapshot.snapshot_id,
+                "region": params["region"],
                 "type": params["type"],
                 "windowSize": params["windowSize"],
                 "threshold": params["threshold"],
@@ -4743,6 +4889,62 @@ class Handler(BaseHTTPRequestHandler):
                 "from": from_value,
                 "to": to_value,
                 "windows": windows,
+            },
+            newline=True,
+        )
+
+    def _replay_region_decisions(self, ledger: EventLedger, query: str) -> None:
+        """Serve GET /events/region/replay/decisions.
+
+        Read-only, step-by-step replay scoped to one region — the
+        region-dimension counterpart of ``GET /events/replay/decisions``,
+        applying the exact verbatim region attribution rule of
+        ``GET /events/region`` before the same type, window, peak, and range
+        contract. The verdict order matches the other replay queries: the
+        credential is checked first, then the query shape, then the
+        organization. Both read and write credentials may call it; the read
+        is one locked snapshot and nothing is written, so repeated calls
+        return the same bytes and never disturb the ledger, inventory, or
+        alerts.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+
+        # A single locked snapshot of the organization's region events,
+        # already scoped by the ledger to this organization and the verbatim
+        # region and sorted by occurredAt then eventId; replay_decision_steps
+        # narrows to the requested type. Events without a non-empty string
+        # payload region never match, and other organizations' data never
+        # enters the result.
+        events = ledger.list_for_organization_region(
+            params["organizationId"], params["region"]
+        )
+        steps = replay_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "region": params["region"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
             },
             newline=True,
         )
