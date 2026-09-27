@@ -682,6 +682,106 @@ containing only that organization's alerts. Each entry carries `alertId`,
 unknown organization returns `"alerts": []`. A missing, blank, or
 duplicated parameter yields `422`.
 
+### `POST /alerts/region/evaluate`
+
+The region-dimension counterpart of `POST /alerts/evaluate`: the same peak,
+threshold, and suppression contract computed only over the caller
+organization's events attributed to one region. Region attribution follows
+the main rule — only a non-empty string payload `region` attributes an
+event, matched verbatim with no normalization; an unknown region simply
+matches zero events and is never implicitly created. Requires a `write`
+credential and `Content-Type: application/json`. The body must be a JSON
+object containing exactly these fields:
+
+| Field               | Rule                                                          |
+| ------------------- | ------------------------------------------------------------ |
+| `organizationId`    | required, non-empty string                                   |
+| `region`            | required, non-empty string, matched verbatim                 |
+| `type`              | required, non-empty string                                   |
+| `windowSize`        | required, positive integer (no booleans, floats, or strings) |
+| `threshold`         | required, positive integer (no booleans, floats, or strings) |
+| `suppressionWindow` | required, positive integer (no booleans, floats, or strings) |
+| `from`              | optional; non-negative integer, present only together with `to` |
+| `to`                | optional; non-negative integer, present only together with `from` |
+
+The peak uses the exact same windowing as `POST /alerts/evaluate`: only
+events matching the organization, the region, and `type` are counted,
+windows start at `0` and cover `[start, start + windowSize)`, ties resolve
+to the earliest window start, and other organizations' data is never
+included. The event ledger, the reservation inventory, and the
+organization-dimension alerts are never modified.
+
+- When the peak is below the threshold, `action` is `"observe"`, no alert
+  is written, `alertId` is `null`, and `suppressedCount` is `null`.
+- When the peak reaches the threshold, the peak start is compared with the
+  most recent prior alert for the same organization, region, and type:
+  - `peakStart - priorStart >= suppressionWindow` creates a new alert;
+    `action` is `"escalate"`, `alertId` is the new id from the one global
+    sequence shared with the organization-dimension alerts (`alert-1`,
+    `alert-2`, …), and `suppressedCount` is `0`.
+  - A peak start less than `suppressionWindow` after the prior alert's
+    peak start increments that alert's suppression count instead; `action`
+    is `"suppress"`, `alertId` is the prior alert's id, and
+    `suppressedCount` is the new total. The first threshold hit for an
+    organization/region/type always creates an alert.
+
+Region alerts and organization-dimension alerts never suppress each other:
+each region and each type is its own suppression scope. The authorization
+decision and the alert write commit atomically under one lock, so
+concurrent threshold hits open exactly one alert and a rejected request
+leaves no trace. The `200` response echoes every request field and adds
+the result fields (compact JSON, keys sorted by code point, integer
+values, one trailing newline):
+
+```json
+{"action":"escalate","alertId":"alert-1","from":null,"organizationId":"org-1","peakCount":3,"peakStart":60,"region":"north","suppressedCount":0,"suppressionWindow":120,"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/alerts/region/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","region":"north","type":"incident.created","windowSize":60,"threshold":3,"suppressionWindow":120}'
+```
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered; the body carries no business
+  content.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is read-only
+  or its organization differs from the body's; the credential and
+  organization are judged before any business computation.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`; no
+  alert is written.
+- `400 Bad Request` — body is not syntactically valid JSON; no alert is
+  written.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body,
+  missing, repeated, or extra fields, blank or non-string identifiers,
+  booleans/floats where integers are required, non-positive values,
+  unpaired `from`/`to`, or `from > to`.
+
+### `GET /alerts/region?organizationId=...&region=...`
+
+Lists one organization's region-dimension alerts for one region. Both
+`organizationId` and `region` must appear exactly once and be non-empty; a
+missing, duplicated, or blank parameter yields `422` with
+`validation_error`. Both `read` and `write` credentials may call it.
+Returns `200` with `{"organizationId": "...", "region": "...", "alerts":
+[...]}` containing only that organization's alerts raised in that region.
+Each entry carries `alertId`, `type`, `peakStart`, `threshold`, and
+`suppressedCount`, sorted by `peakStart` ascending and then `alertId` in
+Unicode code-point order. An unknown organization or region returns
+`"alerts": []`; other organizations' alerts are never included. The body
+is compact JSON with keys sorted by code point and a trailing newline.
+
+```bash
+curl 'http://127.0.0.1:8000/alerts/region?organizationId=org-1&region=north' \
+  -H 'Authorization: Bearer tok-1'
+```
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer credential
+  is missing, malformed, or not registered.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the parameter's
+  organization differs from the credential's.
+
 ## Snapshots and branches
 
 Snapshots capture the current main service state under a unique name so that
