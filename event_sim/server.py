@@ -1234,26 +1234,7 @@ def _region_alert_replay_params_from_query(query: str) -> dict[str, Any]:
     if suppression_window is None or suppression_window <= 0:
         raise EventValidationError("suppressionWindow must be a positive integer")
 
-    from_values = params.get("from")
-    to_values = params.get("to")
-    from_value: int | None = None
-    to_value: int | None = None
-    if from_values is not None or to_values is not None:
-        if (
-            not from_values
-            or len(from_values) != 1
-            or not to_values
-            or len(to_values) != 1
-        ):
-            raise EventValidationError(
-                "from and to must be omitted together or each appear exactly once"
-            )
-        from_value = _integer_text(from_values[0])
-        to_value = _integer_text(to_values[0])
-        if from_value is None or to_value is None:
-            raise EventValidationError("from and to must be non-negative integers")
-        if from_value > to_value:
-            raise EventValidationError("from must be less than or equal to to")
+    from_value, to_value = _range_pair_from_params(params)
 
     return {
         "organizationId": organization_id,
@@ -1265,6 +1246,77 @@ def _region_alert_replay_params_from_query(query: str) -> dict[str, Any]:
         "from": from_value,
         "to": to_value,
     }
+
+
+def _alert_replay_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /alerts/replay/decisions query string.
+
+    The organization-dimension alert-replay counterpart of
+    :func:`_replay_decision_params_from_query`: organizationId, type,
+    windowSize, threshold and suppressionWindow are each required exactly
+    once and non-empty; windowSize, threshold and suppressionWindow must be
+    positive integer text. from and to must be both absent or both present
+    exactly once, each a non-negative integer, with from <= to.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size = _integer_text(_single_non_empty_text(params, "windowSize"))
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+    threshold = _integer_text(_single_non_empty_text(params, "threshold"))
+    if threshold is None or threshold <= 0:
+        raise EventValidationError("threshold must be a positive integer")
+    suppression_window = _integer_text(
+        _single_non_empty_text(params, "suppressionWindow")
+    )
+    if suppression_window is None or suppression_window <= 0:
+        raise EventValidationError("suppressionWindow must be a positive integer")
+
+    from_value, to_value = _range_pair_from_params(params)
+
+    return {
+        "organizationId": organization_id,
+        "type": event_type,
+        "windowSize": window_size,
+        "threshold": threshold,
+        "suppressionWindow": suppression_window,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
+def _range_pair_from_params(
+    params: dict[str, list[str]],
+) -> tuple[int | None, int | None]:
+    """Validate an optional paired ``from``/``to`` range from parsed query.
+
+    Both must be absent or each present exactly once, each non-negative
+    integer text, with from <= to. Shared by the two alert-replay query
+    parsers so their range contract and wording stay identical.
+    """
+    from_values = params.get("from")
+    to_values = params.get("to")
+    if from_values is None and to_values is None:
+        return None, None
+    if (
+        not from_values
+        or len(from_values) != 1
+        or not to_values
+        or len(to_values) != 1
+    ):
+        raise EventValidationError(
+            "from and to must be omitted together or each appear exactly once"
+        )
+    from_value = _integer_text(from_values[0])
+    to_value = _integer_text(to_values[0])
+    if from_value is None or to_value is None:
+        raise EventValidationError("from and to must be non-negative integers")
+    if from_value > to_value:
+        raise EventValidationError("from must be less than or equal to to")
+    return from_value, to_value
 
 
 def compare_replays(
@@ -2270,23 +2322,28 @@ def replay_decision_steps(
     """Replay matching events one at a time, recomputing counts and the peak.
 
     ``events`` is a consistent locked snapshot already filtered to one
-    organization, sorted by ``occurredAt`` then ``eventId``. Events of
-    other types are skipped without opening a step; each remaining event
-    is added in replay order and the window rows and peak decision are
-    recomputed from the accumulated prefix through the same helpers as
-    the aggregate and decision entry points, so every step agrees item
-    by item with what those endpoints return on the same state.
+    organization (and, for the region entry points, one region). Events of
+    other types are skipped without opening a step; the matching events are
+    re-sorted here by ``occurredAt`` ascending and then ``eventId`` in
+    Unicode code-point order — the exact tie order used by the alert
+    replays, so both replay kinds line up identifier by identifier on the
+    same state. Each remaining event is added in that replay order and the
+    window rows and peak decision are recomputed from the accumulated
+    prefix through the same helpers as the aggregate and decision entry
+    points, so every step agrees item by item with what those endpoints
+    return on the same state.
     """
     window_size = params["windowSize"]
     threshold = params["threshold"]
     from_value = params["from"]
     to_value = params["to"]
 
+    matching = [event for event in events if event["type"] == params["type"]]
+    matching.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
+
     steps: list[dict[str, Any]] = []
     accumulated: list[int] = []
-    for event in events:
-        if event["type"] != params["type"]:
-            continue
+    for event in matching:
         accumulated.append(event["occurredAt"])
         windows = _windows_from_occurred(
             accumulated, window_size, from_value, to_value
@@ -2305,21 +2362,30 @@ def replay_decision_steps(
     return steps
 
 
-def region_alert_replay_steps(
+def alert_replay_steps(
     events: list[dict[str, Any]], params: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Replay region events, simulating the alert suppression/escalation rule.
+    """Replay matching events, simulating the alert suppression rule.
 
-    Mirrors :func:`replay_decision_steps` — events already filtered to one
-    organization and region, other types skipped, matching events accumulated
-    by ``occurredAt`` then ``eventId``, and the window rows and peak recomputed
-    through the same aggregate/peak helpers — then layers on the exact
-    suppression rule of ``POST /alerts/region/evaluate`` against the most
-    recent alert *within this replay* for the same organization, region, and
-    type. The simulation never touches the alert store: alert identifiers run
-    their own one-based sequence and the suppressed count is the running total
-    against the simulated prior alert, so the replay is read-only and repeated
-    calls are byte-for-byte identical.
+    Shared by the organization- and region-dimension alert replays, so the
+    two entry points share one ordering, window, peak, and suppression
+    contract. ``events`` is a consistent locked snapshot already filtered to
+    the caller's organization (and, for the region dimension, the verbatim
+    region); events of other types are skipped without opening a step. The
+    matching events are re-sorted here by ``occurredAt`` ascending and then
+    ``eventId`` in Unicode code-point order — the exact tie order of
+    ``GET /events`` — so the two dimensions enter the replay in one identical
+    order regardless of the list that supplied them.
+
+    Each matching event is added in that replay order and the window rows and
+    peak are recomputed from the accumulated prefix through the same helpers
+    as the aggregate and decision entry points, then the exact suppression
+    rule of ``POST /alerts/evaluate`` is layered on against the most recent
+    alert *within this replay* for the same dimension scope. The simulation
+    never touches the alert store: alert identifiers run their own one-based
+    sequence and the suppressed count is the running total against the
+    simulated prior alert, so the replay is read-only and repeated calls are
+    byte-for-byte identical.
 
     A step whose peak is below the threshold is ``observe`` with null alert
     identity. A threshold hit with no prior simulated alert, or whose peak
@@ -2334,15 +2400,16 @@ def region_alert_replay_steps(
     from_value = params["from"]
     to_value = params["to"]
 
+    matching = [event for event in events if event["type"] == params["type"]]
+    matching.sort(key=lambda event: (event["occurredAt"], event["eventId"]))
+
     steps: list[dict[str, Any]] = []
     accumulated: list[int] = []
     prior_start: int | None = None
     prior_alert_id: str | None = None
     suppressed_count = 0
     alert_counter = 0
-    for event in events:
-        if event["type"] != params["type"]:
-            continue
+    for event in matching:
         accumulated.append(event["occurredAt"])
         windows = _windows_from_occurred(
             accumulated, window_size, from_value, to_value
@@ -3220,6 +3287,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/alerts":
             self._list_alerts(query)
+            return
+        if path == "/alerts/replay/decisions":
+            self._replay_alert_decisions(query)
             return
         if path == "/alerts/region/replay/decisions":
             self._replay_region_alert_decisions(query)
@@ -5497,6 +5567,62 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._write_json(HTTPStatus.OK, result, newline=True)
 
+    def _replay_alert_decisions(self, query: str) -> None:
+        """Serve GET /alerts/replay/decisions.
+
+        Read-only, step-by-step organization-dimension alert replay: the
+        alert-suppression counterpart of ``GET /events/replay/decisions``.
+        Matching events enter the replay one at a time and each step reports
+        the accumulated window rows and peak plus the action and alert
+        identity the suppression rule would produce *within the replay*. The
+        alert store is never read or written, so simulated identifiers and
+        suppression counts are independent of committed alerts and repeated
+        calls are byte-for-byte identical. The verdict order matches the
+        other query entry points: credential, then query shape, then
+        organization; both read and write credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _alert_replay_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+
+        # A single locked snapshot of the organization's events, sorted by
+        # occurredAt then eventId; alert_replay_steps narrows to the requested
+        # type (re-asserting that same order) and runs the whole suppression
+        # simulation without touching the alert store, the ledger, or the
+        # reservation inventory. An unknown organization simply yields no
+        # events, and other organizations' data never enters the result.
+        events = self.server.ledger.list_for_organization(  # type: ignore[attr-defined]
+            params["organizationId"]
+        )
+        steps = alert_replay_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "suppressionWindow": params["suppressionWindow"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
+            },
+            newline=True,
+        )
+
     def _replay_region_alert_decisions(self, query: str) -> None:
         """Serve GET /alerts/region/replay/decisions.
 
@@ -5530,13 +5656,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # A single locked snapshot of the organization's region events,
         # scoped to the verbatim region and sorted by occurredAt then
-        # eventId; region_alert_replay_steps narrows to the requested type
-        # and runs the whole suppression simulation without touching the
-        # alert store, the ledger, or the reservation inventory.
+        # eventId; alert_replay_steps narrows to the requested type
+        # (re-asserting that same order) and runs the whole suppression
+        # simulation without touching the alert store, the ledger, or the
+        # reservation inventory.
         events = self.server.ledger.list_for_organization_region(  # type: ignore[attr-defined]
             params["organizationId"], params["region"]
         )
-        steps = region_alert_replay_steps(events, params)
+        steps = alert_replay_steps(events, params)
         self._write_json(
             HTTPStatus.OK,
             {
