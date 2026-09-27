@@ -1077,6 +1077,60 @@ def _replay_decision_params_from_query(query: str) -> dict[str, Any]:
     }
 
 
+def _region_replay_decision_params_from_query(query: str) -> dict[str, Any]:
+    """Validate the /events/region/replay/decisions query string.
+
+    organizationId, region, type, windowSize and threshold are each required
+    exactly once and non-empty; windowSize and threshold must be positive
+    integer text. from and to must be both absent or both present exactly
+    once, each a non-negative integer, with from <= to. The rules mirror
+    /events/replay/decisions plus a region parameter matched verbatim.
+    """
+    params = parse_qs(query, keep_blank_values=True)
+
+    organization_id = _single_non_empty_text(params, "organizationId")
+    region = _single_non_empty_text(params, "region")
+    event_type = _single_non_empty_text(params, "type")
+
+    window_size = _integer_text(_single_non_empty_text(params, "windowSize"))
+    if window_size is None or window_size <= 0:
+        raise EventValidationError("windowSize must be a positive integer")
+    threshold = _integer_text(_single_non_empty_text(params, "threshold"))
+    if threshold is None or threshold <= 0:
+        raise EventValidationError("threshold must be a positive integer")
+
+    from_values = params.get("from")
+    to_values = params.get("to")
+    from_value: int | None = None
+    to_value: int | None = None
+    if from_values is not None or to_values is not None:
+        if (
+            not from_values
+            or len(from_values) != 1
+            or not to_values
+            or len(to_values) != 1
+        ):
+            raise EventValidationError(
+                "from and to must be omitted together or each appear exactly once"
+            )
+        from_value = _integer_text(from_values[0])
+        to_value = _integer_text(to_values[0])
+        if from_value is None or to_value is None:
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+
+    return {
+        "organizationId": organization_id,
+        "region": region,
+        "type": event_type,
+        "windowSize": window_size,
+        "threshold": threshold,
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def compare_replays(
     from_events: list[dict[str, Any]], to_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -2051,6 +2105,24 @@ def replay_decision_steps(
     return steps
 
 
+def replay_region_decision_steps(
+    events: list[dict[str, Any]], params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Replay one region's matching events one at a time.
+
+    Delegates to :func:`replay_decision_steps` after narrowing the consistent
+    snapshot to events whose payload ``region`` is a non-empty string equal
+    to ``params["region"]`` (compared verbatim, with no normalization), so
+    every step agrees item by item with the region aggregate and the main
+    replay-decision query on the same accumulated prefix. An unknown region
+    matches zero events and yields no steps.
+    """
+    region_events = [
+        event for event in events if event_region(event) == params["region"]
+    ]
+    return replay_decision_steps(region_events, params)
+
+
 def _aligned_replay_window_rows(
     left_occurred: list[int],
     right_occurred: list[int],
@@ -2745,6 +2817,20 @@ class Handler(BaseHTTPRequestHandler):
                 # verdict order as the other snapshot-prefixed queries.
                 self._replay_snapshot_decisions(unquote(segments[0]), query)
                 return
+            if (
+                len(segments) == 5
+                and segments[0]
+                and segments[1] == "events"
+                and segments[2] == "region"
+                and segments[3] == "replay"
+                and segments[4] == "decisions"
+            ):
+                # The single-snapshot region replay decision shares the same
+                # verdict order as the other snapshot-prefixed queries.
+                self._replay_snapshot_region_decisions(
+                    unquote(segments[0]), query
+                )
+                return
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "not_found", "path": self.path},
@@ -2848,6 +2934,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/region/aggregate":
             self._aggregate_events_by_region(
+                self.server.ledger,  # type: ignore[attr-defined]
+                query,
+            )
+            return
+        if path == "/events/region/replay/decisions":
+            self._replay_region_decisions(
                 self.server.ledger,  # type: ignore[attr-defined]
                 query,
             )
@@ -3513,6 +3605,75 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "organizationId": params["organizationId"],
                 "snapshotId": snapshot.snapshot_id,
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
+            },
+            newline=True,
+        )
+
+    def _replay_snapshot_region_decisions(
+        self, snapshot_id: str, query: str
+    ) -> None:
+        """Serve GET /snapshots/{snapshotId}/events/region/replay/decisions.
+
+        Read-only, step-by-step replay of one immutable snapshot's captured
+        events attributed to one region — the single-snapshot counterpart of
+        ``GET /events/region/replay/decisions``, lowering the exact region,
+        window, and peak contract of the main region replay-decision query
+        onto the events the snapshot captured at its creation time. The
+        verdict order is fixed: the credential is authenticated first, then
+        the query shape is validated, then the requested organization is
+        compared with the credential's, and only then is the snapshot name
+        resolved (missing snapshot, then foreign snapshot). Both ``read``
+        and ``write`` credentials may call it.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+        # The snapshot must already exist; a replay never implicitly creates
+        # one, and a foreign snapshot is forbidden rather than not found.
+        snapshot = self.server.snapshots.get(snapshot_id)  # type: ignore[attr-defined]
+        if snapshot is None:
+            self._snapshot_not_found()
+            return
+        if snapshot.organization_id != params["organizationId"]:
+            self._forbidden(newline=True)
+            return
+        # The snapshot already scopes its captured events to the owning
+        # organization at capture time and is immutable afterwards, so other
+        # organizations' data and events committed after the capture never
+        # enter the replay. The rows are sorted by occurredAt then eventId —
+        # the replay order the main replay-decision query uses — and each
+        # step recomputes the window rows and peak through the same helpers
+        # as the region aggregate and the main replay-decision query, so
+        # every step agrees item by item with what those endpoints return on
+        # the same accumulated prefix. Nothing is written, so identical
+        # requests return byte-identical JSON.
+        events = event_rows(snapshot.events_snapshot())
+        steps = replay_region_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "snapshotId": snapshot.snapshot_id,
+                "region": params["region"],
                 "type": params["type"],
                 "windowSize": params["windowSize"],
                 "threshold": params["threshold"],
@@ -4619,6 +4780,53 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {
                 "organizationId": params["organizationId"],
+                "type": params["type"],
+                "windowSize": params["windowSize"],
+                "threshold": params["threshold"],
+                "from": params["from"],
+                "to": params["to"],
+                "steps": steps,
+            },
+            newline=True,
+        )
+
+    def _replay_region_decisions(self, ledger: EventLedger, query: str) -> None:
+        """Serve GET /events/region/replay/decisions.
+
+        Verdict order matches the other replay queries: the credential is
+        checked first, then the query shape, then the organization. Both
+        read and write credentials may call it; the read is one locked
+        snapshot and nothing is written, so repeated calls return the same
+        bytes and never disturb the ledger, inventory, or alerts.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        try:
+            params = _region_replay_decision_params_from_query(query)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=True
+        ):
+            return
+
+        # A single locked snapshot of the organization's events, already
+        # scoped by the ledger to this organization and sorted by occurredAt
+        # then eventId; replay_region_decision_steps narrows to the region
+        # (verbatim) and the requested type.
+        events = ledger.list_for_organization(params["organizationId"])
+        steps = replay_region_decision_steps(events, params)
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "organizationId": params["organizationId"],
+                "region": params["region"],
                 "type": params["type"],
                 "windowSize": params["windowSize"],
                 "threshold": params["threshold"],
