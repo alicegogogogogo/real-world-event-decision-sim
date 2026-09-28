@@ -88,6 +88,7 @@ data is forbidden.
   `GET /alerts/region/replay/decisions`,
   `POST /alerts/regions/compare/replay/decisions`,
   `POST /alerts/types/compare/replay/decisions`,
+  `POST /events/types/compare/replay/decisions`,
   `GET /branches/{branchId}/resources`,
   `GET /branches/{branchId}/events/replay/decisions`,
   `GET /snapshots/{snapshotId}/resources`,
@@ -541,6 +542,122 @@ curl -X POST http://127.0.0.1:8000/decisions/allocate \
 - `400 Bad Request` — body is not syntactically valid JSON.
 - `422 Unprocessable Entity` — a non-object body, missing or extra fields,
   invalid types, duplicate or blank identifiers, or out-of-range values.
+
+### `POST /events/types/compare/replay/decisions`
+
+A read-only, step-by-step alignment of two event types' plain **event**
+replay decisions — the event-replay counterpart of
+`POST /alerts/types/compare/replay/decisions`. Where that entry point
+replays two event types with the alert suppression rule layered on, this
+one replays them with the plain observe/escalate decision of
+`GET /events/replay/decisions` only: a side escalates when its peak
+reaches the threshold and otherwise observes, and there is no alert
+identity and no suppression count. The two sides name their type
+directly in `left` and `right`, so the body carries no single shared
+`type` field. Nothing is read for mutation or written: the alert store
+is neither read nor written, the event ledger and reservation inventory
+are never modified, a failed request leaves no trace, and identical
+submissions return byte-for-byte identical JSON. Both `read` and
+`write` credentials may call it. Requires `Content-Type:
+application/json` and a Bearer credential bound to the request's
+`organizationId`. The body must be a JSON object containing exactly
+these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both types must belong to it     |
+| `left`           | required, non-empty type name (the left-hand side)           |
+| `right`          | required, non-empty type name (the right-hand side)          |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Using the same type name for `left` and `right`
+is legal; the two sides are then equal by construction. Type names are
+matched verbatim the way `GET /events/replay/decisions` matches them
+and are not existence-checked, so an unknown type simply contributes no
+events.
+
+Each side replays only its own type's events of the organization;
+region attribution is irrelevant on this dimension, other
+organizations' data never enters the result, and events of the other
+side's type never open a step on this side. On each side the matching
+events are ordered by `occurredAt` ascending and then `eventId` in
+Unicode code-point order and accumulated one at a time. The two
+replays are then aligned by `eventId`:
+
+- an identifier reached by both sides is one shared step on which both
+  sides accumulate their event;
+- an identifier reached by only one side is its own step on which that
+  side accumulates its event and the other side stays put: its prefix
+  is not cleared and its last decision is untouched;
+- the aligned steps are ordered by occurred time ascending and then
+  `eventId` in Unicode code-point order. When the two sides disagree on
+  a shared identifier's `occurredAt`, the earlier time is reported;
+- when neither side holds a matching event, `steps` is `[]`.
+
+Windows start at `0` and each covers `[start, start + windowSize)`, with
+the exact same division as the other replay entry points:
+
+- Without `from`/`to`, a step's window rows cover the **union** of the
+  windows hit by the two accumulated prefixes.
+- With `from`/`to`, events outside the closed interval `[from, to]`
+  still arrive as replay steps in order, but every window intersecting
+  the interval is returned at every step, including intersecting empty
+  windows with count `0`.
+
+Each step carries:
+
+- `eventId` and `occurredAt` identifying the aligned step;
+- `windows`, the two prefixes' window-count rows aligned by `start`
+  ascending. Each row is `{"start", "leftCount", "rightCount", "equal"}`;
+  a side with no event in a window reports `0`, and `equal` is true
+  exactly when the two counts agree;
+- `decision.left` and `decision.right`, each with exactly `peakStart`,
+  `peakCount`, and `action`: the peak of that side's accumulated prefix
+  is the largest window count with ties to the earliest start, and
+  `action` is `"escalate"` when it reaches `threshold`, otherwise
+  `"observe"`. A side that has not moved yet, or whose accumulated
+  prefix counts no window, reports `peakStart: null`, `peakCount: 0`,
+  and `"observe"`. `decision.equal` is true exactly when the two sides
+  agree on `peakStart`, `peakCount`, and `action`.
+
+The `200` response echoes the organization, the two type names, window
+width, threshold, and the (possibly null) range, and carries the
+ordered `steps` array; there is no shared `type` key. It is compact
+JSON with keys sorted by code point, integer values kept as integers,
+booleans kept as booleans, and one trailing newline:
+
+```json
+{"from":null,"left":"incident.created","organizationId":"org-1","right":"incident.updated","steps":[{"decision":{"equal":true,"left":{"action":"observe","peakCount":1,"peakStart":0},"right":{"action":"observe","peakCount":1,"peakStart":0}},"eventId":"evt-1","occurredAt":10,"windows":[{"equal":true,"leftCount":1,"rightCount":1,"start":0}]}],"threshold":2,"to":null,"windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/events/types/compare/replay/decisions \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"incident.created","right":"incident.updated","windowSize":60,"threshold":3}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+media type and body, then the organization.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer
+  credential is missing, malformed, or not registered; the body carries
+  no business content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body,
+  a missing, extra, duplicated, or blank field, a blank or non-string
+  `organizationId`/`left`/`right`, a non-positive-integer
+  `windowSize`/`threshold`, unpaired or non-integer `from`/`to`, or
+  `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound
+  to a different organization. The organization decision happens before
+  either type name is inspected; an unknown type is not an error and
+  computes as zero events.
 
 ## Reservation inventory
 

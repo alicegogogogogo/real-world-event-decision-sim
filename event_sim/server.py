@@ -108,6 +108,21 @@ TYPE_ALERT_COMPARE_FIELDS = (
     TYPE_ALERT_COMPARE_REQUIRED_FIELDS + TYPE_ALERT_COMPARE_OPTIONAL_FIELDS
 )
 
+# The plain event-replay counterpart (no alert identity or suppression)
+# names the two sides' event types directly, so like the alert comparison
+# the body carries left/right types but no single shared "type" field.
+TYPE_EVENT_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "windowSize",
+    "threshold",
+)
+TYPE_EVENT_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+TYPE_EVENT_COMPARE_FIELDS = (
+    TYPE_EVENT_COMPARE_REQUIRED_FIELDS + TYPE_EVENT_COMPARE_OPTIONAL_FIELDS
+)
+
 BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
@@ -2150,6 +2165,75 @@ def validate_type_alert_replay_compare_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_type_event_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /events/types/compare/replay/decisions.
+
+    The plain event-replay counterpart of
+    :func:`validate_type_alert_replay_compare_request`: required fields
+    organizationId, left, right, windowSize, and threshold; optional fields
+    from and to, which must appear together. There is no
+    ``suppressionWindow`` — this entry point only observes or escalates and
+    carries no alert identity — and no shared ``type`` field: ``left`` and
+    ``right`` themselves name the two event types, matched verbatim
+    downstream; the same type name on both sides is legal, and an unknown
+    type simply matches zero events.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "type event replay comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    required = set(TYPE_EVENT_COMPARE_REQUIRED_FIELDS)
+    allowed = set(TYPE_EVENT_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -2715,6 +2799,132 @@ def compare_branch_replay_decisions(
         "left": params["left"],
         "right": params["right"],
         "type": params["type"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "steps": steps,
+    }
+
+
+def _event_replay_side_decision(
+    state: dict[str, Any], event: dict[str, Any] | None, params: dict[str, Any]
+) -> dict[str, Any]:
+    """Advance (or freeze) one side and return its plain replay decision.
+
+    The non-alert counterpart of :func:`_alert_replay_side_decision`: with
+    ``event`` set the side accumulates that event and recomputes the peak of
+    its own prefix through the same helpers as ``GET
+    /events/replay/decisions`` — a peak at or above the threshold is
+    ``"escalate"``, anything else is ``"observe"``. With ``event`` None the
+    aligned step belongs to the other side, so this side neither accumulates
+    nor recomputes: its prefix is not cleared and the step reports the
+    decision of its own last replay step (the initial observe state when it
+    has not moved yet). There is no alert identity or suppression count.
+    """
+    accumulated = state["accumulated"]
+    if event is None:
+        last = state["last"]
+        if last is not None:
+            return dict(last)
+        peak = _prefix_peak(accumulated, params)
+        return {
+            "peakStart": peak["peakStart"],
+            "peakCount": peak["peakCount"],
+            "action": "observe",
+        }
+
+    accumulated.append(event["occurredAt"])
+    peak = _prefix_peak(accumulated, params)
+    decision = {
+        "peakStart": peak["peakStart"],
+        "peakCount": peak["peakCount"],
+        "action": peak["action"],
+    }
+    state["last"] = dict(decision)
+    return decision
+
+
+def compare_type_event_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two event types' step-by-step replay decisions by event id.
+
+    The plain event-replay counterpart of
+    :func:`compare_type_alert_replay_decisions`: the two sides name two
+    event types directly, so the left stream keeps ``params["left"]``
+    events and the right stream keeps ``params["right"]`` events. Each
+    ``events`` list is a single locked snapshot of one organization's
+    events (region attribution is irrelevant here); events of the other
+    side's type never open a step on this side. Each side accumulates its
+    own events in ``occurredAt`` then ``eventId`` order; an identifier
+    reached by both sides is one shared step on which both prefixes
+    extend, an identifier reached by only one side is its own step on
+    which the other side stays put with its prefix and last decision
+    untouched.
+
+    Aligned steps are ordered by occurred time and then identifier in
+    Unicode code-point order; a shared identifier whose sides disagree on
+    time reports the earlier one. Every step carries the event id/time,
+    the two prefixes' window rows aligned by start (a missing side counts
+    zero), and ``decision`` with ``left``/``right`` blocks of
+    ``peakStart``, ``peakCount`` and ``action``; ``equal`` compares
+    exactly that triple. There is no single shared ``type`` field, no
+    alert identity, and no suppression count. Nothing is read for
+    mutation or written, so repeated calls are byte-for-byte identical.
+    """
+    left_stream = [event for event in left_events if event["type"] == params["left"]]
+    right_stream = [
+        event for event in right_events if event["type"] == params["right"]
+    ]
+    left_by_id = {event["eventId"]: event for event in left_stream}
+    right_by_id = {event["eventId"]: event for event in right_stream}
+
+    # One aligned step per identifier in the union; a shared identifier's
+    # reported time is the earlier of the two sides' times.
+    step_times: dict[str, int] = {}
+    for event in left_stream:
+        step_times[event["eventId"]] = event["occurredAt"]
+    for event in right_stream:
+        event_id = event["eventId"]
+        if event_id in step_times:
+            step_times[event_id] = min(step_times[event_id], event["occurredAt"])
+        else:
+            step_times[event_id] = event["occurredAt"]
+
+    left_state: dict[str, Any] = {"accumulated": [], "last": None}
+    right_state: dict[str, Any] = {"accumulated": [], "last": None}
+    steps: list[dict[str, Any]] = []
+    for event_id in sorted(step_times, key=lambda eid: (step_times[eid], eid)):
+        left_event = left_by_id.get(event_id)
+        right_event = right_by_id.get(event_id)
+        left_decision = _event_replay_side_decision(left_state, left_event, params)
+        right_decision = _event_replay_side_decision(
+            right_state, right_event, params
+        )
+
+        windows = _aligned_replay_window_rows(
+            left_state["accumulated"], right_state["accumulated"], params
+        )
+        steps.append(
+            {
+                "eventId": event_id,
+                "occurredAt": step_times[event_id],
+                "windows": windows,
+                "decision": {
+                    "left": left_decision,
+                    "right": right_decision,
+                    "equal": left_decision == right_decision,
+                },
+            }
+        )
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
         "windowSize": params["windowSize"],
         "threshold": params["threshold"],
         "from": params["from"],
@@ -3726,6 +3936,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/alerts/types/compare/replay/decisions":
             self._compare_type_alert_replay_decisions()
+            return
+        if path == "/events/types/compare/replay/decisions":
+            self._compare_type_event_replay_decisions()
             return
 
         if path.startswith("/snapshots/"):
@@ -5246,6 +5459,62 @@ class Handler(BaseHTTPRequestHandler):
             organization_id
         )
         result = compare_type_alert_replay_decisions(events, events, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_type_event_replay_decisions(self) -> None:
+        """Serve POST /events/types/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two event types' plain replay
+        decisions (observe/escalate only — no alert identity or
+        suppression): the event-replay counterpart of the type alert
+        comparison. The verdict order matches the other POST comparisons:
+        the credential is authenticated first, then the media type and
+        body shape are validated, and only then is the requested
+        organization compared with the credential's. Type names are
+        matched verbatim against the ledger and are never
+        existence-checked or implicitly created: an unknown type simply
+        contributes no events, and using the same type name for both
+        sides is legal. Both ``read`` and ``write`` credentials may call
+        it; neither side touches the alert store, the ledger, or the
+        reservation inventory, and identical submissions return
+        byte-identical JSON.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_type_event_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # One locked ledger snapshot of the organization's events feeds
+        # both sides; each keeps only its own verbatim type, and an
+        # unknown type just yields no rows. The aligned steps are
+        # recomputed purely from that copy, so the ledger, inventory, and
+        # alert store are never read or written and repeated calls are
+        # byte-identical.
+        events = self.server.ledger.list_for_organization(  # type: ignore[attr-defined]
+            organization_id
+        )
+        result = compare_type_event_replay_decisions(events, events, params)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshot_events(self) -> None:
