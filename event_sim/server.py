@@ -123,6 +123,22 @@ EVENT_TYPE_COMPARE_FIELDS = (
     EVENT_TYPE_COMPARE_REQUIRED_FIELDS + EVENT_TYPE_COMPARE_OPTIONAL_FIELDS
 )
 
+# The event (non-alert) replay region-dimension comparison carries no
+# suppressionWindow and no shared "type" field: like the type-dimension event
+# comparison, left/right name the two sides directly — here the two region
+# names, matched verbatim by payload attribution downstream.
+EVENT_REGION_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "windowSize",
+    "threshold",
+)
+EVENT_REGION_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+EVENT_REGION_COMPARE_FIELDS = (
+    EVENT_REGION_COMPARE_REQUIRED_FIELDS + EVENT_REGION_COMPARE_OPTIONAL_FIELDS
+)
+
 BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
@@ -2233,6 +2249,74 @@ def validate_event_type_replay_compare_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_event_region_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /events/regions/compare/replay/decisions.
+
+    The region counterpart of
+    :func:`validate_event_type_replay_compare_request`: required fields
+    organizationId, left, right, windowSize and threshold; optional fields
+    from and to, which must appear together. ``left`` and ``right`` name the
+    two sides' regions directly (there is no shared ``type`` field); the
+    region names are matched verbatim against payload attribution downstream,
+    the same region name on both sides is legal, and an unknown region
+    simply matches zero events.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "event region replay comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    required = set(EVENT_REGION_COMPARE_REQUIRED_FIELDS)
+    allowed = set(EVENT_REGION_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -3288,6 +3372,104 @@ def compare_event_type_replay_decisions(
     }
 
 
+def compare_event_region_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two regions' plain event replay decisions by event id.
+
+    The region counterpart of :func:`compare_event_type_replay_decisions`:
+    the two sides name two regions directly, so the left stream keeps the
+    verbatim ``params["left"]`` region events and the right stream keeps the
+    ``params["right"]`` region events. Each ``events`` list is a single
+    locked snapshot already scoped to the caller's organization and one
+    region by the ledger; events attributed to another region never open a
+    step on this side, and events without a non-empty string payload region
+    never match either side. There is no shared ``type`` field, so the
+    result echoes only the two region names.
+
+    Each side accumulates its own region's events in ``occurredAt`` then
+    ``eventId`` order and recomputes its peak purely from that prefix —
+    below the threshold is ``observe``, otherwise ``escalate``; there is
+    no alert identity or suppression state on this dimension. An
+    identifier reached by both sides is one shared step on which both
+    prefixes extend; an identifier reached by only one side is its own
+    step on which the other side keeps its prefix untouched (its frozen
+    decision is re-reported, the initial empty-prefix observe state when
+    it has not moved yet). Aligned steps are ordered by occurred time and
+    then identifier in Unicode code-point order; a shared identifier
+    whose sides disagree on time reports the earlier one. Window rows,
+    the peak tie-break, the equality markers, and the read-only
+    byte-identical contract are all identical to the type replay
+    comparison.
+    """
+    left_stream = [
+        event for event in left_events if event_region(event) == params["left"]
+    ]
+    right_stream = [
+        event for event in right_events if event_region(event) == params["right"]
+    ]
+
+    left_by_id = {event["eventId"]: event for event in left_stream}
+    right_by_id = {event["eventId"]: event for event in right_stream}
+
+    # One aligned step per identifier in the union; a shared identifier's
+    # reported time is the earlier of the two sides' times.
+    step_times: dict[str, int] = {}
+    for event in left_stream:
+        step_times[event["eventId"]] = event["occurredAt"]
+    for event in right_stream:
+        event_id = event["eventId"]
+        if event_id in step_times:
+            step_times[event_id] = min(step_times[event_id], event["occurredAt"])
+        else:
+            step_times[event_id] = event["occurredAt"]
+
+    steps: list[dict[str, Any]] = []
+    left_accumulated: list[int] = []
+    right_accumulated: list[int] = []
+    for event_id in sorted(step_times, key=lambda eid: (step_times[eid], eid)):
+        left_event = left_by_id.get(event_id)
+        right_event = right_by_id.get(event_id)
+        if left_event is not None:
+            left_accumulated.append(left_event["occurredAt"])
+        if right_event is not None:
+            right_accumulated.append(right_event["occurredAt"])
+
+        # The peak is a pure function of the accumulated prefix, so a side
+        # that stays put on this step re-reports exactly its prior decision
+        # (the initial empty-prefix observe state until it has moved).
+        windows = _aligned_replay_window_rows(
+            left_accumulated, right_accumulated, params
+        )
+        left_decision = _prefix_peak(left_accumulated, params)
+        right_decision = _prefix_peak(right_accumulated, params)
+        steps.append(
+            {
+                "eventId": event_id,
+                "occurredAt": step_times[event_id],
+                "windows": windows,
+                "decision": {
+                    "left": left_decision,
+                    "right": right_decision,
+                    "equal": left_decision == right_decision,
+                },
+            }
+        )
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "steps": steps,
+    }
+
+
 def _compare_events(
     left_by_id: dict[str, dict[str, Any]],
     right_by_id: dict[str, dict[str, Any]],
@@ -3907,6 +4089,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/types/compare/replay/decisions":
             self._compare_event_type_replay_decisions()
+            return
+        if path == "/events/regions/compare/replay/decisions":
+            self._compare_event_region_replay_decisions()
             return
 
         if path.startswith("/snapshots/"):
@@ -5484,6 +5669,70 @@ class Handler(BaseHTTPRequestHandler):
             organization_id
         )
         result = compare_event_type_replay_decisions(events, events, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_event_region_replay_decisions(self) -> None:
+        """Serve POST /events/regions/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two regions' plain event
+        replay decisions: the region counterpart of
+        ``POST /events/types/compare/replay/decisions`` and the non-alert
+        counterpart of
+        ``POST /alerts/regions/compare/replay/decisions``. The verdict
+        order matches the other POST comparisons: the credential is
+        authenticated first, then the media type and body shape are
+        validated, and only then is the requested organization compared
+        with the credential's. Region names follow the public attribution
+        rule — only a non-empty string payload region attributes an
+        event, matched verbatim — and are never existence-checked or
+        implicitly created: an unknown region simply contributes no
+        events, and using the same region name for both sides is legal.
+        Both ``read`` and ``write`` credentials may call it; the decision
+        is threshold-only (observe versus escalate) with no alert
+        identity or suppression count, and neither the alert store, the
+        ledger, nor the reservation inventory is touched. Identical
+        submissions return byte-identical JSON.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_event_region_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Each side takes one locked ledger snapshot scoped to the verbatim
+        # region; an unknown region just returns no rows. The pure alignment
+        # function re-asserts the same attribution rule and recomputes both
+        # prefixes from copies, so the read is repeatable with no writes to
+        # the ledger, inventory, or alert store.
+        left_events = self.server.ledger.list_for_organization_region(  # type: ignore[attr-defined]
+            organization_id, params["left"]
+        )
+        right_events = self.server.ledger.list_for_organization_region(  # type: ignore[attr-defined]
+            organization_id, params["right"]
+        )
+        result = compare_event_region_replay_decisions(
+            left_events, right_events, params
+        )
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshot_events(self) -> None:
