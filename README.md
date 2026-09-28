@@ -86,6 +86,7 @@ data is forbidden.
   `GET /events/region/replay/decisions`,
   `GET /alerts/replay/decisions`,
   `GET /alerts/region/replay/decisions`,
+  `POST /alerts/regions/compare/replay/decisions`,
   `GET /branches/{branchId}/resources`,
   `GET /branches/{branchId}/events/replay/decisions`,
   `GET /snapshots/{snapshotId}/resources`,
@@ -986,6 +987,102 @@ curl 'http://127.0.0.1:8000/alerts/region/replay/decisions?organizationId=org-1&
   organization registered to the caller, or an unknown region, computes as
   zero events and returns normally with an empty `steps` array; a failed
   request leaves no trace.
+
+### `POST /alerts/regions/compare/replay/decisions`
+
+A read-only, step-by-step alignment of two regions' **alert** replays
+within one organization: the two-region comparison counterpart of
+`GET /alerts/region/replay/decisions`. Each side simulates that endpoint's
+exact published contract over the organization's events attributed to its
+own region (the same verbatim `payload.region` rule), and the two replays
+align by event identifier. The alert store is neither read nor written,
+the event ledger and reservation inventory are never modified, no region
+is implicitly created, and identical requests return byte-for-byte
+identical JSON. Both `read` and `write` credentials may call it. Requires
+`Content-Type: application/json`; the body must be a JSON object
+containing exactly these fields:
+
+| Field               | Rule                                                          |
+| ------------------- | ------------------------------------------------------------ |
+| `organizationId`    | required, non-empty string; both regions must be in this one organization |
+| `left`              | required, non-empty string, the left region name             |
+| `right`             | required, non-empty string, the right region name            |
+| `type`              | required, non-empty string                                   |
+| `windowSize`        | required, positive integer (no booleans, floats, or strings) |
+| `threshold`         | required, positive integer (no booleans, floats, or strings) |
+| `suppressionWindow` | required, positive integer (no booleans, floats, or strings) |
+| `from`              | optional; non-negative integer, present only together with `to` |
+| `to`                | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, must be
+non-negative integers, and must satisfy `from <= to`. Naming the same
+region on both sides is legal and equal by construction; an unknown
+region simply matches zero events and is never implicitly created.
+
+Each side's matching events enter its replay in the region alert replay's
+exact order — `occurredAt` ascending and then `eventId` in Unicode
+code-point order — with windows starting at `0` and covering
+`[start, start + windowSize)`, the peak the largest count with ties to
+the earliest start, no range listing only covered windows and a range
+keeping intersecting empty windows with zero counts while out-of-range
+events still open steps. Below the threshold a side's action is
+`"observe"`; at the threshold it compares the peak start with that
+region's most recent simulated alert peak start and opens a new alert
+when the distance is at least `suppressionWindow`
+(`peakStart - priorStart >= suppressionWindow`), otherwise it
+`"suppress"`es against that prior alert, reporting its identifier and
+the new cumulative count. Simulated alert identifiers
+(`alert-1`, `alert-2`, …) are numbered independently on each side from
+the beginning of the call; they never advance the real alert sequence
+and never read or write the alert store.
+
+The two replays align by event identifier: an identifier reached by both
+sides is one shared step on which both prefixes accumulate together; an
+identifier reached by only one side is its own step on which the other
+side's prefix and suppression state are neither cleared nor advanced.
+The aligned steps are ordered by occurred time ascending and then
+identifier in Unicode code-point order, exactly like one merged replay;
+when the two sides place a shared identifier at different times, the
+earlier time is reported. Every step carries the identifier and time, the
+aligned left/right window-count rows (rows align by start, a side
+missing from a window counts zero), and each side's peak start, peak
+count, action, alert identifier and suppressed count. A separate
+`equal` marker looks only at the three comparison fields — peak start,
+peak count, and action.
+
+The `200` response echoes the organization, the two region names, type,
+window width, threshold, suppression window, and the (possibly null)
+range, and carries the ordered `steps` array; with no matching event on
+either side `steps` is `[]`. The body is compact JSON with keys sorted
+by code point, integer values kept as integers, and one trailing
+newline:
+
+```json
+{"from":null,"left":"north","organizationId":"org-1","right":"south","steps":[{"equal":true,"eventId":"evt-1","left":{"action":"observe","alertId":null,"peakCount":1,"peakStart":0,"suppressedCount":null},"occurredAt":5,"right":{"action":"observe","alertId":null,"peakCount":1,"peakStart":0,"suppressedCount":null},"windows":[{"leftCount":1,"rightCount":0,"start":0}]}],"suppressionWindow":120,"threshold":3,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/alerts/regions/compare/replay/decisions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer tok-1' \
+  -d '{"organizationId":"org-1","left":"north","right":"south","type":"incident.created","windowSize":60,"threshold":3,"suppressionWindow":120}'
+```
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer
+  credential is missing, malformed, or not registered; the body carries
+  no business content. The credential is judged before the body.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` (`invalid_json`) — the body is not syntactically
+  valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body,
+  a missing, duplicated, or extra field, blank or non-string
+  identifiers/type, booleans/floats where positive integers are
+  required, non-positive `windowSize`/`threshold`/`suppressionWindow`,
+  unpaired or non-integer `from`/`to`, or `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the body's organization
+  differs from the credential's; the organization is judged only after
+  the body is valid. Region names are never probed for registration, so
+  an unknown region computes as zero events and returns normally.
 
 ## Snapshots and branches
 

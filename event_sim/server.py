@@ -38,6 +38,20 @@ REGION_ALERT_REQUIRED_FIELDS = (
 REGION_ALERT_OPTIONAL_FIELDS = ("from", "to")
 REGION_ALERT_FIELDS = REGION_ALERT_REQUIRED_FIELDS + REGION_ALERT_OPTIONAL_FIELDS
 
+REGION_ALERT_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "type",
+    "windowSize",
+    "threshold",
+    "suppressionWindow",
+)
+REGION_ALERT_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+REGION_ALERT_COMPARE_FIELDS = (
+    REGION_ALERT_COMPARE_REQUIRED_FIELDS + REGION_ALERT_COMPARE_OPTIONAL_FIELDS
+)
+
 ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
@@ -1645,6 +1659,74 @@ def validate_region_alert_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_region_alert_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /alerts/regions/compare/replay/decisions.
+
+    Required fields: organizationId, left, right, type, windowSize,
+    threshold, and suppressionWindow. Optional fields: from and to, which
+    must appear together. No other fields are allowed. ``left`` and
+    ``right`` are region names within the one organization; naming the same
+    region on both sides is legal, and an unknown region simply matches
+    zero events downstream.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "region alert replay comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    required = set(REGION_ALERT_COMPARE_REQUIRED_FIELDS)
+    allowed = set(REGION_ALERT_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right", "type"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold", "suppressionWindow"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "type": data["type"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "suppressionWindow": data["suppressionWindow"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_allocation_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /decisions/allocate.
 
@@ -2449,6 +2531,218 @@ def alert_replay_steps(
             }
         )
     return steps
+
+
+def _aligned_alert_replay_window_rows(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Align one region-comparison replay step's window rows for both sides.
+
+    Mirrors :func:`_aligned_replay_window_rows`: without a range the rows
+    cover the union of the two sides' hit windows; with a range they cover
+    every window intersecting the closed interval ``[from, to]``,
+    intersecting empty windows kept. Rows align by start ascending; a side
+    with no event in a window reports a zero count.
+    """
+    left_counts = _branch_window_counts(left_occurred, params)
+    right_counts = _branch_window_counts(right_occurred, params)
+
+    range_starts = _branch_window_starts(params)
+    if range_starts:
+        starts = range_starts
+    else:
+        starts = sorted(set(left_counts) | set(right_counts))
+
+    return [
+        {
+            "start": start,
+            "leftCount": left_counts.get(start, 0),
+            "rightCount": right_counts.get(start, 0),
+        }
+        for start in starts
+    ]
+
+
+def compare_region_alert_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two regions' step-by-step alert replays by event id.
+
+    Each ``events`` list is a single locked ledger snapshot already
+    filtered to the caller's organization and one verbatim region (an
+    unknown region is simply an empty list), and each side replays through
+    the exact published region-alert-replay contract of
+    :func:`alert_replay_steps`: events of other types never open a step,
+    matching events enter by ``occurredAt`` ascending and then ``eventId``
+    in Unicode code-point order, windows start at zero and are
+    left-closed/right-open at a fixed width, the peak is the largest count
+    with ties to the earliest start, and below the threshold a step is
+    ``observe``; a threshold hit is compared with that side's most recent
+    simulated alert peak start and suppression window, opening a new
+    simulated alert (distance at least the suppression window) or
+    suppressing against the prior one. Each side runs its own one-based
+    simulated alert identifiers independently; the alert store is never
+    read or written and the service-wide counter never advances.
+
+    The two replays align by ``eventId``: an identifier reached by both
+    sides is one shared step on which both prefixes extend; an identifier
+    reached by only one side is its own step on which the other side stays
+    put and is not reset. Aligned steps are ordered by occurred time and
+    then identifier in Unicode code-point order, exactly like one merged
+    replay; when the two sides disagree on a shared identifier's time the
+    earlier one is reported. Every step reports the event id and time, the
+    window rows of the two accumulated prefixes aligned by start (a side
+    with no event in a window counts zero), each side's peak start and
+    count, its action, alert id and suppressed count, and an ``equal``
+    marker that looks only at peak start, peak count and action. When
+    neither region holds a matching event there are no steps at all.
+    """
+    threshold = params["threshold"]
+    suppression_window = params["suppressionWindow"]
+
+    left_stream = [event for event in left_events if event["type"] == params["type"]]
+    right_stream = [
+        event for event in right_events if event["type"] == params["type"]
+    ]
+
+    left_by_id = {event["eventId"]: event for event in left_stream}
+    right_by_id = {event["eventId"]: event for event in right_stream}
+
+    # One aligned step per identifier in the union; a shared identifier's
+    # reported time is the earlier of the two sides' times.
+    step_times: dict[str, int] = {}
+    for event in left_stream:
+        step_times[event["eventId"]] = event["occurredAt"]
+    for event in right_stream:
+        event_id = event["eventId"]
+        if event_id in step_times:
+            step_times[event_id] = min(step_times[event_id], event["occurredAt"])
+        else:
+            step_times[event_id] = event["occurredAt"]
+
+    def side_state() -> dict[str, Any]:
+        # accumulated: timestamps seen on this side in aligned step order;
+        # the remaining fields are exactly alert_replay_steps' simulation.
+        # ``last`` is the result of the side's most recent own replay step;
+        # a side that has not taken an event yet reports the empty-prefix
+        # decision and, like a frozen side, never advances suppression.
+        return {
+            "accumulated": [],
+            "prior_start": None,
+            "prior_alert_id": None,
+            "suppressed_count": 0,
+            "alert_counter": 0,
+            "last": {
+                "peakStart": None,
+                "peakCount": 0,
+                "action": "observe",
+                "alertId": None,
+                "suppressedCount": None,
+            },
+        }
+
+    def advance_side(state: dict[str, Any]) -> dict[str, Any]:
+        """Run one own-event replay step, advancing the suppression state."""
+        windows = _windows_from_occurred(
+            state["accumulated"],
+            params["windowSize"],
+            params["from"],
+            params["to"],
+        )
+        peak = _peak_from_windows(windows, threshold)
+        peak_start = peak["peakStart"]
+        peak_count = peak["peakCount"]
+
+        if peak_count < threshold:
+            action = "observe"
+            alert_id = None
+            suppressed_count = None
+        elif (
+            state["prior_start"] is None
+            or peak_start - state["prior_start"] >= suppression_window
+        ):
+            state["alert_counter"] += 1
+            alert_id = f"alert-{state['alert_counter']}"
+            action = "escalate"
+            suppressed_count = 0
+            state["suppressed_count"] = 0
+            state["prior_start"] = peak_start
+            state["prior_alert_id"] = alert_id
+        else:
+            action = "suppress"
+            alert_id = state["prior_alert_id"]
+            state["suppressed_count"] += 1
+            suppressed_count = state["suppressed_count"]
+
+        decision = {
+            "peakStart": peak_start,
+            "peakCount": peak_count,
+            "action": action,
+            "alertId": alert_id,
+            "suppressedCount": suppressed_count,
+        }
+        state["last"] = decision
+        return decision
+
+    steps: list[dict[str, Any]] = []
+    left_state = side_state()
+    right_state = side_state()
+    for event_id in sorted(step_times, key=lambda eid: (step_times[eid], eid)):
+        left_event = left_by_id.get(event_id)
+        right_event = right_by_id.get(event_id)
+        # Only the side that actually reaches this identifier takes a replay
+        # step; the other side stays put — its accumulated prefix and its
+        # suppression state are neither cleared nor advanced.
+        if left_event is not None:
+            left_state["accumulated"].append(left_event["occurredAt"])
+            left_side = advance_side(left_state)
+        else:
+            left_side = left_state["last"]
+        if right_event is not None:
+            right_state["accumulated"].append(right_event["occurredAt"])
+            right_side = advance_side(right_state)
+        else:
+            right_side = right_state["last"]
+
+        windows = _aligned_alert_replay_window_rows(
+            left_state["accumulated"], right_state["accumulated"], params
+        )
+        equal = (
+            left_side["peakStart"],
+            left_side["peakCount"],
+            left_side["action"],
+        ) == (
+            right_side["peakStart"],
+            right_side["peakCount"],
+            right_side["action"],
+        )
+        steps.append(
+            {
+                "eventId": event_id,
+                "occurredAt": step_times[event_id],
+                "windows": windows,
+                "left": left_side,
+                "right": right_side,
+                "equal": equal,
+            }
+        )
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "type": params["type"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "suppressionWindow": params["suppressionWindow"],
+        "from": params["from"],
+        "to": params["to"],
+        "steps": steps,
+    }
 
 
 def _aligned_replay_window_rows(
@@ -3424,6 +3718,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/alerts/region/evaluate":
             self._evaluate_region_alert()
+            return
+        if path == "/alerts/regions/compare/replay/decisions":
+            self._compare_region_alert_replay_decisions()
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
@@ -5679,6 +5976,67 @@ class Handler(BaseHTTPRequestHandler):
             },
             newline=True,
         )
+
+    def _compare_region_alert_replay_decisions(self) -> None:
+        """Serve POST /alerts/regions/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two regions' alert replay
+        decisions within one organization. The verdict order matches the
+        other replay comparisons: the credential is authenticated first,
+        then the media type and body shape are validated, then the body
+        fields, and only then is the organization compared with the
+        credential's. Both ``read`` and ``write`` credentials may call it;
+        the comparison never writes the ledger, reservation inventory, or
+        alert store, never advances the alert identifier counter, and never
+        implicitly creates a region. An unknown region simply matches zero
+        events and yields no steps of its own; the same region name on both
+        sides is legal.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_region_alert_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+
+        # The organization decision happens before either region name is
+        # inspected; regions need no registration, so an unknown name is
+        # simply an empty match rather than an error.
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Each side reads the main ledger in one locked snapshot, already
+        # scoped to the organization and the verbatim region and sorted by
+        # occurredAt then eventId; the aligned steps are then recomputed
+        # purely from those copies without touching the alert store, so
+        # identical submissions return byte-identical JSON.
+        left_events = self.server.ledger.list_for_organization_region(  # type: ignore[attr-defined]
+            organization_id, params["left"]
+        )
+        right_events = self.server.ledger.list_for_organization_region(  # type: ignore[attr-defined]
+            organization_id, params["right"]
+        )
+        result = compare_region_alert_replay_decisions(
+            left_events, right_events, params
+        )
+        self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _list_region_alerts(self, query: str) -> None:
         """Serve GET /alerts/region.
