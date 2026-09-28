@@ -93,6 +93,21 @@ REGION_ALERT_COMPARE_FIELDS = (
     REGION_ALERT_COMPARE_REQUIRED_FIELDS + REGION_ALERT_COMPARE_OPTIONAL_FIELDS
 )
 
+# The type-dimension counterpart names the two sides' event types directly,
+# so the body carries left/right types but no single shared "type" field.
+TYPE_ALERT_COMPARE_REQUIRED_FIELDS = (
+    "organizationId",
+    "left",
+    "right",
+    "windowSize",
+    "threshold",
+    "suppressionWindow",
+)
+TYPE_ALERT_COMPARE_OPTIONAL_FIELDS = ("from", "to")
+TYPE_ALERT_COMPARE_FIELDS = (
+    TYPE_ALERT_COMPARE_REQUIRED_FIELDS + TYPE_ALERT_COMPARE_OPTIONAL_FIELDS
+)
+
 BRANCH_EVENT_COMPARE_FIELDS = ("organizationId", "left", "right")
 
 BRANCH_RESERVATION_COMPARE_FIELDS = ("organizationId", "left", "right")
@@ -2066,6 +2081,75 @@ def validate_region_alert_replay_compare_request(data: Any) -> dict[str, Any]:
     )
 
 
+def validate_type_alert_replay_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /alerts/types/compare/replay/decisions.
+
+    The type-dimension counterpart of
+    :func:`validate_region_alert_replay_compare_request`: required fields
+    organizationId, left, right, windowSize, threshold, and
+    suppressionWindow; optional fields from and to, which must appear
+    together. Unlike the region comparison there is no shared ``type``
+    field — ``left`` and ``right`` themselves name the two event types,
+    matched verbatim downstream; the same type name on both sides is
+    legal, and an unknown type simply matches zero events.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "type alert replay comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    required = set(TYPE_ALERT_COMPARE_REQUIRED_FIELDS)
+    allowed = set(TYPE_ALERT_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold", "suppressionWindow"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "suppressionWindow": data["suppressionWindow"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_branch_event_compare_request(data: Any) -> dict[str, str]:
     """Validate a decoded JSON body for POST /branches/compare/events.
 
@@ -2776,6 +2860,27 @@ def compare_snapshot_replay_decisions(
     return compare_branch_replay_decisions(left_events, right_events, params)
 
 
+def _prefix_peak(
+    accumulated: list[int], params: dict[str, Any]
+) -> dict[str, Any]:
+    """The peak of one side's accumulated timestamps for an alert replay.
+
+    Uses the same window rows and peak tie-break as every other replay
+    entry point, but unlike :func:`evaluate_decision` it neither reads nor
+    echoes a ``type`` field, so it serves the region comparison (whose
+    params carry one shared type) and the type comparison (whose params
+    carry only the two side names) identically. The caller derives the
+    suppression action from the returned start/count itself.
+    """
+    windows = _windows_from_occurred(
+        accumulated,
+        params["windowSize"],
+        params["from"],
+        params["to"],
+    )
+    return _peak_from_windows(windows, params["threshold"])
+
+
 def _empty_alert_side_state() -> dict[str, Any]:
     """One side's private simulated-alert state before its first event."""
     return {
@@ -2788,26 +2893,27 @@ def _empty_alert_side_state() -> dict[str, Any]:
     }
 
 
-def _region_alert_side_decision(
+def _alert_replay_side_decision(
     state: dict[str, Any], event: dict[str, Any] | None, params: dict[str, Any]
 ) -> dict[str, Any]:
     """Advance (or freeze) one side and return its alert replay decision.
 
-    With ``event`` set the side accumulates that event and runs the exact
-    suppression rule of :func:`alert_replay_steps` against the most recent
-    simulated alert *within this side's own replay*; simulated identifiers
-    run a private one-based sequence. With ``event`` None the aligned step
-    belongs to the other side, so this side neither accumulates nor re-runs
-    the rule — its prefix is not cleared and the step reports the decision
-    of its own last replay step (the initial observe state when it has not
-    moved yet).
+    Shared by the region- and type-dimension alert replay comparisons; the
+    suppression mechanics are identical for both. With ``event`` set the
+    side accumulates that event and runs the exact suppression rule of
+    :func:`alert_replay_steps` against the most recent simulated alert
+    *within this side's own replay*; simulated identifiers run a private
+    one-based sequence. With ``event`` None the aligned step belongs to the
+    other side, so this side neither accumulates nor re-runs the rule — its
+    prefix is not cleared and the step reports the decision of its own last
+    replay step (the initial observe state when it has not moved yet).
     """
     accumulated = state["accumulated"]
     if event is None:
         last = state["last"]
         if last is not None:
             return dict(last)
-        peak = evaluate_decision(accumulated, params)
+        peak = _prefix_peak(accumulated, params)
         return {
             "peakStart": peak["peakStart"],
             "peakCount": peak["peakCount"],
@@ -2817,7 +2923,7 @@ def _region_alert_side_decision(
         }
 
     accumulated.append(event["occurredAt"])
-    peak = evaluate_decision(accumulated, params)
+    peak = _prefix_peak(accumulated, params)
     peak_start = peak["peakStart"]
     peak_count = peak["peakCount"]
 
@@ -2858,42 +2964,38 @@ def _region_alert_side_decision(
     return decision
 
 
-def compare_region_alert_replay_decisions(
-    left_events: list[dict[str, Any]],
-    right_events: list[dict[str, Any]],
+def _align_alert_replay_decisions(
+    left_stream: list[dict[str, Any]],
+    right_stream: list[dict[str, Any]],
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Align two regions' step-by-step alert replay decisions by event id.
+    """Align two sides' step-by-step alert replay decisions by event id.
 
-    The alert-suppression counterpart of
-    :func:`compare_branch_replay_decisions`, reusing its event-id alignment
-    and window rows. Each ``events`` list is a single locked snapshot of one
-    region's events for the caller's organization, already filtered to the
-    verbatim region; events of other types never open a step. Each side
-    accumulates its own matching events in ``occurredAt`` then ``eventId``
-    order and runs the suppression simulation of :func:`alert_replay_steps`
-    with **private** state: an identifier reached by both sides is one
-    shared step on which both simulations advance, an identifier reached by
-    only one side is its own step on which the other side stays put with
-    its prefix and prior simulated alert untouched. Simulated alert
-    identifiers restart at ``alert-1`` independently on each side; the
-    alert store, the service-wide counter, the ledger, and reservations are
-    never read or written, so repeated calls are byte-for-byte identical.
+    Dimension-neutral core shared by the region and type alert replay
+    comparisons. Each ``stream`` is already filtered to one side's matching
+    events (the caller scopes the region and/or type) for the caller's
+    organization. Each side accumulates its own events in ``occurredAt``
+    then ``eventId`` order and runs the suppression simulation of
+    :func:`alert_replay_steps` with **private** state: an identifier
+    reached by both sides is one shared step on which both simulations
+    advance, an identifier reached by only one side is its own step on
+    which the other side stays put with its prefix and prior simulated
+    alert untouched. Simulated alert identifiers restart at ``alert-1``
+    independently on each side; the alert store, the service-wide
+    counter, the ledger, and reservations are never read or written, so
+    repeated calls are byte-for-byte identical.
 
     Aligned steps are ordered by occurred time and then identifier in
     Unicode code-point order; a shared identifier whose sides disagree on
-    time reports the earlier one. Every step carries the event id/time, the
-    two prefixes' window rows aligned by start (a missing side counts
+    time reports the earlier one. Every step carries the event id/time,
+    the two prefixes' window rows aligned by start (a missing side counts
     zero), and ``decision`` with ``left``/``right`` blocks of
     ``peakStart``, ``peakCount``, ``action``, ``alertId`` and
     ``suppressedCount``; ``equal`` considers only the peak start, count,
-    and action, never the alert identity.
+    and action, never the alert identity. The echoed body carries the
+    common fields; a dimension that also names a shared scope (the region
+    comparison's single ``type``) adds that key itself.
     """
-    left_stream = [event for event in left_events if event["type"] == params["type"]]
-    right_stream = [
-        event for event in right_events if event["type"] == params["type"]
-    ]
-
     left_by_id = {event["eventId"]: event for event in left_stream}
     right_by_id = {event["eventId"]: event for event in right_stream}
 
@@ -2915,10 +3017,10 @@ def compare_region_alert_replay_decisions(
     for event_id in sorted(step_times, key=lambda eid: (step_times[eid], eid)):
         left_event = left_by_id.get(event_id)
         right_event = right_by_id.get(event_id)
-        left_decision = _region_alert_side_decision(
+        left_decision = _alert_replay_side_decision(
             left_state, left_event, params
         )
-        right_decision = _region_alert_side_decision(
+        right_decision = _alert_replay_side_decision(
             right_state, right_event, params
         )
 
@@ -2951,7 +3053,6 @@ def compare_region_alert_replay_decisions(
         "organizationId": params["organizationId"],
         "left": params["left"],
         "right": params["right"],
-        "type": params["type"],
         "windowSize": params["windowSize"],
         "threshold": params["threshold"],
         "suppressionWindow": params["suppressionWindow"],
@@ -2959,6 +3060,54 @@ def compare_region_alert_replay_decisions(
         "to": params["to"],
         "steps": steps,
     }
+
+
+def compare_region_alert_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two regions' step-by-step alert replay decisions by event id.
+
+    The region-dimension wrapper over :func:`_align_alert_replay_decisions`.
+    Each ``events`` list is a single locked snapshot of one region's events
+    for the caller's organization, already filtered to the verbatim region;
+    events of other types never open a step. Both sides share the one
+    request ``type``, so the result additionally echoes it.
+    """
+    left_stream = [event for event in left_events if event["type"] == params["type"]]
+    right_stream = [
+        event for event in right_events if event["type"] == params["type"]
+    ]
+    result = _align_alert_replay_decisions(left_stream, right_stream, params)
+    result["type"] = params["type"]
+    return result
+
+
+def compare_type_alert_replay_decisions(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Align two event types' step-by-step alert replay decisions by event id.
+
+    The type-dimension counterpart of
+    :func:`compare_region_alert_replay_decisions`: the two sides name two
+    event types directly rather than two regions, so the left stream keeps
+    ``params["left"]`` events and the right stream keeps ``params["right"]``
+    events. Each ``events`` list is a single locked snapshot of one
+    organization's events (region attribution is irrelevant here); events
+    of the other side's type never open a step on this side. There is no
+    single shared ``type`` field, so the result echoes only the two type
+    names. Suppression state, simulated identifier numbering, window rows,
+    alignment order, the equality marker, and the read-only contract are
+    all identical to the region comparison.
+    """
+    left_stream = [event for event in left_events if event["type"] == params["left"]]
+    right_stream = [
+        event for event in right_events if event["type"] == params["right"]
+    ]
+    return _align_alert_replay_decisions(left_stream, right_stream, params)
 
 
 def _compare_events(
@@ -3574,6 +3723,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/alerts/regions/compare/replay/decisions":
             self._compare_region_alert_replay_decisions()
+            return
+        if path == "/alerts/types/compare/replay/decisions":
+            self._compare_type_alert_replay_decisions()
             return
 
         if path.startswith("/snapshots/"):
@@ -5040,6 +5192,60 @@ class Handler(BaseHTTPRequestHandler):
         result = compare_region_alert_replay_decisions(
             left_events, right_events, params
         )
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_type_alert_replay_decisions(self) -> None:
+        """Serve POST /alerts/types/compare/replay/decisions.
+
+        Read-only, step-by-step alignment of two event types' alert replay
+        decisions: the type-alert counterpart of the region comparison. The
+        verdict order matches the other POST comparisons: the credential is
+        authenticated first, then the media type and body shape are
+        validated, and only then is the requested organization compared
+        with the credential's. Type names are matched verbatim against the
+        ledger and are never existence-checked or implicitly created: an
+        unknown type simply contributes no events, and using the same type
+        name for both sides is legal. Both ``read`` and ``write``
+        credentials may call it; neither side touches the alert store, the
+        ledger, or the reservation inventory, and identical submissions
+        return byte-identical JSON.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_type_alert_replay_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Each side takes one locked ledger snapshot of the organization's
+        # events and keeps only its own verbatim type; an unknown type just
+        # yields no rows. The aligned alert simulation is then recomputed
+        # purely from those copies with private per-side state, so the
+        # alert store and its counters are never read or advanced and
+        # repeated calls are byte-identical.
+        events = self.server.ledger.list_for_organization(  # type: ignore[attr-defined]
+            organization_id
+        )
+        result = compare_type_alert_replay_decisions(events, events, params)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_snapshot_events(self) -> None:
