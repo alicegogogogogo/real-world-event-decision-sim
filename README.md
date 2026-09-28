@@ -86,6 +86,7 @@ data is forbidden.
   `GET /events/region/replay/decisions`,
   `GET /alerts/replay/decisions`,
   `GET /alerts/region/replay/decisions`,
+  `POST /alerts/regions/compare/replay/decisions`,
   `GET /branches/{branchId}/resources`,
   `GET /branches/{branchId}/events/replay/decisions`,
   `GET /snapshots/{snapshotId}/resources`,
@@ -986,6 +987,129 @@ curl 'http://127.0.0.1:8000/alerts/region/replay/decisions?organizationId=org-1&
   organization registered to the caller, or an unknown region, computes as
   zero events and returns normally with an empty `steps` array; a failed
   request leaves no trace.
+
+### `POST /alerts/regions/compare/replay/decisions`
+
+A read-only, step-by-step alignment of two regions' **alert** replay
+decisions. Where `GET /alerts/region/replay/decisions` replays one
+region's matching events and simulates the suppression rule within that
+replay, this entry point runs that same replay independently for two
+regions of one organization and aligns the two replays step by step by
+`eventId`. Nothing is read for mutation or written: the alert store is
+neither read nor written, the service-wide alert counter never advances,
+the event ledger and reservation inventory are never modified, no region
+is implicitly created, a failed request leaves no trace, and identical
+submissions return byte-for-byte identical JSON. Both `read` and `write`
+credentials may call it. Requires `Content-Type: application/json` and a
+Bearer credential bound to the request's `organizationId`. The body must
+be a JSON object containing exactly these fields:
+
+| Field               | Rule                                                          |
+| ------------------- | ------------------------------------------------------------ |
+| `organizationId`    | required, non-empty string; both regions must belong to it   |
+| `left`              | required, non-empty region name (the left-hand side)         |
+| `right`             | required, non-empty region name (the right-hand side)        |
+| `type`              | required, non-empty string                                   |
+| `windowSize`        | required, positive integer (no booleans, floats, or strings) |
+| `threshold`         | required, positive integer (no booleans, floats, or strings) |
+| `suppressionWindow` | required, positive integer (no booleans, floats, or strings) |
+| `from`              | optional; non-negative integer, present only together with `to` |
+| `to`                | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Using the same region name for `left` and `right`
+is legal; the two sides are then equal by construction. Region names are
+matched verbatim the way `GET /alerts/region/replay/decisions` matches
+them and are not existence-checked, so an unknown region simply
+contributes no events.
+
+Each side replays only that region's own events matching both the
+organization and `type`; region attribution follows the main rule (only
+a non-empty string payload `region` attributes an event, matched
+verbatim with no normalization), other organizations' data never enters
+the result, and events of other types never open a step. On each side
+the matching events are ordered by `occurredAt` ascending and then
+`eventId` in Unicode code-point order and accumulated one at a time. The
+two replays are then aligned by `eventId`:
+
+- an identifier reached by both sides is one shared step on which both
+  sides accumulate their event;
+- an identifier reached by only one side is its own step on which that
+  side accumulates its event and the other side stays put: its prefix is
+  not cleared and its suppression state (its prior simulated alert) is
+  untouched;
+- the aligned steps are ordered by occurred time ascending and then
+  `eventId` in Unicode code-point order. When the two sides disagree on
+  a shared identifier's `occurredAt`, the earlier time is reported;
+- when neither side holds a matching event, `steps` is `[]`.
+
+Windows start at `0` and each covers `[start, start + windowSize)`, with
+the exact same division as the other replay entry points:
+
+- Without `from`/`to`, a step's window rows cover the **union** of the
+  windows hit by the two accumulated prefixes.
+- With `from`/`to`, events outside the closed interval `[from, to]`
+  still arrive as replay steps in order, but every window intersecting
+  the interval is returned at every step, including intersecting empty
+  windows with count `0`.
+
+Each step carries:
+
+- `eventId` and `occurredAt` identifying the aligned step;
+- `windows`, the two prefixes' window-count rows aligned by `start`
+  ascending. Each row is `{"start", "leftCount", "rightCount", "equal"}`;
+  a side with no event in a window reports `0`, and `equal` is true
+  exactly when the two counts agree;
+- `decision.left` and `decision.right`, each with `peakStart`,
+  `peakCount`, `action`, `alertId`, and `suppressedCount`: the peak of
+  that side's accumulated prefix is the largest window count with ties
+  to the earliest start, and the suppression rule runs exactly like the
+  single-region alert replay against the most recent simulated alert
+  **within that side's own replay** — below the threshold is `"observe"`
+  with null identity, a peak at least `suppressionWindow` after the
+  prior simulated alert's peak start opens a new simulated alert
+  (`"escalate"` with a zero suppressed count), and a closer peak is
+  `"suppress"` against the prior alert with the new cumulative count.
+  Simulated alert identifiers (`alert-1`, `alert-2`, …) restart
+  independently on each side and are unrelated to committed alerts.
+  `decision.equal` is true exactly when the two sides agree on
+  `peakStart`, `peakCount`, and `action`; alert identity and suppressed
+  counts never participate.
+
+The `200` response echoes the organization, the two region names, the
+type, window width, threshold, suppression window, and the (possibly
+null) range, and carries the ordered `steps` array. It is compact JSON
+with keys sorted by code point, integer values kept as integers,
+booleans kept as booleans, and one trailing newline:
+
+```json
+{"from":null,"left":"north","organizationId":"org-1","right":"south","steps":[{"decision":{"equal":true,"left":{"action":"observe","alertId":null,"peakCount":1,"peakStart":0,"suppressedCount":null},"right":{"action":"observe","alertId":null,"peakCount":1,"peakStart":0,"suppressedCount":null}},"eventId":"evt-1","occurredAt":10,"windows":[{"equal":true,"leftCount":1,"rightCount":1,"start":0}]},{"decision":{"equal":false,"left":{"action":"escalate","alertId":"alert-1","peakCount":2,"peakStart":0,"suppressedCount":0},"right":{"action":"observe","alertId":null,"peakCount":1,"peakStart":0,"suppressedCount":null}},"eventId":"evt-2","occurredAt":20,"windows":[{"equal":false,"leftCount":2,"rightCount":1,"start":0}]},{"decision":{"equal":true,"left":{"action":"escalate","alertId":"alert-1","peakCount":2,"peakStart":0,"suppressedCount":0},"right":{"action":"escalate","alertId":"alert-1","peakCount":2,"peakStart":0,"suppressedCount":0}},"eventId":"evt-3","occurredAt":20,"windows":[{"equal":true,"leftCount":2,"rightCount":2,"start":0}]},{"decision":{"equal":false,"left":{"action":"suppress","alertId":"alert-1","peakCount":2,"peakStart":0,"suppressedCount":1},"right":{"action":"escalate","alertId":"alert-1","peakCount":2,"peakStart":0,"suppressedCount":0}},"eventId":"evt-4","occurredAt":65,"windows":[{"equal":true,"leftCount":2,"rightCount":2,"start":0},{"equal":false,"leftCount":1,"rightCount":0,"start":60}]}],"suppressionWindow":120,"threshold":2,"to":null,"type":"incident.created","windowSize":60}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/alerts/regions/compare/replay/decisions \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"north","right":"south","type":"incident.created","windowSize":60,"threshold":3,"suppressionWindow":120}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+media type and body, then the organization.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer
+  credential is missing, malformed, or not registered; the body carries
+  no business content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body,
+  a missing, extra, duplicated, or blank field, a blank or non-string
+  `organizationId`/`left`/`right`/`type`, a non-positive-integer
+  `windowSize`/`threshold`/`suppressionWindow`, unpaired or non-integer
+  `from`/`to`, or `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound
+  to a different organization. The organization decision happens before
+  either region name is inspected; an unknown region is not an error and
+  computes as zero events.
 
 ## Snapshots and branches
 
