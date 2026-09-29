@@ -123,7 +123,8 @@ EVENT_TYPE_COMPARE_FIELDS = (
     EVENT_TYPE_COMPARE_REQUIRED_FIELDS + EVENT_TYPE_COMPARE_OPTIONAL_FIELDS
 )
 
-# The event (non-alert) replay region-dimension comparison carries no
+# The event (non-alert) region-dimension comparisons — the one-shot window
+# comparison and the step-by-step replay comparison — carry no
 # suppressionWindow and no shared "type" field: like the type-dimension event
 # comparison, left/right name the two sides directly — here the two region
 # names, matched verbatim by payload attribution downstream.
@@ -396,6 +397,27 @@ class EventLedger:
                 for event in self._events.values()
                 if event["organizationId"] == organization_id
                 and event["type"] == event_type
+                and event_region(event) == region
+            ]
+        values.sort()
+        return values
+
+    def occurred_at_values_for_region_all_types(
+        self, organization_id: str, region: str
+    ) -> list[int]:
+        """Sorted occurredAt values of an org's events in one region.
+
+        The all-types counterpart of
+        :meth:`occurred_at_values_for_region`: every event attributed to
+        the verbatim region counts, whatever its type. Consistent locked
+        snapshot, like :meth:`occurred_at_values`; events without a
+        non-empty string payload ``region`` never match.
+        """
+        with self._lock:
+            values = [
+                event["occurredAt"]
+                for event in self._events.values()
+                if event["organizationId"] == organization_id
                 and event_region(event) == region
             ]
         values.sort()
@@ -2249,6 +2271,75 @@ def validate_event_type_replay_compare_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_event_region_compare_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /events/regions/compare.
+
+    The one-shot window comparison shares its body shape with the
+    step-by-step replay comparison
+    (:func:`validate_event_region_replay_compare_request`): required
+    fields organizationId, left, right, windowSize and threshold;
+    optional fields from and to, which must appear together. ``left``
+    and ``right`` name the two sides' regions directly (there is no
+    shared ``type`` field); the region names are matched verbatim
+    against payload attribution downstream, the same region name on both
+    sides is legal, and an unknown region simply matches zero events.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "event region comparison body must be a JSON object"
+        )
+
+    keys = set(data)
+    required = set(EVENT_REGION_COMPARE_REQUIRED_FIELDS)
+    allowed = set(EVENT_REGION_COMPARE_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - allowed)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "left", "right"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    for field in ("windowSize", "threshold"):
+        if not _is_positive_integer(data[field]):
+            raise EventValidationError(f"{field} must be a positive integer")
+
+    # from and to are either both present or both omitted.
+    if "from" in keys or "to" in keys:
+        if "from" not in keys or "to" not in keys:
+            raise EventValidationError(
+                "from and to must be omitted together or both be present"
+            )
+        from_value = data["from"]
+        to_value = data["to"]
+        if not _is_non_negative_integer(from_value) or not _is_non_negative_integer(
+            to_value
+        ):
+            raise EventValidationError("from and to must be non-negative integers")
+        if from_value > to_value:
+            raise EventValidationError("from must be less than or equal to to")
+    else:
+        from_value = None
+        to_value = None
+
+    return {
+        "organizationId": data["organizationId"],
+        "left": data["left"],
+        "right": data["right"],
+        "windowSize": data["windowSize"],
+        "threshold": data["threshold"],
+        "from": from_value,
+        "to": to_value,
+    }
+
+
 def validate_event_region_replay_compare_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /events/regions/compare/replay/decisions.
 
@@ -3470,6 +3561,70 @@ def compare_event_region_replay_decisions(
     }
 
 
+def compare_event_regions(
+    left_occurred: list[int],
+    right_occurred: list[int],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Diff two regions' window counts and peaks from timestamp snapshots.
+
+    The region-dimension counterpart of :func:`compare_branches` on the
+    main ledger: each ``occurred`` list is a single locked snapshot of
+    one region's matching events of the caller's organization — every
+    type attributed to the verbatim region counts — so the window rows
+    and the peak for a side derive from the same read; nothing is
+    written. There is no shared ``type`` field, so the result echoes
+    only the two region names. Without a range, rows cover the union of
+    the two sides' hit windows; with a range, rows cover every window
+    intersecting ``[from, to]``, empty windows kept. Rows align by start
+    ascending and carry each side's count plus an ``equal`` marker. The
+    ``decision`` block holds each side's peak and action and a marker
+    saying whether the two peak results agree; an empty side reports
+    ``peakStart`` null, ``peakCount`` zero, and ``observe``.
+    """
+    left_counts = _branch_window_counts(left_occurred, params)
+    right_counts = _branch_window_counts(right_occurred, params)
+
+    range_starts = _branch_window_starts(params)
+    if range_starts:
+        starts = range_starts
+    else:
+        starts = sorted(set(left_counts) | set(right_counts))
+
+    windows = []
+    for start in starts:
+        left_count = left_counts.get(start, 0)
+        right_count = right_counts.get(start, 0)
+        windows.append(
+            {
+                "start": start,
+                "leftCount": left_count,
+                "rightCount": right_count,
+                "equal": left_count == right_count,
+            }
+        )
+
+    left_decision = _prefix_peak(left_occurred, params)
+    right_decision = _prefix_peak(right_occurred, params)
+    decision = {
+        "left": left_decision,
+        "right": right_decision,
+        "equal": left_decision == right_decision,
+    }
+
+    return {
+        "organizationId": params["organizationId"],
+        "left": params["left"],
+        "right": params["right"],
+        "windowSize": params["windowSize"],
+        "threshold": params["threshold"],
+        "from": params["from"],
+        "to": params["to"],
+        "decision": decision,
+        "windows": windows,
+    }
+
+
 def _compare_events(
     left_by_id: dict[str, dict[str, Any]],
     right_by_id: dict[str, dict[str, Any]],
@@ -4089,6 +4244,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/events/types/compare/replay/decisions":
             self._compare_event_type_replay_decisions()
+            return
+        if path == "/events/regions/compare":
+            self._compare_event_regions()
             return
         if path == "/events/regions/compare/replay/decisions":
             self._compare_event_region_replay_decisions()
@@ -5669,6 +5827,68 @@ class Handler(BaseHTTPRequestHandler):
             organization_id
         )
         result = compare_event_type_replay_decisions(events, events, params)
+        self._write_json(HTTPStatus.OK, result, newline=True)
+
+    def _compare_event_regions(self) -> None:
+        """Serve POST /events/regions/compare.
+
+        Read-only, one-shot window comparison of two regions' event
+        counts on the main ledger: the region-dimension counterpart of
+        ``POST /branches/compare`` and the one-shot companion of
+        ``POST /events/regions/compare/replay/decisions``. The verdict
+        order matches the other POST comparisons: the credential is
+        authenticated first, then the media type and body shape are
+        validated, and only then is the requested organization compared
+        with the credential's. Region names follow the public
+        attribution rule — only a non-empty string payload region
+        attributes an event, matched verbatim — and are never
+        existence-checked or implicitly created: an unknown region
+        simply contributes no events, and using the same region name for
+        both sides is legal. Every type attributed to the region counts.
+        Both ``read`` and ``write`` credentials may call it; the
+        decision is threshold-only (observe versus escalate) with no
+        alert identity or suppression count, and neither the alert
+        store, the ledger, nor the reservation inventory is touched.
+        Identical submissions return byte-identical JSON.
+        """
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+
+        data = self._json_request_body(
+            newline=True, reject_duplicate_keys=True
+        )
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_event_region_compare_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = params["organizationId"]
+        if not self._authorize_organization(
+            subject, organization_id, newline=True
+        ):
+            return
+
+        # Each side takes one locked timestamp snapshot scoped to the
+        # verbatim region, every type included; an unknown region just
+        # contributes no events. The pure comparison function recomputes
+        # both sides from those copies, so the read is repeatable with
+        # no writes to the ledger, inventory, or alert store.
+        left_occurred = self.server.ledger.occurred_at_values_for_region_all_types(  # type: ignore[attr-defined]
+            organization_id, params["left"]
+        )
+        right_occurred = self.server.ledger.occurred_at_values_for_region_all_types(  # type: ignore[attr-defined]
+            organization_id, params["right"]
+        )
+        result = compare_event_regions(left_occurred, right_occurred, params)
         self._write_json(HTTPStatus.OK, result, newline=True)
 
     def _compare_event_region_replay_decisions(self) -> None:

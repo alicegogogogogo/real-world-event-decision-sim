@@ -89,6 +89,7 @@ data is forbidden.
   `POST /alerts/regions/compare/replay/decisions`,
   `POST /alerts/types/compare/replay/decisions`,
   `POST /events/types/compare/replay/decisions`,
+  `POST /events/regions/compare`,
   `POST /events/regions/compare/replay/decisions`,
   `GET /branches/{branchId}/resources`,
   `GET /branches/{branchId}/events/replay/decisions`,
@@ -534,6 +535,101 @@ media type and body, then the organization.
   to a different organization. The organization decision happens before
   either type name is inspected; an unknown type is not an error and
   computes as zero events.
+
+### `POST /events/regions/compare`
+
+A read-only, one-shot window comparison of two regions' event counts on
+the main ledger — the region-dimension counterpart of
+`POST /branches/compare` and the one-shot companion of
+`POST /events/regions/compare/replay/decisions`. Where the replay
+comparison walks the two regions' events step by step, this entry point
+compares the two sides' final window counts and peak decisions in a
+single response. Nothing is read for mutation or written: the event
+ledger, reservation inventory, and alert store are never modified, a
+failed request leaves no trace, and identical submissions return
+byte-for-byte identical JSON. Both `read` and `write` credentials may
+call it. Requires `Content-Type: application/json` and a Bearer
+credential bound to the request's `organizationId`. The body must be a
+JSON object containing exactly these fields:
+
+| Field            | Rule                                                          |
+| ---------------- | ------------------------------------------------------------ |
+| `organizationId` | required, non-empty string; both regions must belong to it   |
+| `left`           | required, non-empty region name (the left-hand side)         |
+| `right`          | required, non-empty region name (the right-hand side)        |
+| `windowSize`     | required, positive integer (no booleans, floats, or strings) |
+| `threshold`      | required, positive integer (no booleans, floats, or strings) |
+| `from`           | optional; non-negative integer, present only together with `to` |
+| `to`             | optional; non-negative integer, present only together with `from` |
+
+`from` and `to` must be omitted together or supplied together, and must
+satisfy `from <= to`. Using the same region name for `left` and `right`
+is legal; the two sides are then equal item by item. Region attribution
+follows the public rule of `GET /events/region`: only a non-empty
+string payload `region` attributes an event, matched verbatim with no
+normalization, so an event with a missing, empty, or non-string payload
+region never matches either side. Region names are not
+existence-checked and are never implicitly created, so an unknown
+region simply computes as zero events.
+
+Each side counts only its own region's events of the organization;
+other organizations' data never enters either side, and every event
+type attributed to the region counts. Windows start at `0` and each
+covers `[start, start + windowSize)`, with the exact same division as
+the region aggregate entry point:
+
+- Without `from`/`to`, the window rows cover the **union** of the
+  windows hit by the two sides.
+- With `from`/`to`, only events inside the closed interval
+  `[from, to]` count, and every window intersecting the interval is
+  returned, including intersecting empty windows with count `0`.
+
+Each window row is `{"start", "leftCount", "rightCount", "equal"}`,
+aligned by `start` ascending; a side with no event in a window reports
+`0`, and `equal` is true exactly when the two counts agree. The
+`decision` block holds `left` and `right`, each with `peakStart`,
+`peakCount`, and `action`: the peak is the largest window count with
+ties to the earliest start, `"escalate"` at or above `threshold` and
+`"observe"` below it, with `peakStart: null`, `peakCount: 0`, and
+`"observe"` for a side with no counted events. `decision.equal` is
+true exactly when the two sides agree on `peakStart`, `peakCount`, and
+`action`.
+
+The `200` response echoes the organization, the two region names,
+window width, threshold, and the (possibly null) range, and carries
+the `windows` array and the `decision` block; there is no shared
+`type` key. It is compact JSON with keys sorted by code point, integer
+values kept as integers, booleans kept as booleans, and one trailing
+newline:
+
+```json
+{"decision":{"equal":false,"left":{"action":"observe","peakCount":2,"peakStart":0},"right":{"action":"observe","peakCount":1,"peakStart":0}},"from":null,"left":"north","organizationId":"org-1","right":"south","threshold":3,"to":null,"windowSize":60,"windows":[{"equal":false,"leftCount":2,"rightCount":1,"start":0}]}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/events/regions/compare \
+  -H 'Authorization: Bearer tok-1' \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","left":"north","right":"south","windowSize":60,"threshold":3}'
+```
+
+The verdict order is fixed: the credential is checked first, then the
+media type and body, then the organization.
+
+- `401 Unauthorized` (`{"error": "unauthorized"}`) — the Bearer
+  credential is missing, malformed, or not registered; the body carries
+  no business content.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` (`validation_error`) — a non-object body,
+  a missing, extra, duplicated, or blank field, a blank or non-string
+  `organizationId`/`left`/`right`, a non-positive-integer
+  `windowSize`/`threshold`, unpaired or non-integer `from`/`to`, or
+  `from > to`.
+- `403 Forbidden` (`{"error": "forbidden"}`) — the credential is bound
+  to a different organization. The organization decision happens before
+  either region name is inspected; an unknown region is not an error
+  and computes as zero events.
 
 ### `POST /events/regions/compare/replay/decisions`
 
