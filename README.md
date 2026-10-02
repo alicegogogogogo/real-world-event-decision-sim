@@ -111,8 +111,9 @@ data is forbidden.
   `POST /snapshots/compare/resources`,
   `POST /snapshots/{snapshotId}/decisions/evaluate`, and the other
   read-only branch entry points.
-- Committing an event or reservation, evaluating an alert, and creating a
-  snapshot or branch are writes; only a `write` token may call them. A
+- Committing an event or reservation, releasing a reservation, evaluating an
+  alert, and creating a snapshot or branch are writes; only a `write` token
+  may call them. A
   `read` token against a write entry point receives `403`. The authorization
   decision and the ledger/inventory mutation complete under one lock, so a
   rejected request never changes the ledger or inventory.
@@ -830,6 +831,55 @@ requests cannot oversell a resource or lose each other's writes.
   is produced.
 - `422 Unprocessable Entity` — a non-object body, missing or extra fields,
   blank or non-string identifiers, or non-positive/non-integer values.
+
+### `POST /reservations/release`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly these two top-level fields:
+
+| Field           | Rule              |
+| --------------- | ----------------- |
+| `organizationId` | non-empty string |
+| `reservationId` | non-empty string  |
+
+```bash
+curl -X POST http://127.0.0.1:8000/reservations/release \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"organizationId":"org-1","reservationId":"res-1"}'
+```
+
+Releasing a confirmed reservation removes it from the active inventory: its
+quantity stops counting against the resource, the resource's recorded
+`capacity` is kept, and the reservation disappears from
+`GET /reservations?organizationId=...`. The released record is retained as
+audit history, so releasing the same `reservationId` again conflicts instead
+of releasing twice. Later reservations on the same resource reuse the
+recorded capacity and the freed balance, still committing atomically with no
+oversell. Snapshots and branches are isolated copies and are never rewritten
+by a release; a snapshot taken after a release holds only the still-active
+reservations.
+
+A successful response is `200 OK` with compact JSON, stable key order,
+integer values, and a trailing newline, carrying the released record and the
+post-release balances:
+
+```json
+{"capacity":5,"occupied":0,"organizationId":"org-1","quantity":2,"remaining":5,"reservationId":"res-1","resourceId":"r-a"}
+```
+
+- `200 OK` — reservation released; the balances reflect the release.
+- `401 Unauthorized` — missing, malformed, or unregistered credential.
+- `403 Forbidden` — a read-only credential, an organization mismatch, or a
+  `reservationId` owned by another organization; nothing changes.
+- `404 Not Found` (`{"error": "reservation_not_found"}`) — unknown
+  `reservationId`.
+- `409 Conflict` (`{"error": "reservation_released"}`) — the `reservationId`
+  was already released; concurrent releases of one id commit exactly once.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — a non-object body, missing, extra, or
+  duplicated fields, or blank/non-string identifiers.
 
 ### `GET /reservations?organizationId=...`
 
