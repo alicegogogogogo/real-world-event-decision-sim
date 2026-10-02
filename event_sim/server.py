@@ -50,6 +50,8 @@ RESERVATION_FIELDS = (
     "capacity",
 )
 
+RESERVATION_RELEASE_FIELDS = ("organizationId", "reservationId")
+
 TOKEN_FIELDS = ("token", "organizationId", "role")
 ROLES = ("read", "write")
 
@@ -437,13 +439,16 @@ class ReservationInventory:
     Resource capacities are fixed by the first reservation that names the
     resource and are never rewritten. The balance check and the deduction
     happen inside a single lock, so concurrent requests can neither oversell
-    a resource nor lose each other's writes. State lives only for the
-    lifetime of this instance.
+    a resource nor lose each other's writes. Released reservations leave the
+    active inventory but stay in an audit history, so a repeated release of
+    the same reservationId is recognized instead of mistaken for an unknown
+    id. State lives only for the lifetime of this instance.
     """
 
     def __init__(self) -> None:
         self._capacities: dict[str, int] = {}
         self._reservations: dict[str, dict[str, Any]] = {}
+        self._released: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def _occupied_locked(self, resource_id: str) -> int:
@@ -504,6 +509,38 @@ class ReservationInventory:
             self._capacities[resource_id] = capacity
             self._reservations[stored["reservationId"]] = stored
             return "created", self._view_locked(stored)
+
+    def release(
+        self, organization_id: str, reservation_id: str
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Release one active reservation, atomically.
+
+        Returns ``(status, view)`` where status is ``"released"`` when the
+        reservationId was active for this organization (the record leaves the
+        active inventory and its quantity returns to the resource's
+        remaining balance; the recorded capacity is never rewritten),
+        ``"forbidden"`` when the reservationId is or was held by another
+        organization, ``"reservation_released"`` when the reservationId was
+        already released by this organization, or ``"reservation_not_found"``
+        when the reservationId is entirely unknown. Only ``"released"``
+        mutates state; the released record is kept in the audit history so a
+        retry is answered from it, and the view carries the post-release
+        occupied and remaining balances.
+        """
+        with self._lock:
+            record = self._reservations.get(reservation_id)
+            if record is not None:
+                if record["organizationId"] != organization_id:
+                    return "forbidden", None
+                del self._reservations[reservation_id]
+                self._released[reservation_id] = record
+                return "released", self._view_locked(record)
+            released = self._released.get(reservation_id)
+            if released is not None:
+                if released["organizationId"] != organization_id:
+                    return "forbidden", None
+                return "reservation_released", None
+            return "reservation_not_found", None
 
     def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -1859,6 +1896,37 @@ def validate_reservation_request(data: Any) -> dict[str, Any]:
             raise EventValidationError(f"{field} must be a positive integer")
 
     return {field: data[field] for field in RESERVATION_FIELDS}
+
+
+def validate_reservation_release_request(data: Any) -> dict[str, str]:
+    """Validate a decoded JSON body for POST /reservations/release.
+
+    Exactly the ``organizationId`` and ``reservationId`` fields may be
+    present; both must be non-empty, non-blank strings.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError(
+            "reservation release body must be a JSON object"
+        )
+
+    keys = set(data)
+    expected = set(RESERVATION_RELEASE_FIELDS)
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in RESERVATION_RELEASE_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+
+    return {field: data[field] for field in RESERVATION_RELEASE_FIELDS}
 
 
 def _validate_single_identifier_body(
@@ -4160,6 +4228,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.reservations,  # type: ignore[attr-defined]
                 newline=True,
             )
+            return
+        if path == "/reservations/release":
+            self._release_reservation()
             return
         if path == "/decisions/evaluate":
             self._evaluate_decision(self.server.ledger)  # type: ignore[attr-defined]
@@ -6788,6 +6859,66 @@ class Handler(BaseHTTPRequestHandler):
             {"organizationId": organization_id, "reservations": views},
             newline=newline,
         )
+
+    def _release_reservation(self) -> None:
+        subject = self._require_subject(newline=True)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=True)
+            return
+
+        # A duplicated field is a validation failure on this entry point, so
+        # it is rejected as 422 rather than silently keeping the last value.
+        data = self._json_request_body(newline=True, reject_duplicate_keys=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            release = validate_reservation_release_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=True,
+            )
+            return
+
+        organization_id = release["organizationId"]
+
+        def commit() -> tuple[str, dict[str, Any] | None]:
+            return self.server.reservations.release(  # type: ignore[attr-defined]
+                organization_id, release["reservationId"]
+            )
+
+        # The organization/role decision and the release run under the same
+        # outer registry lock, so a forbidden request never reaches the
+        # inventory and two concurrent releases of one id serialize: exactly
+        # one succeeds, the other sees the audited reservation_released.
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=True)
+            return
+        release_status, view = result
+        if release_status == "released":
+            self._write_json(HTTPStatus.OK, view, newline=True)
+        elif release_status == "forbidden":
+            # The reservationId is (or was) held by another organization.
+            self._forbidden(newline=True)
+        elif release_status == "reservation_released":
+            self._write_json(
+                HTTPStatus.CONFLICT,
+                {"error": "reservation_released"},
+                newline=True,
+            )
+        else:
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "reservation_not_found"},
+                newline=True,
+            )
 
     # ------------------------------------------------------------------ wiring
 

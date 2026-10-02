@@ -842,6 +842,55 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
 
+### `POST /reservations/release`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly these two top-level fields:
+
+| Field            | Rule              |
+| ---------------- | ----------------- |
+| `organizationId` | non-empty string  |
+| `reservationId`  | non-empty string  |
+
+```bash
+curl -X POST http://127.0.0.1:8000/reservations/release \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"organizationId":"org-1","reservationId":"res-1"}'
+```
+
+Releasing a confirmed reservation removes it from the active inventory: the
+resource's recorded `capacity` is kept, `occupied` drops by the reservation's
+`quantity`, and `remaining` grows by the same amount, so the freed balance
+can be reserved again (still atomically, still never oversold). The released
+record is kept in an audit history, and `GET
+/reservations?organizationId=...` no longer lists it. Snapshots and branches
+already taken are isolated copies and never change; a snapshot taken after
+the release captures only the still-active reservations. A successful
+response is `200 OK` with compact, key-sorted JSON and a trailing newline:
+
+```json
+{"capacity":5,"occupied":0,"organizationId":"org-1","quantity":2,"remaining":5,"reservationId":"res-1","resourceId":"r-a"}
+```
+
+- `200 OK` — the reservation was active for this organization and is now
+  released; the body reports the post-release balances.
+- `401 Unauthorized` — missing, malformed, or unregistered Bearer token.
+- `403 Forbidden` — a read-only credential, a credential for another
+  organization, or a `reservationId` held by another organization.
+- `404 Not Found` (`{"error": "reservation_not_found"}`) — the
+  `reservationId` is entirely unknown.
+- `409 Conflict` (`{"error": "reservation_released"}`) — the `reservationId`
+  was already released; concurrent releases of one id let exactly one
+  request succeed.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — a non-object body, missing, extra, or
+  duplicated fields, or blank/non-string identifiers.
+
+A failed release never changes reservations, balances, snapshots, or
+branches.
+
 ## Alert suppression and escalation
 
 Alerts are held only in the main service process alongside the event
