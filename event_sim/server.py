@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 import threading
 from collections.abc import Callable
@@ -41,6 +42,11 @@ REGION_ALERT_FIELDS = REGION_ALERT_REQUIRED_FIELDS + REGION_ALERT_OPTIONAL_FIELD
 ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
+
+ROUTE_ALLOCATION_REQUIRED_FIELDS = ("organizationId", "edges", "demands", "resources")
+ROUTE_EDGE_FIELDS = ("from", "to", "cost")
+ROUTE_DEMAND_FIELDS = ("demandId", "location", "units", "priority")
+ROUTE_RESOURCE_FIELDS = ("resourceId", "location", "capacity")
 
 RESERVATION_FIELDS = (
     "organizationId",
@@ -1828,6 +1834,193 @@ def validate_allocation_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_route_allocation_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /decisions/route-allocate.
+
+    Required fields: organizationId, edges, demands, resources, and no
+    others. Each edge/demand/resource element must be an object with exactly
+    its fixed fields; demand and resource identifiers must be unique within
+    the request and non-blank, and no directed endpoint pair may repeat.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("route allocation body must be a JSON object")
+
+    keys = set(data)
+    required = set(ROUTE_ALLOCATION_REQUIRED_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    organization_id = data["organizationId"]
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise EventValidationError("organizationId must be a non-empty string")
+
+    raw_edges = data["edges"]
+    raw_demands = data["demands"]
+    raw_resources = data["resources"]
+    if (
+        not isinstance(raw_edges, list)
+        or not isinstance(raw_demands, list)
+        or not isinstance(raw_resources, list)
+    ):
+        raise EventValidationError("edges, demands and resources must be arrays")
+
+    edges: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for index, element in enumerate(raw_edges):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"edges[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(ROUTE_EDGE_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"edges[{index}]: {'; '.join(element_detail)}"
+            )
+        from_location = element["from"]
+        to_location = element["to"]
+        if not isinstance(from_location, str) or not from_location.strip():
+            raise EventValidationError(
+                f"edges[{index}].from must be a non-empty string"
+            )
+        if not isinstance(to_location, str) or not to_location.strip():
+            raise EventValidationError(
+                f"edges[{index}].to must be a non-empty string"
+            )
+        if not _is_positive_integer(element["cost"]):
+            raise EventValidationError(
+                f"edges[{index}].cost must be a positive integer"
+            )
+        pair = (from_location, to_location)
+        if pair in seen_pairs:
+            raise EventValidationError(
+                f"duplicate edge endpoints: {from_location} -> {to_location}"
+            )
+        seen_pairs.add(pair)
+        edges.append(
+            {"from": from_location, "to": to_location, "cost": element["cost"]}
+        )
+
+    demands: list[dict[str, Any]] = []
+    seen_demand_ids: set[str] = set()
+    for index, element in enumerate(raw_demands):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"demands[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(ROUTE_DEMAND_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"demands[{index}]: {'; '.join(element_detail)}"
+            )
+        demand_id = element["demandId"]
+        if not isinstance(demand_id, str) or not demand_id.strip():
+            raise EventValidationError(
+                f"demands[{index}].demandId must be a non-empty string"
+            )
+        if demand_id in seen_demand_ids:
+            raise EventValidationError(
+                f"duplicate demandId: {demand_id}"
+            )
+        if not isinstance(element["location"], str) or not element["location"].strip():
+            raise EventValidationError(
+                f"demands[{index}].location must be a non-empty string"
+            )
+        if not _is_positive_integer(element["units"]):
+            raise EventValidationError(
+                f"demands[{index}].units must be a positive integer"
+            )
+        if not _is_non_negative_integer(element["priority"]):
+            raise EventValidationError(
+                f"demands[{index}].priority must be a non-negative integer"
+            )
+        seen_demand_ids.add(demand_id)
+        demands.append(
+            {
+                "demandId": demand_id,
+                "location": element["location"],
+                "units": element["units"],
+                "priority": element["priority"],
+            }
+        )
+
+    resources: dict[str, dict[str, Any]] = {}
+    for index, element in enumerate(raw_resources):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"resources[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(ROUTE_RESOURCE_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"resources[{index}]: {'; '.join(element_detail)}"
+            )
+        resource_id = element["resourceId"]
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise EventValidationError(
+                f"resources[{index}].resourceId must be a non-empty string"
+            )
+        if resource_id in resources:
+            raise EventValidationError(
+                f"duplicate resourceId: {resource_id}"
+            )
+        if not isinstance(element["location"], str) or not element["location"].strip():
+            raise EventValidationError(
+                f"resources[{index}].location must be a non-empty string"
+            )
+        if not _is_positive_integer(element["capacity"]):
+            raise EventValidationError(
+                f"resources[{index}].capacity must be a positive integer"
+            )
+        resources[resource_id] = {
+            "location": element["location"],
+            "capacity": element["capacity"],
+        }
+
+    return {
+        "organizationId": organization_id,
+        "edges": edges,
+        "demands": demands,
+        "resources": resources,
+    }
+
+
 def validate_reservation_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /reservations.
 
@@ -2613,6 +2806,112 @@ def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
         "assignments": assignments,
         "unassigned": unassigned,
         "totalUnits": total_units,
+    }
+
+
+def _shortest_path(
+    adjacency: dict[str, list[tuple[str, int]]], start: str, goal: str
+) -> tuple[int, list[str]] | None:
+    """Return (cost, path) of the cheapest directed route, or None.
+
+    Among equally cheap routes the node sequence smallest in Unicode
+    code-point order wins. Edge costs are positive, so a Dijkstra pass
+    ordered by (cost, path) settles every node with its final route the
+    first time it is popped: any rival path shares a strictly cheaper
+    prefix that is settled first, placing the better route in the queue
+    before the worse one can be popped.
+    """
+    if start == goal:
+        return (0, [start])
+    settled: set[str] = set()
+    queue: list[tuple[int, tuple[str, ...], str]] = [(0, (start,), start)]
+    while queue:
+        cost, path, node = heapq.heappop(queue)
+        if node in settled:
+            continue
+        settled.add(node)
+        if node == goal:
+            return (cost, list(path))
+        for neighbor, edge_cost in adjacency.get(node, ()):
+            if neighbor not in settled:
+                heapq.heappush(
+                    queue, (cost + edge_cost, path + (neighbor,), neighbor)
+                )
+    return None
+
+
+def plan_route_allocation(params: dict[str, Any]) -> dict[str, Any]:
+    """Allocate whole demands to reachable resources by deterministic rules.
+
+    Demands are handled by priority descending, then demandId in Unicode
+    code-point order. A demand goes wholly to the resource with enough
+    remaining capacity whose shortest route from its location to the
+    demand's location is cheapest; ties resolve to the lexicographically
+    smallest resourceId. Capacity is deducted within this computation only.
+    """
+    adjacency: dict[str, list[tuple[str, int]]] = {}
+    for edge in params["edges"]:
+        adjacency.setdefault(edge["from"], []).append((edge["to"], edge["cost"]))
+
+    resources = params["resources"]
+    remaining = {
+        resource_id: info["capacity"] for resource_id, info in resources.items()
+    }
+    ordered_resources = sorted(remaining)
+    ordered_demands = sorted(
+        params["demands"], key=lambda demand: (-demand["priority"], demand["demandId"])
+    )
+
+    assignments: list[dict[str, Any]] = []
+    unassigned: list[dict[str, Any]] = []
+    total_units = 0
+    total_travel_cost = 0
+    for demand in ordered_demands:
+        demand_id = demand["demandId"]
+        units = demand["units"]
+        candidates = [
+            resource_id
+            for resource_id in ordered_resources
+            if remaining[resource_id] >= units
+        ]
+        if not candidates:
+            unassigned.append(
+                {"demandId": demand_id, "reason": "insufficient_capacity"}
+            )
+            continue
+        best: tuple[int, str, list[str]] | None = None
+        for resource_id in candidates:
+            route = _shortest_path(
+                adjacency, resources[resource_id]["location"], demand["location"]
+            )
+            if route is None:
+                continue
+            cost, path = route
+            if best is None or (cost, resource_id) < (best[0], best[1]):
+                best = (cost, resource_id, path)
+        if best is None:
+            unassigned.append({"demandId": demand_id, "reason": "unreachable"})
+            continue
+        cost, chosen, path = best
+        remaining[chosen] -= units
+        assignments.append(
+            {
+                "demandId": demand_id,
+                "resourceId": chosen,
+                "units": units,
+                "path": path,
+                "travelCost": cost,
+            }
+        )
+        total_units += units
+        total_travel_cost += cost
+
+    return {
+        "organizationId": params["organizationId"],
+        "assignments": assignments,
+        "unassigned": unassigned,
+        "totalUnits": total_units,
+        "totalTravelCost": total_travel_cost,
     }
 
 
@@ -4336,6 +4635,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
+            return
+        if path == "/decisions/route-allocate":
+            self._route_allocate_decision()
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -6573,6 +6875,35 @@ class Handler(BaseHTTPRequestHandler):
         # alone, so identical submissions and concurrent requests never
         # interfere with each other or with the ledger.
         result = plan_allocation(params)
+        self._write_json(HTTPStatus.OK, result)
+
+    def _route_allocate_decision(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
+
+        data = self._json_request_body(reject_duplicate_keys=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_route_allocation_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=False
+        ):
+            return
+
+        # Read-only and stateless like /decisions/allocate: the route plan
+        # is computed from the request body alone and never touches the
+        # ledger, inventory, alerts, snapshots, or branches.
+        result = plan_route_allocation(params)
         self._write_json(HTTPStatus.OK, result)
 
     # ------------------------------------------------------------------ alerts
