@@ -66,6 +66,15 @@ def allocation_body(organization_id: str = ORG1) -> dict[str, Any]:
     }
 
 
+def dispatch_body(organization_id: str = ORG1) -> dict[str, Any]:
+    return {
+        "organizationId": organization_id,
+        "demands": [{"demandId": "d1", "nodeId": "n1", "units": 1, "priority": 0}],
+        "resources": [{"resourceId": "r1", "nodeId": "n1", "capacity": 2}],
+        "roads": [],
+    }
+
+
 def alert_body(organization_id: str = ORG1) -> dict[str, Any]:
     return {
         "organizationId": organization_id,
@@ -327,6 +336,7 @@ class AuthTest(unittest.TestCase):
             ("POST", "/reservations", reservation_body()),
             ("POST", "/decisions/evaluate", decision_body()),
             ("POST", "/decisions/allocate", allocation_body()),
+            ("POST", "/decisions/dispatch", dispatch_body()),
             ("POST", "/alerts/evaluate", alert_body()),
             ("POST", "/snapshots", {"snapshotId": "s1"}),
             ("POST", "/branches", {"branchId": "b1", "snapshotId": "s1"}),
@@ -453,6 +463,15 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body["error"], "forbidden")
 
+        status, body = self.call(
+            "/decisions/dispatch",
+            method="POST",
+            payload=dispatch_body(ORG1),
+            token="w2",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "forbidden")
+
         # No ORG1 state was created by the rejected requests.
         status, body = self.call("/events?organizationId=org-1", token="w1")
         self.assertEqual(body["events"], [])
@@ -550,6 +569,7 @@ class AuthTest(unittest.TestCase):
         for path, payload in (
             ("/decisions/evaluate", decision_body()),
             ("/decisions/allocate", allocation_body()),
+            ("/decisions/dispatch", dispatch_body()),
         ):
             with self.subTest(path=path):
                 status, _ = self.call(path, method="POST", payload=payload, token="r1")

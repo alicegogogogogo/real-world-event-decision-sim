@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 import threading
 from collections.abc import Callable
@@ -41,6 +42,11 @@ REGION_ALERT_FIELDS = REGION_ALERT_REQUIRED_FIELDS + REGION_ALERT_OPTIONAL_FIELD
 ALLOCATION_REQUIRED_FIELDS = ("organizationId", "demands", "resources")
 DEMAND_FIELDS = ("demandId", "units", "priority")
 RESOURCE_FIELDS = ("resourceId", "capacity")
+
+DISPATCH_REQUIRED_FIELDS = ("organizationId", "demands", "resources", "roads")
+DISPATCH_DEMAND_FIELDS = ("demandId", "nodeId", "units", "priority")
+DISPATCH_RESOURCE_FIELDS = ("resourceId", "nodeId", "capacity")
+ROAD_FIELDS = ("from", "to", "travelTime")
 
 RESERVATION_FIELDS = (
     "organizationId",
@@ -1827,6 +1833,204 @@ def validate_allocation_request(data: Any) -> dict[str, Any]:
     }
 
 
+def validate_dispatch_request(data: Any) -> dict[str, Any]:
+    """Validate a decoded JSON body for POST /decisions/dispatch.
+
+    Required fields: organizationId, demands, resources, roads, and no
+    others. Each demand/resource/road element must be an object with exactly
+    its fixed fields; identifiers must be unique within the request and
+    non-blank, and the same ordered (from, to) road endpoints may not repeat.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("dispatch body must be a JSON object")
+
+    keys = set(data)
+    required = set(DISPATCH_REQUIRED_FIELDS)
+    missing = sorted(required - keys)
+    unknown = sorted(keys - required)
+    detail = []
+    if missing:
+        detail.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        detail.append(f"unexpected fields: {', '.join(unknown)}")
+    if detail:
+        raise EventValidationError("; ".join(detail))
+
+    organization_id = data["organizationId"]
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise EventValidationError("organizationId must be a non-empty string")
+
+    raw_demands = data["demands"]
+    raw_resources = data["resources"]
+    raw_roads = data["roads"]
+    if (
+        not isinstance(raw_demands, list)
+        or not isinstance(raw_resources, list)
+        or not isinstance(raw_roads, list)
+    ):
+        raise EventValidationError("demands, resources and roads must be arrays")
+
+    demands: list[dict[str, Any]] = []
+    seen_demand_ids: set[str] = set()
+    for index, element in enumerate(raw_demands):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"demands[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(DISPATCH_DEMAND_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"demands[{index}]: {'; '.join(element_detail)}"
+            )
+        demand_id = element["demandId"]
+        if not isinstance(demand_id, str) or not demand_id.strip():
+            raise EventValidationError(
+                f"demands[{index}].demandId must be a non-empty string"
+            )
+        if demand_id in seen_demand_ids:
+            raise EventValidationError(
+                f"duplicate demandId: {demand_id}"
+            )
+        node_id = element["nodeId"]
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise EventValidationError(
+                f"demands[{index}].nodeId must be a non-empty string"
+            )
+        if not _is_positive_integer(element["units"]):
+            raise EventValidationError(
+                f"demands[{index}].units must be a positive integer"
+            )
+        if not _is_non_negative_integer(element["priority"]):
+            raise EventValidationError(
+                f"demands[{index}].priority must be a non-negative integer"
+            )
+        seen_demand_ids.add(demand_id)
+        demands.append(
+            {
+                "demandId": demand_id,
+                "nodeId": node_id,
+                "units": element["units"],
+                "priority": element["priority"],
+            }
+        )
+
+    resources: list[dict[str, Any]] = []
+    seen_resource_ids: set[str] = set()
+    for index, element in enumerate(raw_resources):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"resources[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(DISPATCH_RESOURCE_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"resources[{index}]: {'; '.join(element_detail)}"
+            )
+        resource_id = element["resourceId"]
+        if not isinstance(resource_id, str) or not resource_id.strip():
+            raise EventValidationError(
+                f"resources[{index}].resourceId must be a non-empty string"
+            )
+        if resource_id in seen_resource_ids:
+            raise EventValidationError(
+                f"duplicate resourceId: {resource_id}"
+            )
+        node_id = element["nodeId"]
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise EventValidationError(
+                f"resources[{index}].nodeId must be a non-empty string"
+            )
+        if not _is_positive_integer(element["capacity"]):
+            raise EventValidationError(
+                f"resources[{index}].capacity must be a positive integer"
+            )
+        seen_resource_ids.add(resource_id)
+        resources.append(
+            {
+                "resourceId": resource_id,
+                "nodeId": node_id,
+                "capacity": element["capacity"],
+            }
+        )
+
+    roads: list[dict[str, Any]] = []
+    seen_endpoints: set[tuple[str, str]] = set()
+    for index, element in enumerate(raw_roads):
+        if not isinstance(element, dict):
+            raise EventValidationError(f"roads[{index}] must be a JSON object")
+        element_keys = set(element)
+        expected = set(ROAD_FIELDS)
+        if element_keys != expected:
+            element_missing = sorted(expected - element_keys)
+            element_unknown = sorted(element_keys - expected)
+            element_detail = []
+            if element_missing:
+                element_detail.append(
+                    f"missing fields: {', '.join(element_missing)}"
+                )
+            if element_unknown:
+                element_detail.append(
+                    f"unexpected fields: {', '.join(element_unknown)}"
+                )
+            raise EventValidationError(
+                f"roads[{index}]: {'; '.join(element_detail)}"
+            )
+        from_node = element["from"]
+        to_node = element["to"]
+        if not isinstance(from_node, str) or not from_node.strip():
+            raise EventValidationError(
+                f"roads[{index}].from must be a non-empty string"
+            )
+        if not isinstance(to_node, str) or not to_node.strip():
+            raise EventValidationError(
+                f"roads[{index}].to must be a non-empty string"
+            )
+        if not _is_positive_integer(element["travelTime"]):
+            raise EventValidationError(
+                f"roads[{index}].travelTime must be a positive integer"
+            )
+        endpoints = (from_node, to_node)
+        if endpoints in seen_endpoints:
+            raise EventValidationError(
+                f"duplicate road: {from_node} -> {to_node}"
+            )
+        seen_endpoints.add(endpoints)
+        roads.append(
+            {
+                "from": from_node,
+                "to": to_node,
+                "travelTime": element["travelTime"],
+            }
+        )
+
+    return {
+        "organizationId": organization_id,
+        "demands": demands,
+        "resources": resources,
+        "roads": roads,
+    }
+
+
 def validate_reservation_request(data: Any) -> dict[str, Any]:
     """Validate a decoded JSON body for POST /reservations.
 
@@ -2535,6 +2739,112 @@ def plan_allocation(params: dict[str, Any]) -> dict[str, Any]:
         remaining[chosen] -= units
         assignments.append(
             {"demandId": demand_id, "resourceId": chosen, "units": units}
+        )
+        total_units += units
+
+    unassigned.sort()
+    return {
+        "organizationId": params["organizationId"],
+        "assignments": assignments,
+        "unassigned": unassigned,
+        "totalUnits": total_units,
+    }
+
+
+def _shortest_paths(
+    graph: dict[str, list[tuple[str, int]]], source: str
+) -> dict[str, tuple[int, tuple[str, ...]]]:
+    """Shortest directed routes from ``source`` to every reachable node.
+
+    Each entry maps a node to ``(travelTime, path)`` where ``path`` is the
+    complete node sequence. Among equally short routes the lexicographically
+    smallest node sequence (Unicode code-point order, element by element)
+    wins; the source itself maps to the zero-length route ``(0, (source,))``.
+    """
+    best: dict[str, tuple[int, tuple[str, ...]]] = {source: (0, (source,))}
+    heap: list[tuple[int, tuple[str, ...], str]] = [(0, (source,), source)]
+    while heap:
+        distance, path, node = heapq.heappop(heap)
+        if best.get(node) != (distance, path):
+            continue  # stale entry superseded by a better route
+        for next_node, travel_time in graph.get(node, ()):
+            next_distance = distance + travel_time
+            next_path = path + (next_node,)
+            current = best.get(next_node)
+            if current is None or (next_distance, next_path) < current:
+                best[next_node] = (next_distance, next_path)
+                heapq.heappush(heap, (next_distance, next_path, next_node))
+    return best
+
+
+def plan_dispatch(params: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch whole demands to resources over the directed road network.
+
+    Demands are handled by priority descending, then demandId in Unicode
+    code-point order. A demand goes wholly to a resource with enough
+    remaining capacity whose node can reach the demand's node along the
+    directed roads; candidates compare by shortest total travel time, then
+    by resourceId. A resource on the demand's own node travels zero. The
+    chosen capacity is deducted immediately — demands are never split,
+    capacity is never oversold, and earlier placements are never revised.
+    """
+    demands = params["demands"]
+    resources = params["resources"]
+
+    graph: dict[str, list[tuple[str, int]]] = {}
+    for road in params["roads"]:
+        graph.setdefault(road["from"], []).append(
+            (road["to"], road["travelTime"])
+        )
+
+    remaining: dict[str, int] = {}
+    resource_node: dict[str, str] = {}
+    routes_from_node: dict[str, dict[str, tuple[int, tuple[str, ...]]]] = {}
+    for resource in resources:
+        resource_id = resource["resourceId"]
+        remaining[resource_id] = resource["capacity"]
+        resource_node[resource_id] = resource["nodeId"]
+        if resource["nodeId"] not in routes_from_node:
+            routes_from_node[resource["nodeId"]] = _shortest_paths(
+                graph, resource["nodeId"]
+            )
+
+    ordered_demands = sorted(
+        demands, key=lambda demand: (-demand["priority"], demand["demandId"])
+    )
+
+    assignments: list[dict[str, Any]] = []
+    unassigned: list[str] = []
+    total_units = 0
+    for demand in ordered_demands:
+        demand_id = demand["demandId"]
+        units = demand["units"]
+        target = demand["nodeId"]
+        chosen = None
+        chosen_key = None
+        for resource_id in sorted(remaining):
+            if remaining[resource_id] < units:
+                continue
+            route = routes_from_node[resource_node[resource_id]].get(target)
+            if route is None:
+                continue
+            key = (route[0], resource_id)
+            if chosen_key is None or key < chosen_key:
+                chosen_key = key
+                chosen = resource_id
+        if chosen is None:
+            unassigned.append(demand_id)
+            continue
+        travel_time, path = routes_from_node[resource_node[chosen]][target]
+        remaining[chosen] -= units
+        assignments.append(
+            {
+                "demandId": demand_id,
+                "resourceId": chosen,
+                "units": units,
+                "travelTime": travel_time,
+                "path": list(path),
+            }
         )
         total_units += units
 
@@ -4172,6 +4482,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/decisions/allocate":
             self._allocate_decision()
+            return
+        if path == "/decisions/dispatch":
+            self._dispatch_decision()
             return
         self._write_json(
             HTTPStatus.NOT_FOUND,
@@ -6347,6 +6660,35 @@ class Handler(BaseHTTPRequestHandler):
         # alone, so identical submissions and concurrent requests never
         # interfere with each other or with the ledger.
         result = plan_allocation(params)
+        self._write_json(HTTPStatus.OK, result)
+
+    def _dispatch_decision(self) -> None:
+        subject = self._require_subject(newline=False)
+        if subject is None:
+            return
+
+        data = self._json_request_body(reject_duplicate_keys=True)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            params = validate_dispatch_request(data)
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+            )
+            return
+
+        if not self._authorize_organization(
+            subject, params["organizationId"], newline=False
+        ):
+            return
+
+        # Read-only and stateless like /decisions/allocate: the plan is
+        # computed from the request body alone, so identical submissions and
+        # concurrent requests never interfere with each other or the ledger.
+        result = plan_dispatch(params)
         self._write_json(HTTPStatus.OK, result)
 
     # ------------------------------------------------------------------ alerts

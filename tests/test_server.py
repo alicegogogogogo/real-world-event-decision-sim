@@ -94,6 +94,14 @@ class ServerTest(unittest.TestCase):
             "/decisions/allocate", method="POST", body=body, content_type=content_type
         )
 
+    def post_dispatch(
+        self, payload: Any, *, raw: bool = False, content_type: str | None = "application/json"
+    ) -> tuple[int, Any]:
+        body = payload if raw else json.dumps(payload).encode()
+        return self.request(
+            "/decisions/dispatch", method="POST", body=body, content_type=content_type
+        )
+
     def seed_aggregate_events(self) -> None:
         events = [
             make_event(eventId="evt-1", occurredAt=0),
@@ -1085,6 +1093,350 @@ class ServerTest(unittest.TestCase):
         payload = self.allocation_payload()
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda _: self.post_allocation(payload), range(16)))
+        self.assertTrue(all(status == 200 for status, _ in results))
+        bodies = {json.dumps(body, sort_keys=True) for _, body in results}
+        self.assertEqual(len(bodies), 1)
+
+    # --- POST /decisions/dispatch ---------------------------------------------
+
+    def dispatch_payload(self, **overrides: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "organizationId": "org-1",
+            "demands": [
+                {"demandId": "d-low", "nodeId": "site-x", "units": 3, "priority": 1},
+                {"demandId": "d-b", "nodeId": "site-y", "units": 4, "priority": 5},
+                {"demandId": "d-a", "nodeId": "site-x", "units": 2, "priority": 5},
+                {"demandId": "d-big", "nodeId": "site-x", "units": 10, "priority": 9},
+            ],
+            "resources": [
+                {"resourceId": "r-b", "nodeId": "hub-b", "capacity": 6},
+                {"resourceId": "r-a", "nodeId": "hub-a", "capacity": 5},
+            ],
+            "roads": [
+                {"from": "hub-a", "to": "site-x", "travelTime": 5},
+                {"from": "hub-b", "to": "site-x", "travelTime": 2},
+                {"from": "hub-b", "to": "site-y", "travelTime": 3},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_dispatch_plans_by_priority_travel_time_then_resource_id(self) -> None:
+        # Processing order: d-big(9), d-a(5), d-b(5), d-low(1).
+        # d-big fits nowhere -> unassigned. d-a: both reach site-x, r-b is
+        # shorter (2 < 5) -> r-b (6 -> 4). d-b: only r-b reaches site-y but
+        # r-b has 4 left -> r-b (4 -> 0). d-low: r-b is full, r-a reaches
+        # site-x in 5 -> r-a (5 -> 2).
+        status, body = self.post_dispatch(self.dispatch_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "assignments": [
+                    {
+                        "demandId": "d-a",
+                        "resourceId": "r-b",
+                        "units": 2,
+                        "travelTime": 2,
+                        "path": ["hub-b", "site-x"],
+                    },
+                    {
+                        "demandId": "d-b",
+                        "resourceId": "r-b",
+                        "units": 4,
+                        "travelTime": 3,
+                        "path": ["hub-b", "site-y"],
+                    },
+                    {
+                        "demandId": "d-low",
+                        "resourceId": "r-a",
+                        "units": 3,
+                        "travelTime": 5,
+                        "path": ["hub-a", "site-x"],
+                    },
+                ],
+                "unassigned": ["d-big"],
+                "totalUnits": 9,
+            },
+        )
+
+    def test_dispatch_equal_travel_time_prefers_smaller_resource_id(self) -> None:
+        payload = self.dispatch_payload(
+            demands=[{"demandId": "d1", "nodeId": "site-x", "units": 1, "priority": 0}],
+            resources=[
+                {"resourceId": "r-b", "nodeId": "hub-b", "capacity": 1},
+                {"resourceId": "r-a", "nodeId": "hub-a", "capacity": 1},
+            ],
+            roads=[
+                {"from": "hub-a", "to": "site-x", "travelTime": 4},
+                {"from": "hub-b", "to": "site-x", "travelTime": 4},
+            ],
+        )
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["assignments"][0]["resourceId"], "r-a")
+
+    def test_dispatch_equal_length_routes_prefer_lexicographically_smaller_path(self) -> None:
+        # Two hub->site routes of equal total travel time; the node sequence
+        # ["hub", "mid-a", "site"] beats ["hub", "mid-b", "site"].
+        payload = self.dispatch_payload(
+            demands=[{"demandId": "d1", "nodeId": "site", "units": 1, "priority": 0}],
+            resources=[{"resourceId": "r1", "nodeId": "hub", "capacity": 1}],
+            roads=[
+                {"from": "hub", "to": "mid-b", "travelTime": 2},
+                {"from": "mid-b", "to": "site", "travelTime": 3},
+                {"from": "hub", "to": "mid-a", "travelTime": 1},
+                {"from": "mid-a", "to": "site", "travelTime": 4},
+            ],
+        )
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["assignments"],
+            [
+                {
+                    "demandId": "d1",
+                    "resourceId": "r1",
+                    "units": 1,
+                    "travelTime": 5,
+                    "path": ["hub", "mid-a", "site"],
+                }
+            ],
+        )
+
+    def test_dispatch_same_node_route_is_zero_travel_single_node_path(self) -> None:
+        payload = self.dispatch_payload(
+            demands=[{"demandId": "d1", "nodeId": "here", "units": 2, "priority": 0}],
+            resources=[{"resourceId": "r1", "nodeId": "here", "capacity": 5}],
+            roads=[],
+        )
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["assignments"],
+            [
+                {
+                    "demandId": "d1",
+                    "resourceId": "r1",
+                    "units": 2,
+                    "travelTime": 0,
+                    "path": ["here"],
+                }
+            ],
+        )
+        self.assertEqual(body["totalUnits"], 2)
+
+    def test_dispatch_directed_roads_and_unreachable_nodes(self) -> None:
+        # Roads are directed: site -> hub does not make hub reachable from a
+        # resource at site, and an isolated node is never reachable.
+        payload = self.dispatch_payload(
+            demands=[
+                {"demandId": "d-back", "nodeId": "hub", "units": 1, "priority": 2},
+                {"demandId": "d-nowhere", "nodeId": "isle", "units": 1, "priority": 1},
+            ],
+            resources=[{"resourceId": "r1", "nodeId": "site", "capacity": 5}],
+            roads=[{"from": "site", "to": "hub", "travelTime": 4}],
+        )
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["assignments"],
+            [
+                {
+                    "demandId": "d-back",
+                    "resourceId": "r1",
+                    "units": 1,
+                    "travelTime": 4,
+                    "path": ["site", "hub"],
+                }
+            ],
+        )
+        self.assertEqual(body["unassigned"], ["d-nowhere"])
+        self.assertEqual(body["totalUnits"], 1)
+
+    def test_dispatch_never_splits_or_oversells(self) -> None:
+        # Two resources of 3 each cannot take a demand of 5 even though total
+        # remaining capacity is 6; the demand stays unassigned.
+        payload = self.dispatch_payload(
+            demands=[
+                {"demandId": "d1", "nodeId": "n", "units": 5, "priority": 0},
+                {"demandId": "d2", "nodeId": "n", "units": 3, "priority": 0},
+            ],
+            resources=[
+                {"resourceId": "r1", "nodeId": "n", "capacity": 3},
+                {"resourceId": "r2", "nodeId": "n", "capacity": 3},
+            ],
+            roads=[],
+        )
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["assignments"],
+            [
+                {
+                    "demandId": "d2",
+                    "resourceId": "r1",
+                    "units": 3,
+                    "travelTime": 0,
+                    "path": ["n"],
+                }
+            ],
+        )
+        self.assertEqual(body["unassigned"], ["d1"])
+        self.assertEqual(body["totalUnits"], 3)
+
+    def test_dispatch_empty_arrays_succeed(self) -> None:
+        status, body = self.post_dispatch(
+            {
+                "organizationId": "org-1",
+                "demands": [],
+                "resources": [],
+                "roads": [],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "organizationId": "org-1",
+                "assignments": [],
+                "unassigned": [],
+                "totalUnits": 0,
+            },
+        )
+
+    def test_dispatch_repeated_requests_return_identical_bytes(self) -> None:
+        payload = self.dispatch_payload()
+        results = [self.post_dispatch(payload) for _ in range(5)]
+        self.assertTrue(all(status == 200 for status, _ in results))
+        self.assertEqual(
+            len({json.dumps(body, sort_keys=True) for _, body in results}), 1
+        )
+
+    def test_dispatch_missing_or_extra_top_level_field_is_422(self) -> None:
+        for field in ("organizationId", "demands", "resources", "roads"):
+            payload = self.dispatch_payload()
+            del payload[field]
+            with self.subTest(field=field):
+                status, body = self.post_dispatch(payload)
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        status, body = self.post_dispatch(self.dispatch_payload(extra="nope"))
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_dispatch_blank_or_duplicate_identifiers_are_422(self) -> None:
+        for bad_value in ("", "   ", 123, None, ["x"], True):
+            with self.subTest(bad_value=bad_value):
+                status, body = self.post_dispatch(
+                    self.dispatch_payload(organizationId=bad_value)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+        duplicate_demand = self.dispatch_payload()
+        duplicate_demand["demands"].append(
+            {"demandId": "d-a", "nodeId": "site-x", "units": 1, "priority": 0}
+        )
+        status, body = self.post_dispatch(duplicate_demand)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+        duplicate_resource = self.dispatch_payload()
+        duplicate_resource["resources"].append(
+            {"resourceId": "r-a", "nodeId": "hub-a", "capacity": 1}
+        )
+        status, body = self.post_dispatch(duplicate_resource)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_dispatch_element_field_and_type_errors_are_422(self) -> None:
+        demand = {"demandId": "d", "nodeId": "n", "units": 1, "priority": 0}
+        resource = {"resourceId": "r", "nodeId": "n", "capacity": 1}
+        road = {"from": "a", "to": "b", "travelTime": 1}
+        bad_cases = [
+            {"demands": [{k: v for k, v in demand.items() if k != "nodeId"}]},
+            {"demands": [{**demand, "extra": 1}]},
+            {"demands": [{**demand, "nodeId": " "}]},
+            {"demands": [{**demand, "units": 0}]},
+            {"demands": [{**demand, "units": 1.5}]},
+            {"demands": [{**demand, "units": True}]},
+            {"demands": [{**demand, "priority": -1}]},
+            {"demands": ["x"]},
+            {"resources": [{k: v for k, v in resource.items() if k != "nodeId"}]},
+            {"resources": [{**resource, "extra": 1}]},
+            {"resources": [{**resource, "nodeId": ""}]},
+            {"resources": [{**resource, "capacity": 0}]},
+            {"resources": [{**resource, "capacity": 1.0}]},
+            {"roads": [{k: v for k, v in road.items() if k != "travelTime"}]},
+            {"roads": [{**road, "extra": 1}]},
+            {"roads": [{**road, "from": ""}]},
+            {"roads": [{**road, "to": "  "}]},
+            {"roads": [{**road, "travelTime": 0}]},
+            {"roads": [{**road, "travelTime": -2}]},
+            {"roads": [{**road, "travelTime": "1"}]},
+            {"roads": ["x"]},
+            {"demands": {}},
+            {"resources": "x"},
+            {"roads": None},
+        ]
+        for overrides in bad_cases:
+            with self.subTest(overrides=overrides):
+                status, body = self.post_dispatch(
+                    self.dispatch_payload(**overrides)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"], "validation_error")
+
+    def test_dispatch_duplicate_road_endpoints_are_422(self) -> None:
+        payload = self.dispatch_payload()
+        payload["roads"].append({"from": "hub-a", "to": "site-x", "travelTime": 9})
+        status, body = self.post_dispatch(payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+        # The reversed direction is a different road and stays valid.
+        payload = self.dispatch_payload()
+        payload["roads"].append({"from": "site-x", "to": "hub-a", "travelTime": 9})
+        status, _ = self.post_dispatch(payload)
+        self.assertEqual(status, 200)
+
+    def test_dispatch_duplicate_json_keys_are_422(self) -> None:
+        raw = (
+            b'{"organizationId":"org-1","organizationId":"org-1",'
+            b'"demands":[],"resources":[],"roads":[]}'
+        )
+        status, body = self.post_dispatch(raw, raw=True)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_dispatch_media_type_and_json_errors(self) -> None:
+        status, body = self.post_dispatch(
+            self.dispatch_payload(), content_type="text/plain"
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"], "unsupported_media_type")
+        status, body = self.post_dispatch(b'{"organizationId": ', raw=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_json")
+        status, body = self.post_dispatch([1, 2, 3])
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_error")
+
+    def test_dispatch_failed_requests_change_no_state(self) -> None:
+        status, _ = self.post_dispatch(self.dispatch_payload(organizationId=""))
+        self.assertEqual(status, 422)
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], [])
+        # A valid dispatch is likewise invisible to the ledger.
+        status, _ = self.post_dispatch(self.dispatch_payload())
+        self.assertEqual(status, 200)
+        status, body = self.request("/events?organizationId=org-1")
+        self.assertEqual(body["events"], [])
+
+    def test_dispatch_concurrent_requests_do_not_pollute_each_other(self) -> None:
+        payload = self.dispatch_payload()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.post_dispatch(payload), range(16)))
         self.assertTrue(all(status == 200 for status, _ in results))
         bodies = {json.dumps(body, sort_keys=True) for _, body in results}
         self.assertEqual(len(bodies), 1)
