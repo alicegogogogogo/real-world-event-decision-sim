@@ -449,13 +449,16 @@ class ReservationInventory:
     Resource capacities are fixed by the first reservation that names the
     resource and are never rewritten. The balance check and the deduction
     happen inside a single lock, so concurrent requests can neither oversell
-    a resource nor lose each other's writes. State lives only for the
-    lifetime of this instance.
+    a resource nor lose each other's writes. A cancelled reservation is
+    removed from the active records but leaves a tombstone behind, so its
+    reservationId stays reserved forever and a repeated cancel replays the
+    same cancelled view. State lives only for the lifetime of this instance.
     """
 
     def __init__(self) -> None:
         self._capacities: dict[str, int] = {}
         self._reservations: dict[str, dict[str, Any]] = {}
+        self._cancelled: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def _occupied_locked(self, resource_id: str) -> int:
@@ -486,7 +489,9 @@ class ReservationInventory:
         Returns ``(status, view)`` where status is ``"created"`` for a new
         reservationId, ``"exists"`` for an identical replay (nothing is
         counted twice), ``"reservation_conflict"`` when the reservationId
-        exists with different fields, ``"capacity_conflict"`` when the
+        exists with different fields, ``"reservation_cancelled"`` when the
+        reservationId was cancelled before (it is never reusable),
+        ``"capacity_conflict"`` when the
         resource's recorded capacity differs from the declared one, or
         ``"capacity_exceeded"`` when the remaining balance cannot cover the
         quantity. Only ``"created"`` mutates state; the view carries the
@@ -501,6 +506,10 @@ class ReservationInventory:
                 ):
                     return "exists", self._view_locked(existing)
                 return "reservation_conflict", None
+            if reservation["reservationId"] in self._cancelled:
+                # A cancelled reservationId is never reusable, whatever
+                # fields the resubmission carries.
+                return "reservation_cancelled", None
 
             resource_id = reservation["resourceId"]
             recorded = self._capacities.get(resource_id)
@@ -516,6 +525,59 @@ class ReservationInventory:
             self._capacities[resource_id] = capacity
             self._reservations[stored["reservationId"]] = stored
             return "created", self._view_locked(stored)
+
+    @staticmethod
+    def _cancelled_view(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "organizationId": record["organizationId"],
+            "reservationId": record["reservationId"],
+            "resourceId": record["resourceId"],
+            "quantity": record["quantity"],
+            "status": "cancelled",
+        }
+
+    def cancel(
+        self, organization_id: str, reservation_id: str
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Cancel a reservation or reconcile a replay, atomically.
+
+        Returns ``(status, view)`` where status is ``"cancelled"`` (the
+        reservation was active and is now released, or it was already
+        cancelled and the same view is replayed without touching capacity
+        again), ``"forbidden"`` when the reservationId belongs to another
+        organization, or ``"not_found"`` when the reservationId never
+        existed. Only the first ``"cancelled"`` mutates state: the record
+        leaves the active reservations, its quantity is released, and a
+        tombstone keeps the reservationId permanently unusable. The
+        resource's recorded capacity is never rewritten.
+        """
+        with self._lock:
+            record = self._reservations.get(reservation_id)
+            if record is None:
+                record = self._cancelled.get(reservation_id)
+            if record is None:
+                return "not_found", None
+            if record["organizationId"] != organization_id:
+                return "forbidden", None
+            self._reservations.pop(reservation_id, None)
+            self._cancelled[reservation_id] = record
+            return "cancelled", self._cancelled_view(record)
+
+    def cancelled_for_organization(
+        self, organization_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Locked deep copies of one organization's cancellation tombstones.
+
+        Snapshots carry these so a branch derived from a snapshot inherits
+        the cancelled state of its organization's reservationIds; the
+        tombstones never appear in listings, balances, or counts.
+        """
+        with self._lock:
+            return {
+                reservation_id: dict(record)
+                for reservation_id, record in self._cancelled.items()
+                if record["organizationId"] == organization_id
+            }
 
     def list_for_organization(self, organization_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -612,13 +674,18 @@ class ReservationInventory:
         self,
         capacities: dict[str, int],
         reservations: dict[str, dict[str, Any]],
+        cancelled: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        """Replace capacities and reservations with deep copies."""
+        """Replace capacities, reservations, and tombstones with deep copies."""
         with self._lock:
             self._capacities = dict(capacities)
             self._reservations = {
                 reservation_id: dict(record)
                 for reservation_id, record in reservations.items()
+            }
+            self._cancelled = {
+                reservation_id: dict(record)
+                for reservation_id, record in (cancelled or {}).items()
             }
 
 
@@ -635,6 +702,7 @@ class Snapshot:
         events: dict[str, dict[str, Any]],
         capacities: dict[str, int],
         reservations: dict[str, dict[str, Any]],
+        cancelled: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.snapshot_id = snapshot_id
         self.organization_id = organization_id
@@ -645,6 +713,12 @@ class Snapshot:
         self._reservations = {
             reservation_id: dict(record)
             for reservation_id, record in reservations.items()
+        }
+        # Cancellation tombstones are captured so a derived branch inherits
+        # the cancelled state; they never count as reservations or balances.
+        self._cancelled = {
+            reservation_id: dict(record)
+            for reservation_id, record in (cancelled or {}).items()
         }
 
     @property
@@ -664,7 +738,7 @@ class Snapshot:
         ledger = EventLedger()
         ledger.restore(self._events)
         reservations = ReservationInventory()
-        reservations.restore(self._capacities, self._reservations)
+        reservations.restore(self._capacities, self._reservations, self._cancelled)
         return ledger, reservations
 
     def events_snapshot(self) -> dict[str, dict[str, Any]]:
@@ -798,6 +872,7 @@ class SnapshotStore:
                 organization_id,
                 ledger.snapshot_for_organization(organization_id),
                 *reservations.snapshot_for_organization(organization_id),
+                reservations.cancelled_for_organization(organization_id),
             )
             self._snapshots[snapshot_id] = snapshot
             return "created", snapshot
@@ -2066,6 +2141,34 @@ def validate_reservation_request(data: Any) -> dict[str, Any]:
             raise EventValidationError(f"{field} must be a positive integer")
 
     return {field: data[field] for field in RESERVATION_FIELDS}
+
+
+def validate_reservation_cancel_request(data: Any) -> tuple[str, str]:
+    """Validate a decoded JSON body for POST /reservations/cancel.
+
+    Exactly the ``organizationId`` and ``reservationId`` fields may be
+    present, and both must be non-empty strings.
+    """
+    if not isinstance(data, dict):
+        raise EventValidationError("reservation cancel body must be a JSON object")
+
+    keys = set(data)
+    expected = {"organizationId", "reservationId"}
+    if keys != expected:
+        missing = sorted(expected - keys)
+        unknown = sorted(keys - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unexpected fields: {', '.join(unknown)}")
+        raise EventValidationError("; ".join(detail))
+
+    for field in ("organizationId", "reservationId"):
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise EventValidationError(f"{field} must be a non-empty string")
+    return data["organizationId"], data["reservationId"]
 
 
 def _validate_single_identifier_body(
@@ -4619,6 +4722,13 @@ class Handler(BaseHTTPRequestHandler):
                         return
                 if (
                     len(segments) == 3
+                    and segments[1] == "reservations"
+                    and segments[2] == "cancel"
+                ):
+                    self._cancel_reservation(branch.reservations, newline=True)
+                    return
+                if (
+                    len(segments) == 3
                     and segments[1] == "decisions"
                     and segments[2] == "evaluate"
                 ):
@@ -4636,6 +4746,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/reservations":
             self._create_reservation(
+                self.server.reservations,  # type: ignore[attr-defined]
+                newline=True,
+            )
+            return
+        if path == "/reservations/cancel":
+            self._cancel_reservation(
                 self.server.reservations,  # type: ignore[attr-defined]
                 newline=True,
             )
@@ -7331,6 +7447,62 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(
                 HTTPStatus.CONFLICT, {"error": reserve_status}, newline=newline
             )
+
+    def _cancel_reservation(
+        self,
+        reservations: ReservationInventory,
+        *,
+        newline: bool = False,
+    ) -> None:
+        subject = self._require_subject(newline=newline)
+        if subject is None:
+            return
+        if subject.role != "write":
+            self._forbidden(newline=newline)
+            return
+
+        data = self._json_request_body(newline=newline)
+        if data is _BODY_ERROR:
+            return
+
+        try:
+            organization_id, reservation_id = validate_reservation_cancel_request(
+                data
+            )
+        except EventValidationError as exc:
+            self._write_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "validation_error", "message": str(exc)},
+                newline=newline,
+            )
+            return
+
+        def commit() -> tuple[str, dict[str, Any] | None]:
+            return reservations.cancel(organization_id, reservation_id)
+
+        # The cancel and the capacity release commit under the same lock
+        # pair as every other write: the organization/role decision is made
+        # by the registry lock and the inventory mutation by the inventory
+        # lock, so a rejected request changes nothing and a concurrent
+        # reservation cannot observe a half-released balance.
+        status, result = self.server.tokens.commit_write(  # type: ignore[attr-defined]
+            self.token, organization_id, commit
+        )
+        if status == "forbidden":
+            self._forbidden(newline=newline)
+            return
+        cancel_status, view = result
+        if cancel_status == "forbidden":
+            self._forbidden(newline=newline)
+            return
+        if cancel_status == "not_found":
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "reservation_not_found"},
+                newline=newline,
+            )
+            return
+        self._write_json(HTTPStatus.OK, view, newline=newline)
 
     def _list_reservations(
         self,

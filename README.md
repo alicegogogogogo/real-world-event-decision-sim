@@ -113,7 +113,8 @@ data is forbidden.
   `POST /snapshots/compare/resources`,
   `POST /snapshots/{snapshotId}/decisions/evaluate`, and the other
   read-only branch entry points.
-- Committing an event or reservation, evaluating an alert, and creating a
+- Committing an event or reservation, cancelling a reservation, evaluating
+  an alert, and creating a
   snapshot or branch are writes; only a `write` token may call them. A
   `read` token against a write entry point receives `403`. The authorization
   decision and the ledger/inventory mutation complete under one lock, so a
@@ -1020,6 +1021,48 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `occupied` and `remaining` balances. An unknown organization returns
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
+
+### `POST /reservations/cancel` and `POST /branches/{branchId}/reservations/cancel`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly two non-empty string fields: `organizationId` (matching the
+`write` credential's organization and, for the branch form, the branch
+owner) and `reservationId`.
+
+```bash
+curl -X POST http://127.0.0.1:8000/reservations/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","reservationId":"res-1"}'
+```
+
+Cancelling an active reservation atomically removes it from the
+reservation listing and releases its quantity back to the resource's
+remaining balance; the resource's recorded capacity is never rewritten.
+The response is compact, key-sorted JSON with a trailing newline:
+
+```json
+{"organizationId":"org-1","quantity":2,"reservationId":"res-1","resourceId":"r-a","status":"cancelled"}
+```
+
+- `200 OK` — the reservation was cancelled (or was already cancelled: a
+  repeated cancel returns the identical body and never releases capacity
+  twice).
+- `404 Not Found` (`{"error": "reservation_not_found"}`) — the
+  `reservationId` never existed.
+- `409 Conflict` (`{"error": "reservation_cancelled"}`) — on the
+  reservation submission entry points, a cancelled `reservationId` is
+  permanently unusable, whatever fields the resubmission carries.
+- `401` / `403` / `415` / `400` / `422` — same credential, role,
+  organization, media-type, syntax, and body-shape rules as the other
+  write entry points; cancelling another organization's reservation is
+  `403 forbidden`. No failed request changes reservations, capacity,
+  events, alerts, snapshots, or branches.
+
+Cancellation never propagates: snapshots taken before a cancel keep the
+reservation, snapshots taken after it count neither the reservation nor
+its balance, and a branch derived from a snapshot inherits the
+then-valid or then-cancelled state. Cancelling in the main service, a
+branch, or a sibling branch leaves the others untouched.
 
 ## Alert suppression and escalation
 
