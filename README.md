@@ -959,7 +959,8 @@ curl -X POST http://127.0.0.1:8000/decisions/route-allocate \
 Reservations are held only in the server process alongside the event ledger:
 restarting (or starting a new instance) begins with empty inventory. The
 first reservation that names a resource fixes that resource's capacity; it
-is never rewritten afterwards.
+is never rewritten afterwards, not even when every reservation against the
+resource is cancelled.
 
 ### `POST /reservations`
 
@@ -1020,6 +1021,58 @@ carries `quantity`, the resource's `capacity`, and the resource-wide
 `occupied` and `remaining` balances. An unknown organization returns
 `"reservations": []`. A missing, blank, or duplicated parameter yields
 `422`.
+
+### `POST /reservations/cancel`
+
+Requires `Content-Type: application/json`. The body must be a JSON object
+with exactly these two top-level fields, both non-empty strings:
+
+| Field            | Rule              |
+| ---------------- | ----------------- |
+| `organizationId` | non-empty string  |
+| `reservationId`  | non-empty string  |
+
+```bash
+curl -X POST http://127.0.0.1:8000/reservations/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"organizationId":"org-1","reservationId":"res-1"}'
+```
+
+Cancelling an active reservation releases its quantity atomically: the
+record leaves the reservation listing and the resource's `occupied`
+balance in the same commit, so another `reservationId` can reserve the
+freed quantity immediately, while the resource's recorded `capacity` is
+kept. The response is compact JSON with stable key order and a trailing
+newline:
+
+```json
+{"organizationId":"org-1","quantity":2,"reservationId":"res-1","resourceId":"r-a","status":"cancelled"}
+```
+
+- `200 OK` — the reservation was cancelled, or it had already been
+  cancelled: a repeated cancel returns the byte-identical body and never
+  releases the quantity twice.
+- `404 Not Found` (`{"error": "reservation_not_found"}`) — the
+  `reservationId` was never committed.
+- `403 Forbidden` — a `read` credential, a credential whose organization
+  differs from the body's `organizationId`, or a reservation owned by
+  another organization.
+- `401 Unauthorized` — missing, malformed, or unregistered Bearer token.
+- `415 Unsupported Media Type` — missing or unsupported `Content-Type`.
+- `400 Bad Request` — body is not syntactically valid JSON.
+- `422 Unprocessable Entity` — a non-object body, missing or extra fields,
+  or blank or non-string identifiers.
+
+A cancelled `reservationId` is retired permanently: resubmitting it to
+`POST /reservations` returns `409` with `{"error": "reservation_cancelled"}`
+no matter which fields the submission carries. Snapshots taken before the
+cancel still hold the reservation as active; snapshots taken after it count
+neither the reservation nor its resource balance, and a branch forked from
+a snapshot inherits the active-or-cancelled state as of the capture.
+Cancels never propagate: cancelling in the main service, in one branch, or
+in a sibling branch leaves every other copy untouched, and existing
+snapshots stay immutable. Any failed cancel changes no reservation,
+capacity, event, alert, snapshot, or branch state.
 
 ## Alert suppression and escalation
 
@@ -2478,6 +2531,7 @@ validation, ordering, and window semantics:
 | GET    | `/branches/{branchId}/reservations`       | list the branch's reservations            |
 | GET    | `/branches/{branchId}/resources`          | list the branch's resource balances       |
 | POST   | `/branches/{branchId}/reservations`       | reserve against branch balances only      |
+| POST   | `/branches/{branchId}/reservations/cancel` | cancel a reservation in the branch only  |
 
 - Branch event commits honor `415`, `400`, `422`, identical-replay (`200`),
   and `event_id_conflict` (`409`); writes stay in the branch. Name and
@@ -2489,7 +2543,13 @@ validation, ordering, and window semantics:
   capacity rules: identical replays return `200` without double counting,
   while `reservation_conflict`, `capacity_conflict`, and
   `capacity_exceeded` still return `409`; a failed commit never changes the
-  branch inventory.
+  branch inventory. A reservationId cancelled in the branch (or inherited
+  as cancelled from the fork snapshot) is retired inside the branch and
+  replays as `reservation_cancelled` (`409`).
+- Branch reservation cancels follow the main-service cancel contract —
+  the same two-field body, the same fixed `cancelled` response, the same
+  error taxonomy — but release only the branch's own copy of the
+  reservation; the main service and every sibling branch keep theirs.
 - Branch list and aggregate queries apply the same parameter rules as the
   main endpoints; missing, duplicated, or empty parameters return `422` with
   `validation_error`.
